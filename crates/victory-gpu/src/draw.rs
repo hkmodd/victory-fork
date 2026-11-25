@@ -671,16 +671,17 @@ fn table_constants_on_card(list: &HostList, address: u64, size: u32) -> Option<u
     }
     let shadow = crate::shadow::find_made(address, u64::from(size))?;
     let gpu = shadow.gpu(address);
-    if gpu % 256 != 0 {
-        return None;
-    }
     // The view reads a whole number of 256 bytes, which may pass the title
     // buffer's end (its 32,304 bytes at 0xdc7d6aa00): inside the host
     // buffer (made a multiple of 64 KiB), past the title's bytes.
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
-    if shadow.offset(address) + u64::from(size.next_multiple_of(256)) > width {
-        return None;
+    if gpu % 256 != 0 || shadow.offset(address) + u64::from(size.next_multiple_of(256)) > width {
+        // Where the view cannot name it: the card copies it into the list's
+        // own memory (`crate::host::cbv_card_scratch`).
+        return crate::host::cbv_card_scratch()
+            .then(|| list.card_read(&shadow, address, u64::from(size)))
+            .flatten();
     }
     shadow.refresh(list, address, u64::from(size));
     Some(gpu)

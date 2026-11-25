@@ -835,6 +835,8 @@ pub(crate) struct HostList {
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
+    /// The list's own memory on the card ([`Step::CardRead`]).
+    card_scratch: Mutex<CardScratch>,
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
     /// order, so the transitions from a texture's real state are made at
@@ -1979,6 +1981,67 @@ enum Step {
     /// and the one the source lies in. Its destination counts as a range
     /// shaders write.
     CardCopy(usize, usize, usize, std::sync::Arc<crate::shadow::Shadow>, std::sync::Arc<crate::shadow::Shadow>),
+    /// Bytes of a title buffer's copy the card copies into the list's own
+    /// memory on the card ([`HostList::card_read`]): the copy, the title
+    /// address, bytes, the buffer and offset they go to.
+    CardRead(std::sync::Arc<crate::shadow::Shadow>, usize, usize, ID3D12Resource, u64),
+}
+
+/// Where a copy the card does ahead of a submission's lists goes: a title
+/// buffer's copy (that copy, the title address) or a list's own memory on
+/// the card (buffer, offset).
+enum CardTo {
+    Title(std::sync::Arc<crate::shadow::Shadow>, usize),
+    Own(ID3D12Resource, u64),
+}
+
+/// A copy the card does ahead of a submission's lists: where to, the
+/// source's copy, the source's title address, bytes.
+type CardOp = (CardTo, std::sync::Arc<crate::shadow::Shadow>, usize, usize);
+
+/// A list's own memory on the card for [`Step::CardRead`]: buffers of
+/// [`CARD_SCRATCH`] bytes handed out front to back, the bytes used of the
+/// last. Given back for other lists when the list is reset.
+#[derive(Default)]
+struct CardScratch {
+    buffers: Vec<(ID3D12Resource, u64)>,
+    used: u64,
+}
+
+const CARD_SCRATCH: u64 = 1 << 20;
+
+/// Card scratch buffers no list holds (at most 32).
+static CARD_SPARE: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
+
+impl Drop for CardScratch {
+    fn drop(&mut self) {
+        give_card_scratch(std::mem::take(&mut self.buffers));
+    }
+}
+
+fn give_card_scratch(buffers: Vec<(ID3D12Resource, u64)>) {
+    let mut spare = CARD_SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    for (buffer, size) in buffers {
+        if size == CARD_SCRATCH && spare.len() < 32 {
+            spare.push(buffer);
+        }
+    }
+}
+
+/// Whether a table's constant buffer that lies in a title buffer's copy at
+/// an address the view cannot name (not a multiple of 256) is copied by
+/// the card into the list's own memory on the card (`VICTORY_CBV_CARD_SCRATCH`;
+/// on by default, `0` fills it on the CPU as before).
+///
+/// Why: run tc4 still waited for flights once a frame (some 16 ms) for a
+/// fill of such a constant buffer, 80 to 480 bytes in the title's 174 MB
+/// buffer (0x3d4aff60+160, 0x3e04fcf0+80, 0x3d66f2e0+480) that its compute
+/// shaders may write. The card copies them behind the flights, in queue
+/// order, with the title's changes gone up ahead, as for the title's own
+/// buffer copies ([`Step::CardCopy`]).
+pub(crate) fn cbv_card_scratch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CBV_CARD_SCRATCH").is_none_or(|v| v != "0"))
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -2698,7 +2761,10 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                 // snapshot they started from; where the title has mapped
                 // other pages since, that snapshot is someone else's
                 // (`crate::writeback`): the flights land first.
-                Step::Refresh(_, at, len) | Step::GpuWrite(_, at, len) | Step::CardCopy(at, _, len, _, _) => {
+                Step::Refresh(_, at, len)
+                | Step::GpuWrite(_, at, len)
+                | Step::CardCopy(at, _, len, _, _)
+                | Step::CardRead(_, at, len, _, _) => {
                     if crate::writeback::needs_new_snapshot(*at, at + len, written) {
                         return Some(WHY_READ);
                     }
@@ -4008,7 +4074,7 @@ impl Host {
     /// so a copy is behind the one before it that wrote or read its bytes.
     fn card_copy_list(
         &self,
-        copies: Vec<(std::sync::Arc<crate::shadow::Shadow>, std::sync::Arc<crate::shadow::Shadow>, usize, usize, usize)>,
+        copies: Vec<CardOp>,
         value: u64,
     ) -> Option<ID3D12CommandList> {
         /// Lists made, the value their last submission signals, and the
@@ -4061,16 +4127,14 @@ impl Host {
             (|| -> windows::core::Result<()> {
                 allocator.Reset()?;
                 list.Reset(allocator, None)?;
-                for (to, from, dst, src, len) in &copies {
+                for (to, from, src, len) in &copies {
+                    let (buffer, at) = match to {
+                        CardTo::Title(to, dst) => (&to.buffer, to.offset(*dst as u64)),
+                        CardTo::Own(buffer, at) => (buffer, *at),
+                    };
                     want(&mut states, &from.buffer, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                    want(&mut states, &to.buffer, D3D12_RESOURCE_STATE_COPY_DEST);
-                    list.CopyBufferRegion(
-                        &to.buffer,
-                        to.offset(*dst as u64),
-                        &from.buffer,
-                        from.offset(*src as u64),
-                        *len as u64,
-                    );
+                    want(&mut states, buffer, D3D12_RESOURCE_STATE_COPY_DEST);
+                    list.CopyBufferRegion(buffer, at, &from.buffer, from.offset(*src as u64), *len as u64);
                 }
                 let back: Vec<D3D12_RESOURCE_BARRIER> = states
                     .iter()
@@ -4088,8 +4152,9 @@ impl Host {
         // copies were counted in `run_deferred`).
         let n = CARD_COPIES[0].load(Ordering::Relaxed);
         let before = n.saturating_sub(copies.len() as u64);
-        if before.leading_zeros() != n.leading_zeros() {
-            let (to, from, dst, src, len) = &copies[0];
+        if before.leading_zeros() != n.leading_zeros()
+            && let Some((CardTo::Title(to, dst), from, src, len)) = copies.iter().find(|c| matches!(c.0, CardTo::Title(..)))
+        {
             tracing::info!(
                 "title buffer copies done by the card, since the start: {n} ({} MB); one: {len} bytes from {src:#x} to {dst:#x} (source's copy {:#x}+{:#x}{}, destination's {:#x}+{:#x}{}), {} in this submission",
                 CARD_COPIES[1].load(Ordering::Relaxed) >> 20,
@@ -4102,7 +4167,12 @@ impl Host {
                 copies.len()
             );
         }
-        held.extend(copies.into_iter().flat_map(|(to, from, ..)| [to, from]));
+        for (to, from, ..) in copies {
+            if let CardTo::Title(to, _) = to {
+                held.push(to);
+            }
+            held.push(from);
+        }
         list.cast().ok()
     }
 
@@ -4150,6 +4220,7 @@ impl Host {
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
+                card_scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 prelude,
@@ -6555,6 +6626,11 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
+        {
+            let mut card = self.card_scratch.lock().unwrap_or_else(|e| e.into_inner());
+            card.used = 0;
+            give_card_scratch(std::mem::take(&mut card.buffers));
+        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -7240,6 +7316,41 @@ impl HostList {
         Some((gpu + at, (data + at as usize) as *mut u8))
     }
 
+    /// The card's copy of `len` bytes at title address `address` of the
+    /// title buffer copy `shadow` (they lie in it) in the list's own memory
+    /// on the card, made when the list is submitted, ahead of the title's
+    /// lists and behind the flights: its GPU address, 256-byte aligned.
+    pub(crate) fn card_read(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: u64, len: u64) -> Option<u64> {
+        let host = host()?;
+        let size = len.max(1).next_multiple_of(256);
+        let (buffer, at) = {
+            let mut s = self.card_scratch.lock().unwrap_or_else(|e| e.into_inner());
+            if s.buffers.is_empty() || s.used + size > s.buffers.last()?.1 {
+                let whole = size.max(CARD_SCRATCH);
+                let kept = (whole == CARD_SCRATCH)
+                    .then(|| CARD_SPARE.lock().unwrap_or_else(|e| e.into_inner()).pop())
+                    .flatten();
+                let buffer = match kept {
+                    Some(b) => b,
+                    None => {
+                        let b = host.uav_buffer(whole)?;
+                        name(&b, || "list scratch on the card".into());
+                        b
+                    }
+                };
+                s.buffers.push((buffer, whole));
+                s.used = 0;
+            }
+            let at = s.used;
+            s.used += size;
+            (s.buffers.last()?.0.clone(), at)
+        };
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() } + at;
+        self.deferred().copies.push(Step::CardRead(shadow.clone(), address as usize, len as usize, buffer, at));
+        Some(gpu)
+    }
+
     /// The bytes of scratch chunks the list holds now (after a reset:
     /// none while lists share their chunks).
     pub(crate) fn scratch_kept(&self) -> u64 {
@@ -7547,6 +7658,16 @@ impl HostList {
                     }
                     continue;
                 }
+                Step::CardRead(from, src, len, buffer, at) => {
+                    // As a view of the copy: the title's bytes go up ahead
+                    // with the submission's refreshes (brought up to date
+                    // one view at a time, run tc5 spent ~15 ms more a frame
+                    // in copies), the copy is behind the flights in queue
+                    // order.
+                    batch.add(from, *src, *len);
+                    batch.card_copies.push((CardTo::Own(buffer.clone(), *at), from.clone(), *src, *len));
+                    continue;
+                }
                 &Step::CardCopy(dst, src, len, ref to, ref from) => {
                     if !batch.card {
                         // Waited for (no flights): on the CPU, as a `Copy`.
@@ -7563,7 +7684,7 @@ impl HostList {
                         batch.flush_one(from);
                         batch.flush_one(to);
                         to.writing(dst, len);
-                        batch.card_copies.push((to.clone(), from.clone(), dst, src, len));
+                        batch.card_copies.push((CardTo::Title(to.clone(), dst), from.clone(), src, len));
                         CARD_COPIES[0].fetch_add(1, Ordering::Relaxed);
                         CARD_COPIES[1].fetch_add(len as u64, Ordering::Relaxed);
                         continue;
@@ -7694,7 +7815,7 @@ struct Batch {
     card: bool,
     /// The title buffer copies the card does ahead of the submission's
     /// lists: destination's copy, source's copy, destination, source, bytes.
-    card_copies: Vec<(std::sync::Arc<crate::shadow::Shadow>, std::sync::Arc<crate::shadow::Shadow>, usize, usize, usize)>,
+    card_copies: Vec<CardOp>,
 }
 
 impl Batch {
