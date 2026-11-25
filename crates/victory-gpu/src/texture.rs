@@ -134,14 +134,14 @@ fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resourc
 }
 
 /// Whether staging buffers are taken from and returned to the spare ones
-/// now (`VICTORY_STAGING_POOL`).
+/// now (`VICTORY_STAGING_POOL=1`; off by default, as the set of run 253; run fs3).
 fn staging_pool() -> bool {
     /// 0 off, 1 on, 2 in turn.
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     match *MODE.get_or_init(|| match std::env::var("VICTORY_STAGING_POOL").as_deref() {
-        Ok("0") => 0,
+        Ok("1") => 1,
         Ok("alt") => 2,
-        _ => 1,
+        _ => 0,
     }) {
         0 => false,
         1 => true,
@@ -412,9 +412,10 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 ///
 /// What changes for the picture: a texture that arrives while the runtime
 /// is remapping may show a frame later. It never shows partly read.
+/// On by default (run fs3); `VICTORY_TEXTURE_NO_WAIT=0` waits.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
