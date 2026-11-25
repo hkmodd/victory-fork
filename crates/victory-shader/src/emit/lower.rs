@@ -548,7 +548,62 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
     same
 }
 
-/// What a register value holds, for [`wave_local`].
+/// Whether `v` is the same in every lane of its console wave in the
+/// surrounding control flow: constants, scalar reads, and lane operations
+/// whose inputs all are, through loop-carried phis. An LDS read at a
+/// uniform address counts: every lane asks for the same dword (the shader
+/// uses this for a wave's running scan).
+fn value_uniform(p: &Program, st: &Structured, v: Value, seen: &mut HashSet<Value>) -> bool {
+    if !seen.insert(v) {
+        // A loop-carried value: its non-cyclic inputs decide, and those are
+        // checked by the caller's phi arm.
+        return true;
+    }
+    for block in &p.blocks {
+        for phi in &block.phis {
+            if phi.value == v {
+                return phi
+                    .args
+                    .iter()
+                    .all(|&a| value_uniform(p, st, a, seen));
+            }
+        }
+        for inst in &block.insts {
+            if !inst.writes.iter().any(|&(_, w)| w == v) {
+                continue;
+            }
+            let name = inst.name();
+            let scalar_ok = |x: Value| !st.masks.contains_key(&x) && !st.highs.contains_key(&x);
+            let operand_ok = |op: &Operand, seen: &mut HashSet<Value>| match *op {
+                Operand::Vector { reg, .. } => inst
+                    .read(Reg::V(reg))
+                    .is_some_and(|x| value_uniform(p, st, x, seen)),
+                Operand::Scalar { code, .. } => inst
+                    .read(Reg::S(code))
+                    .is_none_or(&scalar_ok),
+                _ => true,
+            };
+            if name.starts_with("ds_read") {
+                // The address is uniform, so every lane reads that dword.
+                let Fields::Ds { addr, .. } = &inst.fields else {
+                    return false;
+                };
+                return addr
+                    .as_ref()
+                    .is_none_or(|a| operand_ok(a, seen));
+            }
+            if name.starts_with("v_mbcnt") || name.contains("lane") || name.starts_with("v_cmpx") {
+                return false;
+            }
+            let Fields::Valu(val) = &inst.fields else {
+                return false;
+            };
+            return val.src.iter().all(|op| operand_ok(op, seen));
+        }
+    }
+    false
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Wave {
     /// Nothing that depends on how the threads are divided into waves.
@@ -7890,12 +7945,14 @@ impl<'a> Lower<'a> {
                 let (mine, any) = self.first_lane(a, guard);
                 // two host waves that exchange: the console's first lane may be in the other
                 // one, unless every lane holds the same value
-                let alike = match v.src.first() {
-                    Some(&Operand::Vector { reg, .. }) => {
-                        inst.read(Reg::V(reg)).is_some_and(|x| self.uniform.contains(&x))
-                    }
-                    _ => true,
+                let src = match v.src.first() {
+                    Some(&Operand::Vector { reg, .. }) => inst.read(Reg::V(reg)),
+                    _ => None,
                 };
+                let alike = src.is_some_and(|x| {
+                    self.uniform.contains(&x)
+                        || value_uniform(self.x.p, self.x.st, x, &mut HashSet::new())
+                });
                 let halves = self.exchange.as_ref().is_some_and(|e| !e.1) && !self.local;
                 let r = if halves && !alike {
                     if !self.all_lanes(self.cur_ir) {
