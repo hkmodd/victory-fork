@@ -354,6 +354,10 @@ struct Section {
     /// committed for all of them, and these bits live and die with the
     /// section, so a page number used again in a new section starts clear.
     committed: Box<[AtomicU64]>,
+    /// A view of ours on the whole section, mapped at its first write
+    /// ([`whole_views`]); 0 when not mapped (or the mapping failed).
+    whole: std::sync::OnceLock<usize>,
+    pages: usize,
 }
 
 impl Section {
@@ -361,8 +365,40 @@ impl Section {
         Section {
             handle,
             committed: (0..pages.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+            whole: std::sync::OnceLock::new(),
+            pages,
         }
     }
+
+    /// The address of [`Section::whole`], mapped now if it is not yet.
+    fn whole(&self) -> Option<usize> {
+        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+        let at = *self.whole.get_or_init(|| {
+            if self.handle.is_null() {
+                return 0;
+            }
+            // SAFETY: the whole of a section we own; unmapped on drop. It
+            // reserves addresses only: pages are committed as written.
+            unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, self.pages * PAGE) }.Value as usize
+        });
+        (at != 0).then_some(at)
+    }
+}
+
+/// Whether DirectStorage writes into physical pages through one view of
+/// each section, kept for the section's life (`VICTORY_PHYSICAL_VIEW=0`:
+/// a view of its own per write, as before). Each write took a map, a commit
+/// and an unmap (which flushes every core's TLB), all three holding the
+/// process's address space; some fifteen workers write while the world
+/// streams in, and the title's own page mappings (`map_alias`,
+/// `XMemMapPhysicalPages`) waited behind them: in a timing capture at 100 s
+/// two title threads waited 0.66 s each of 5.3 s on that lock, woken by the
+/// workers' `write_physical` and `page_window`, while one remap took 1 ms
+/// instead of 10 us. With the view the pages are committed once (the
+/// section's bits) and fault in once.
+fn whole_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PHYSICAL_VIEW").is_none_or(|v| v != "0"))
 }
 
 // SAFETY: a section handle may be used from any thread.
@@ -372,6 +408,13 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        if let Some(&at) = self.whole.get()
+            && at != 0
+        {
+            use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+            // SAFETY: our whole view; nothing holds it (a `View` on it holds the section).
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void }) };
+        }
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.handle) };
     }
@@ -563,6 +606,9 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
 struct View {
     at: MEMORY_MAPPED_VIEW_ADDRESS,
     len: usize,
+    /// A piece of the section's whole view ([`whole_views`]): not unmapped
+    /// on drop, and the section held so that view stays.
+    within: Option<Arc<Section>>,
 }
 
 impl View {
@@ -570,6 +616,24 @@ impl View {
     fn map(slice: &Slice, n: usize) -> Option<View> {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
+        if whole_views()
+            && slice.index + n <= slice.section.pages
+            && let Some(base) = slice.section.whole()
+        {
+            let at = base + slice.index * PAGE;
+            // A section page committed once stays committed for every view.
+            if !slice.committed(n) {
+                if !commit(at, len) {
+                    return None;
+                }
+                slice.note_committed(n);
+            }
+            return Some(View {
+                at: MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void },
+                len,
+                within: Some(slice.section.clone()),
+            });
+        }
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let at = unsafe {
             MapViewOfFile(
@@ -583,7 +647,7 @@ impl View {
         if at.Value.is_null() {
             return None;
         }
-        let view = View { at, len };
+        let view = View { at, len, within: None };
         commit(at.Value as usize, len).then_some(view)
     }
 
@@ -598,6 +662,9 @@ impl View {
 impl Drop for View {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+        if self.within.is_some() {
+            return;
+        }
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(self.at) };
     }
