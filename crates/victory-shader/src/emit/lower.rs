@@ -108,9 +108,29 @@ pub(super) fn lower_with_thread_limit(
     parts: &Parts,
     partial: bool,
 ) -> Result<Lowered, ShaderError> {
+    lower_limited(parts, if partial { Limit::Return } else { Limit::None })
+}
+
+/// The dispatch's thread limit (`USER_DISPATCH_THREADS_X`) kept only from
+/// memory writes: threads past it still run (a console wave split in host
+/// waves needs every thread at its barriers) but store nothing.
+pub(super) fn lower_with_store_limit(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_limited(parts, Limit::Stores)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Limit {
+    None,
+    /// Threads past the limit return at once.
+    Return,
+    /// Threads past the limit run but do not write memory.
+    Stores,
+}
+
+fn lower_limited(parts: &Parts, limit: Limit) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad, partial).run(partial) {
+        match Lower::new(parts, &bad, limit == Limit::Return).run(limit) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -202,6 +222,9 @@ struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
     bad: &'a HashMap<Value, Why>,
+    /// With [`Limit::Stores`]: the thread is inside the dispatch's limit
+    /// (an entry block value, so it dominates every write).
+    inside: Option<V>,
     lane_fail: HashMap<Value, Why>,
     vals: HashMap<Value, Val>,
     floats: HashMap<Value, V>,
@@ -1516,6 +1539,7 @@ impl<'a> Lower<'a> {
             s,
             x,
             bad,
+            inside: None,
             lane_fail: HashMap::new(),
             vals: HashMap::new(),
             floats: HashMap::new(),
@@ -2221,14 +2245,14 @@ impl<'a> Lower<'a> {
         self.s.m.bin(c, Bin::Or, first, sum)
     }
 
-    fn run(mut self, partial: bool) -> Result<Lowered, Stop> {
-        if partial {
+    fn run(mut self, limit: Limit) -> Result<Lowered, Stop> {
+        if limit != Limit::None {
             // Keep inactive threads out of wave counts, packed-header
             // reads, and stores. Wave64 emulation through group barriers
             // requires full participation and cannot run this prologue.
             let original = self.s.entry;
             let width = self.s.threads.expect("compute thread count")[0];
-            let limit = self.host_word(
+            let threads = self.host_word(
                 RootType::Other(super::shader::USER_DISPATCH_THREADS_X),
                 0,
                 width,
@@ -2243,14 +2267,18 @@ impl<'a> Lower<'a> {
             let first = self.s.m.bin(original, Bin::Mul, group, width);
             let x = self.s.m.bin(original, Bin::Add, first, thread);
             let zero = self.s.m.i32(0);
-            let unlimited = self.s.m.cmp(original, pred::EQ, limit, zero);
-            let inside = self.s.m.cmp(original, pred::IULT, x, limit);
+            let unlimited = self.s.m.cmp(original, pred::EQ, threads, zero);
+            let inside = self.s.m.cmp(original, pred::IULT, x, threads);
             let active = self.s.m.bin(original, Bin::Or, unlimited, inside);
-            let body = self.s.m.new_block();
-            let done = self.s.m.new_block();
-            self.s.m.terminate(original, Term::CondBr(active, body, done));
-            self.s.m.terminate(done, Term::Ret);
-            self.s.entry = body;
+            if limit == Limit::Stores {
+                self.inside = Some(active);
+            } else {
+                let body = self.s.m.new_block();
+                let done = self.s.m.new_block();
+                self.s.m.terminate(original, Term::CondBr(active, body, done));
+                self.s.m.terminate(done, Term::Ret);
+                self.s.entry = body;
+            }
         }
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
@@ -3038,7 +3066,8 @@ impl<'a> Lower<'a> {
             args.resize(3 + 4, iu);
             args.push(self.s.m.i8((1u8 << n) - 1));
             args.push(align);
-            let at = self.begin_guarded(guard);
+            let limited = self.write_guard(guard);
+            let at = self.begin_guarded(limited);
             self.s
                 .op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
             self.end_guarded(at, &[]);
@@ -3080,7 +3109,8 @@ impl<'a> Lower<'a> {
             "fmin" | "fmax" => None,
             _ => return Err(name),
         };
-        let at = self.begin_guarded(guard);
+        let limited = self.write_guard(guard);
+        let at = self.begin_guarded(limited);
         let was = match simple {
             Some((code, x)) => {
                 let code = self.s.m.i32(code);
@@ -4031,6 +4061,16 @@ impl<'a> Lower<'a> {
         match self.x.st.guards[b][i] {
             None => Ok(None),
             Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
+        }
+    }
+
+    /// The lane guard of a memory write, with the dispatch's thread limit
+    /// ([`Limit::Stores`]) added.
+    pub(super) fn write_guard(&mut self, guard: Option<V>) -> Option<V> {
+        match (guard, self.inside) {
+            (g, None) => g,
+            (None, inside) => inside,
+            (Some(g), Some(inside)) => Some(self.s.m.bin(self.cur, Bin::And, g, inside)),
         }
     }
 
@@ -9883,7 +9923,8 @@ impl<'a> Lower<'a> {
             let set_next = self.s.m.bin(c, Bin::LShr, v, k8);
             let (and, or) = (self.s.m.i32(1), self.s.m.i32(2));
             let i32t = self.s.t.i32;
-            let at = self.begin_guarded(guard);
+            let limited = self.write_guard(guard);
+            let at = self.begin_guarded(limited);
             for (op, x) in [(and, keep), (or, set)] {
                 let args = [h, op, aligned, iu, iu, x];
                 self.s
@@ -9928,7 +9969,8 @@ impl<'a> Lower<'a> {
                 Some(v) if returns => self.i32_of(v)?,
                 _ => self.s.m.i32(0),
             };
-            let at = self.begin_guarded(guard);
+            let limited = self.write_guard(guard);
+            let at = self.begin_guarded(limited);
             let i32t = self.s.t.i32;
             let r = if op == u32::MAX {
                 // cmpswap: data is (new, compare).
@@ -10020,7 +10062,8 @@ impl<'a> Lower<'a> {
             if !typed {
                 args.push(self.s.m.i32(4));
             }
-            let at = self.begin_guarded(guard);
+            let limited = self.write_guard(guard);
+            let at = self.begin_guarded(limited);
             let void = self.s.t.void;
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
             self.end_guarded(at, &[]);

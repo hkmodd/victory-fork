@@ -696,12 +696,13 @@ fn emit_program(
     let mut l = lower::lower_with_thread_limit(&parts, box_rehydration)?;
     // The thread limit keeps the console's 64-lane waves (the split into
     // host waves of 32 needs every thread at its barriers), which a host of
-    // 32 lanes (NVIDIA) refuses: there the kernel runs split, without the
-    // limit (the dispatch still has the right group count; only the last
-    // group's spare lanes run).
+    // 32 lanes (NVIDIA) refuses: there the kernel runs split, every thread
+    // of the last group at its barriers, and the spare ones write no memory
+    // (unguarded, they stored empty boxes past the array: run bvh4, a title
+    // object full of half +inf/-inf).
     let max = lower::host_max_wave();
     if box_rehydration && max != 0 && l.wave_size.is_some_and(|w| w > max) {
-        l = lower::lower_with_thread_limit(&parts, false)?;
+        l = lower::lower_with_store_limit(&parts)?;
     }
     let wave_size = l.wave_size;
     let shader = HostShader {

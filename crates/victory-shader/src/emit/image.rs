@@ -168,7 +168,8 @@ impl<'a> Lower<'a> {
                     78,
                 )
             };
-            let at = self.begin_guarded(guard);
+            let limited = self.write_guard(guard);
+            let at = self.begin_guarded(limited);
             let r = self
                 .s
                 .op(self.cur, intrinsic, Attr::NoUnwind, ty, opcode, &args);
@@ -222,7 +223,8 @@ impl<'a> Lower<'a> {
                 });
             }
             let h = self.handle(site, src, false, props)?;
-            let at = self.begin_guarded(guard);
+            let limited = self.write_guard(guard);
+            let at = self.begin_guarded(limited);
             let mut args = vec![h];
             args.extend(cs);
             args.extend(vals);
