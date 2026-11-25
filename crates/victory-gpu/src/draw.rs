@@ -935,9 +935,14 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{
+            USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+        };
+        if kind == USER_DISPATCH_THREADS_X {
+            return 0;
+        }
         if kind == USER_MEMORY_BASE {
-            return memory.map_or(0, |m| m.base);
+            return memory.map_or(0, |m| if dword == 0 { m.base } else { m.count });
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
@@ -1172,7 +1177,10 @@ impl State {
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                // The shader can read the scene through guest addresses and
+                // write its result to a texture or a separate root UAV.
+                let raw_writes = writes && (t.host.writes_guest_memory || !write_skip());
+                let Some(ready) = self.memory_ready(list, compute, raw_writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
@@ -1324,7 +1332,9 @@ impl State {
                         None
                     }
                 };
-                if !self.root_uav(list, address, param, compute, writes) {
+                let writes_slot =
+                    writes && (!write_skip() || t.host.written_root_uavs.contains(&slot));
+                if !self.root_uav(list, address, param, compute, writes_slot) {
                     return false;
                 }
             }
@@ -2262,7 +2272,7 @@ impl State {
     }
 
     /// Runs a dispatch on the host.
-    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: Option<u32>) {
         // It may write the arguments a window holds clamped.
         self.window = None;
         list.gather_close();
@@ -2314,10 +2324,34 @@ impl State {
             }
             return;
         }
+        let builder = crate::pipeline::is_builder(self.pipeline as This);
+        let thread_group = (builder && flags.unwrap_or(0) & 0x20 != 0)
+            .then(|| p.stages[0].translated().compute_threads)
+            .flatten();
+        let threads = [x, y, z];
+        let [x, y, z] = thread_group.map_or(threads, |size| {
+            std::array::from_fn(|i| threads[i].div_ceil(size[i]))
+        });
+        let tail = thread_group.and_then(|_| {
+            let stage = p.stages.first().filter(|_| p.compute)?;
+            let (param, _) = stage.user_data?;
+            let word = stage.translated().host.user_data.iter().find(|u| {
+                u.root == RootType::Other(victory_shader::emit::USER_DISPATCH_THREADS_X)
+            })?;
+            Some((param, word.index))
+        });
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        // SAFETY: an open list with everything set; `tail` names a declared root word.
+        unsafe {
+            if let Some((param, word)) = tail {
+                list.list.SetComputeRoot32BitConstant(param, threads[0], word);
+            }
+            list.list.Dispatch(x, y, z);
+            if let Some((param, word)) = tail {
+                list.list.SetComputeRoot32BitConstant(param, 0, word);
+            }
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if self.ambient(list, p) {
             self.host_heaps = [0; 2];

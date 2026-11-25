@@ -105,21 +105,34 @@ fn lowered_on(
     wide: &HashSet<usize>,
     host_wave: u32,
 ) -> Result<HostShader, ShaderError> {
+    lowered_dispatch(native, p, wide, host_wave, false)
+}
+
+fn lowered_dispatch(
+    native: &NativeProgram,
+    p: &ir::Program,
+    wide: &HashSet<usize>,
+    host_wave: u32,
+    partial: bool,
+) -> Result<HostShader, ShaderError> {
     let st = structure::structure_wide(p, wide).expect("structure");
     let res = resource::track(p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(p, native).expect("io::raise");
     let was = lower::TEST_HOST_WAVE.replace(Some(host_wave));
-    let lowered = lower::lower(&lower::Parts {
-        native,
-        p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-    });
+    let lowered = lower::lower_with_thread_limit(
+        &lower::Parts {
+            native,
+            p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        },
+        partial,
+    );
     lower::TEST_HOST_WAVE.set(was);
     let lowered = lowered?;
     Ok(HostShader {
@@ -131,8 +144,62 @@ fn lowered_on(
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        written_root_uavs: lowered.written_root_uavs,
+        writes_guest_memory: lowered.writes_guest_memory,
         root_indexed_views: res.root_indexed_views,
     })
+}
+
+#[test]
+fn partial_thread_dispatch_masks_the_final_groups_memory_writes() {
+    // Each active thread increments counter[local X]. With two groups the
+    // tail's first N lanes report two increments, the others only one.
+    let native = native(&[
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0x7e04_0281, // v_mov_b32 v2, 1
+        0xe0c8_1000, 0x8002_0201, // buffer_atomic_add v2, v1, s[8:11], 0 offen
+    ]);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let shader = lowered_dispatch(&native, &p, &HashSet::new(), 64, true).unwrap();
+    let limit = shader
+        .user_data
+        .iter()
+        .find(|u| u.root == RootType::Other(super::USER_DISPATCH_THREADS_X))
+        .unwrap();
+    assert_eq!((limit.slot, limit.dword), (0, 64));
+    let mut validator =
+        validator::Validator::load(validator::Validator::default_path().as_deref()).unwrap();
+    validator.validate(&mut shader.dxil.clone()).unwrap();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(true) else { return };
+    let (root, pso) = host.compute_pipeline(&shader).unwrap();
+    for count in [0u32, 1, 7, 63, 64, 65, 74, 77, 127, 128] {
+        let mut constants = vec![0; shader.user_data_dwords() as usize];
+        constants[limit.index as usize] = count;
+        let result = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(constants))],
+                    views: &[View::RawUav(68)],
+                    samplers: &[],
+                    groups: [2, 1, 1],
+                },
+            )
+            .unwrap();
+        let active = if count == 0 { 128 } else { count };
+        for (i, &word) in result[0].iter().enumerate() {
+            let expected = if i < 64 {
+                u32::from((i as u32) < active) + u32::from((i as u32 + 64) < active)
+            } else {
+                0
+            };
+            assert_eq!(word, expected, "count {count}, word {i}");
+        }
+    }
 }
 
 #[test]
