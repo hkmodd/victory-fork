@@ -693,7 +693,16 @@ fn emit_program(
         0xba30_5538_e28d_414c_af39_a51a_4bc2_f308
             | 0xd635_3bf6_df15_ff8e_c4aa_aec1_0dbf_3974
     ) && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads == [64, 1, 1]);
-    let l = lower::lower_with_thread_limit(&parts, box_rehydration)?;
+    let mut l = lower::lower_with_thread_limit(&parts, box_rehydration)?;
+    // The thread limit keeps the console's 64-lane waves (the split into
+    // host waves of 32 needs every thread at its barriers), which a host of
+    // 32 lanes (NVIDIA) refuses: there the kernel runs split, without the
+    // limit (the dispatch still has the right group count; only the last
+    // group's spare lanes run).
+    let max = lower::host_max_wave();
+    if box_rehydration && max != 0 && l.wave_size.is_some_and(|w| w > max) {
+        l = lower::lower_with_thread_limit(&parts, false)?;
+    }
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,
