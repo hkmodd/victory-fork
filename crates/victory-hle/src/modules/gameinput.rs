@@ -1193,15 +1193,32 @@ mod host {
             self.empty_until[slot] = None;
             #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
-            // The scripted keys (`VICTORY_KEYS`) also press the first
-            // pad's buttons, by the stand-in pad's table: with a real pad
-            // connected the stand-in is not there, and a title that listens
-            // to the pad (the title's start screen) saw nothing.
+            // The scripted keys (`VICTORY_KEYS`, `VICTORY_PATH`) also drive
+            // the first pad, by the stand-in pad's table (buttons, sticks,
+            // triggers): with a real pad connected the stand-in is not
+            // there, and a title that listens to the pad (the title's start
+            // screen, walking in the world) saw nothing. A scripted stick or
+            // trigger wins over the pad's own; with `VICTORY_KEYS_ONLY=1`
+            // the real pad is not read at all.
             #[cfg(feature = "diagnostics")]
             if slot == 0 {
-                for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
-                        pad.buttons |= button;
+                if scripted_only() {
+                    pad = PadState::default();
+                }
+                let keys: Vec<KeyState> =
+                    scripted().into_iter().map(|virtual_key| KeyState { virtual_key, ..Default::default() }).collect();
+                let by_script = fallback(&keys);
+                pad.buttons |= by_script.buttons;
+                for (own, script) in [
+                    (&mut pad.left_trigger, by_script.left_trigger),
+                    (&mut pad.right_trigger, by_script.right_trigger),
+                    (&mut pad.left_x, by_script.left_x),
+                    (&mut pad.left_y, by_script.left_y),
+                    (&mut pad.right_x, by_script.right_x),
+                    (&mut pad.right_y, by_script.right_y),
+                ] {
+                    if script != 0.0 {
+                        *own = script;
                     }
                 }
             }
@@ -1213,7 +1230,7 @@ mod host {
             let mut down = scripted();
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
-            if focused() {
+            if focused() && !scripted_only() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
@@ -1281,10 +1298,99 @@ mod host {
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
+        let mut down: Vec<u8> = keys
+            .iter()
             .filter(|&&(from, to, _)| (from..to).contains(&now))
             .map(|&(_, _, vk)| vk)
-            .collect()
+            .collect();
+        down.extend(path(now));
+        down
+    }
+
+    /// A key of `VICTORY_KEYS` or `VICTORY_PATH` by its name.
+    #[cfg(feature = "diagnostics")]
+    fn key_code(name: &str) -> Option<u8> {
+        Some(match name.trim() {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => k.as_bytes()[0].to_ascii_uppercase(),
+            _ => return None,
+        })
+    }
+
+    /// Debugging aid, for runs that must see the same views:
+    /// `VICTORY_PATH=<seconds>;<frames>:<keys>,<frames>:<keys>,...`. From
+    /// `seconds` after input starts (the clock of `VICTORY_KEYS`) each step
+    /// holds its keys for that many presented frames, one step after the
+    /// other, then nothing. Keys are named as in `VICTORY_KEYS` and joined
+    /// with `+`; on the stand-in pad's table W/A/S/D push the left stick
+    /// (walk), I/J/K/L the right one (look), `-` holds none. Steps count
+    /// frames, not seconds, on the assumption that at a few frames a second
+    /// the title moves by frames (its step of time held at a limit): then a
+    /// path ends in the same place in a slower and a faster run.
+    #[cfg(feature = "diagnostics")]
+    fn path(now: Duration) -> Vec<u8> {
+        use std::sync::atomic::AtomicUsize;
+        static PATH: LazyLock<Option<(Duration, Vec<(u64, Vec<u8>)>)>> = LazyLock::new(|| {
+            let text = std::env::var("VICTORY_PATH").ok()?;
+            let (at, steps) = text.split_once(';')?;
+            let at = Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?;
+            let steps = steps
+                .split(',')
+                .filter_map(|step| {
+                    let (frames, keys) = step.split_once(':')?;
+                    let keys = match keys.trim() {
+                        "-" => Vec::new(),
+                        keys => keys.split('+').map(key_code).collect::<Option<Vec<u8>>>()?,
+                    };
+                    Some((frames.trim().parse().ok()?, keys))
+                })
+                .collect();
+            Some((at, steps))
+        });
+        /// The presented frame the path started at (`u64::MAX`: not yet).
+        static FIRST: AtomicU64 = AtomicU64::new(u64::MAX);
+        /// The step last logged (`usize::MAX`: none).
+        static LOGGED: AtomicUsize = AtomicUsize::new(usize::MAX);
+        let Some((at, steps)) = &*PATH else {
+            return Vec::new();
+        };
+        if now < *at {
+            return Vec::new();
+        }
+        let frame = victory_gpu::queue::presented();
+        let first = match FIRST.compare_exchange(u64::MAX, frame, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => frame,
+            Err(first) => first,
+        };
+        let mut left = frame - first;
+        for (index, (frames, keys)) in steps.iter().enumerate() {
+            if left < *frames {
+                if LOGGED.swap(index, Ordering::Relaxed) != index {
+                    tracing::info!(step = index + 1, of = steps.len(), frames, frame, keys = ?keys, "scripted path (VICTORY_PATH)");
+                }
+                return keys.clone();
+            }
+            left -= frames;
+        }
+        if LOGGED.swap(steps.len(), Ordering::Relaxed) != steps.len() {
+            tracing::info!(frame, "scripted path (VICTORY_PATH) done");
+        }
+        Vec::new()
+    }
+
+    /// `VICTORY_KEYS_ONLY=1` (diagnostics builds): the host's own pad and
+    /// keyboard are not read, only the scripted keys; for runs that must be
+    /// alike while someone sits at the machine.
+    fn scripted_only() -> bool {
+        static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_KEYS_ONLY").is_some_and(|v| v == "1"));
+        cfg!(feature = "diagnostics") && *ON
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
