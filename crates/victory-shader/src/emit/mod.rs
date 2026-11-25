@@ -503,6 +503,28 @@ pub fn emit(
                 }
             }
         }
+        // Nothing else gave 32-lane waves: the host refuses the pipeline (its draws and
+        // dispatches are lost: the water's transmission, the particles' visibility, the
+        // shadow-ray tiling). The wave-wide form as the last resort, by default, for these
+        // programs only: the ones that translate otherwise keep their form (runs 121-124
+        // lost the card with it ahead of the approximate forms, `VICTORY_WAVE_WIDE=1`).
+        // `VICTORY_WAVE_WIDE=0` refuses them as before.
+        if !wide_on && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") {
+            let deep = form(ir::without_skips(p, true));
+            let bases = [
+                deep.as_ref().map(|f| &f.0),
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            for base in bases.into_iter().flatten() {
+                let again = widen(c, native, base, why);
+                report("wave-wide branches (last resort)", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
+                }
+            }
+        }
     }
     // Cross-lane code that needs every lane of the console wave where it
     // stands (a mask operation, a lane read, a first-lane read): right once
