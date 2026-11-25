@@ -1823,6 +1823,46 @@ pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
+/// Since the last frame-rate line, why [`Shadow::merge_under_writes`] left
+/// the flights to be settled: the copy is not write-watched, the journal
+/// could not say what was written, the changed runs ran out, a snapshot
+/// was missing.
+static MERGE_REFUSED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// [`MERGE_REFUSED`], taken.
+pub(crate) fn merge_refused() -> [u64; 4] {
+    [0, 1, 2, 3].map(|i| MERGE_REFUSED[i].swap(0, Ordering::Relaxed))
+}
+
+/// Whether the small changed runs of copies in the card's memory go up as
+/// byte masks over 4 KiB windows, put in by a compute pass that writes only
+/// the marked bytes (`VICTORY_CARD_MASKS`; on by default, `0`: each run is
+/// a copy of its own, as before).
+///
+/// Why: under flights' shader writes the title's bytes are put in run by
+/// run (`merge_under_writes`), and the title changes its pages in runs of
+/// about 3 bytes: run mr2 had 24,000 to 42,000 a frame, over the cap of
+/// 4,096 copies a submission once a frame, and each time the flights were
+/// settled, 43 ms of the 137 ms frame. Run mr1 (cap 65,536) still settled
+/// 0.8 times a frame, and the card idled more. Joining runs over gaps
+/// (`VICTORY_MERGE_GAP`) is not exact. A mask is: the bytes put in are
+/// exactly the runs, the cost follows the windows, not the runs.
+pub(crate) fn card_masks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_MASKS").is_none_or(|v| v != "0"))
+}
+
+/// The longest run that goes up in a mask ([`card_masks`]); longer runs are
+/// copies of their own.
+pub(crate) const MASKED_MAX: usize = 256;
+
+/// The window of a mask record, in bytes.
+pub(crate) const MASK_WINDOW: usize = 4096;
+
+/// A mask record: the window's offset (a dword), its bits (a dword per 32
+/// bytes) and its bytes.
+pub(crate) const MASK_RECORD: usize = 4 + MASK_WINDOW / 8 + MASK_WINDOW;
+
 /// `runs` (in order) with those a gap of `gap` bytes or fewer apart made
 /// one run, the gap's bytes included.
 fn joined_over(runs: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
@@ -3119,6 +3159,29 @@ impl Shadow {
         !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
+    /// Whether `[from, to)` lies wholly in ranges this copy's shaders were
+    /// declared to write and that are not copied back yet.
+    pub(crate) fn pending_covers(&self, from: usize, to: usize) -> bool {
+        let mut ranges = self.pending.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        ranges.sort_unstable();
+        let mut at = from;
+        for (a, b) in ranges {
+            if at >= to {
+                break;
+            }
+            if a > at {
+                return false;
+            }
+            at = at.max(b);
+        }
+        at >= to
+    }
+
+    /// Whether this is title memory in place (no copy of its own).
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     /// Whether [`Shadow::update`] of `[address, address + len)` would leave
     /// title bytes behind: a range shaders may be writing holds a page the
     /// title wrote since the copy last took it. The answer comes from the
@@ -3192,6 +3255,7 @@ impl Shadow {
             return false;
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            MERGE_REFUSED[0].fetch_add(1, Ordering::Relaxed);
             return true;
         }
         let base = start / PAGE;
@@ -3204,6 +3268,7 @@ impl Shadow {
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
+                MERGE_REFUSED[1].fetch_add(1, Ordering::Relaxed);
                 return true;
             };
             let stale: Vec<usize> = {
@@ -3238,10 +3303,17 @@ impl Shadow {
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = joined_over(changed_runs(title, held), merge_gap());
-                    if runs.len() > *runs_left {
+                    // Runs that go up in masks are not copies of their own.
+                    let copies = if self.card_maskable() {
+                        runs.iter().filter(|r| r.1 > MASKED_MAX).count()
+                    } else {
+                        runs.len()
+                    };
+                    if copies > *runs_left {
+                        MERGE_REFUSED[2].fetch_add(1, Ordering::Relaxed);
                         return true;
                     }
-                    *runs_left -= runs.len();
+                    *runs_left -= copies;
                     for (r, m) in runs {
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
                         self.card_changed(at + r, at + r + m);
@@ -3250,6 +3322,7 @@ impl Shadow {
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
+                        MERGE_REFUSED[3].fetch_add(1, Ordering::Relaxed);
                         return true;
                     };
                     // SAFETY: the snapshot's allocation holds the copy's
@@ -3512,6 +3585,54 @@ impl Shadow {
     /// ([`cards`]).
     pub(crate) fn carded(&self) -> bool {
         self.card.is_some()
+    }
+
+    /// Whether this copy's small changed runs go up as byte masks
+    /// ([`card_masks`]): a copy in the card's memory whose size is whole
+    /// dwords (the merge writes dwords) and fits the masks' 32-bit offsets.
+    pub(crate) fn card_maskable(&self) -> bool {
+        card_masks() && self.card.as_ref().is_some_and(|c| c.size % 4 == 0 && c.size <= u64::from(u32::MAX))
+    }
+
+    /// Of a copy in the card's memory: appends to `out` a record
+    /// ([`MASK_RECORD`] bytes) for each 4 KiB window of the card's side
+    /// that `ranges` (offsets in the copy) touch: the window's offset, a
+    /// bit per byte of it set where a range lies, and the CPU side's bytes
+    /// of the window as they are now. Returns the number of records.
+    pub(crate) fn card_mask_records(&self, ranges: impl Iterator<Item = (usize, usize)>, out: &mut Vec<u8>) -> u32 {
+        let Some(card) = &self.card else {
+            return 0;
+        };
+        let size = card.size as usize;
+        let mut windows: BTreeMap<usize, Box<[u32; 128]>> = BTreeMap::new();
+        for (a, b) in ranges {
+            let b = b.min(size);
+            let mut x = a;
+            while x < b {
+                let w = x & !(MASK_WINDOW - 1);
+                let end = b.min(w + MASK_WINDOW);
+                let mask = windows.entry(w).or_insert_with(|| Box::new([0; 128]));
+                for byte in x - w..end - w {
+                    mask[byte >> 5] |= 1 << (byte & 31);
+                }
+                x = end;
+            }
+        }
+        // The relay's thread writes the CPU side under this lock
+        // (`card_merge_relay`).
+        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        for (&w, mask) in &windows {
+            out.extend_from_slice(&(w as u32).to_le_bytes());
+            for word in mask.iter() {
+                out.extend_from_slice(&word.to_le_bytes());
+            }
+            let at = out.len();
+            out.resize(at + MASK_WINDOW, 0);
+            // SAFETY: the CPU side's mapping holds `size` bytes, and the
+            // window's bytes up to `size` are read.
+            unsafe { std::ptr::copy_nonoverlapping(self.data.add(w), out[at..].as_mut_ptr(), (size - w).min(MASK_WINDOW)) };
+        }
+        windows.len() as u32
     }
 
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
