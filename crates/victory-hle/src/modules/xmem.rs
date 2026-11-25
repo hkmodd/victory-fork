@@ -385,6 +385,18 @@ struct Physical {
     shown: HashMap<(usize, usize), Vec<usize>>,
 }
 
+impl Physical {
+    /// `[base, end)` grown to the whole views it touches: [`unmap`] takes
+    /// them away and maps what stays again, and what they show before and
+    /// after is compared over all of it (`victory_gpu::title_memory_remapping_range`;
+    /// from DexNom's runtime).
+    fn unmap_extent(&self, base: usize, end: usize) -> std::ops::Range<usize> {
+        let start = self.views.range(..=base).next_back().filter(|(at, (size, _))| *at + size > base).map_or(base, |(&at, _)| at);
+        let end = self.views.range(..end).next_back().map_or(end, |(&at, (size, _))| end.max(at + size));
+        start..end
+    }
+}
+
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
     Mutex::new(Physical {
         // Page numbers are opaque to titles; 0 stays unused.
@@ -673,8 +685,10 @@ pub extern "system" fn XMemMapPhysicalPages(
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
-    // into that gap (`victory_gpu::title_memory_remapping`).
-    let _changing = victory_gpu::title_memory_remapping();
+    // into that gap (`victory_gpu::title_memory_remapping`). What the range
+    // shows before and after is compared: shader writes still in the air
+    // to pages that change no longer land there.
+    let _changing = victory_gpu::title_memory_remapping_range(physical.unmap_extent(base, base.saturating_add(n.saturating_mul(PAGE))));
     unmap(&mut physical, base, n * PAGE);
     if pages.is_null() {
         return address;
@@ -742,8 +756,9 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
-    // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let _changing = victory_gpu::title_memory_remapping();
+    // As in `XMemMapPhysicalPages`: no read in place meets the gap. The
+    // last page is mapped whole.
+    let _changing = victory_gpu::title_memory_remapping_range(physical.unmap_extent(to, to.saturating_add(len.div_ceil(PAGE).saturating_mul(PAGE))));
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {

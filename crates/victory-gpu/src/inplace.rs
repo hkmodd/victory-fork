@@ -363,6 +363,87 @@ pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
     out
 }
 
+/// Physical backing, clipped to the title range being changed: a view's
+/// part with the section and the offset in it. A view the runtime splits
+/// still shows the same section bytes on either side
+/// (`crate::watch::title_memory_remapping_range`, `crate::writeback`;
+/// from DexNom's bc3cd4b0).
+#[derive(Clone, Copy)]
+pub(crate) struct PhysicalSpan {
+    start: usize,
+    end: usize,
+    section: usize,
+    offset: u64,
+}
+
+/// The views' backing of `range`, in order.
+pub(crate) fn physical_spans(range: &std::ops::Range<usize>) -> Vec<PhysicalSpan> {
+    if range.is_empty() {
+        return Vec::new();
+    }
+    let v = views();
+    let search = v.views.range(..=range.start).next_back().map_or(range.start, |(&at, _)| at);
+    v.views
+        .range(search..range.end)
+        .filter_map(|(&base, &(size, section, offset))| {
+            let start = range.start.max(base);
+            let end = range.end.min(base.saturating_add(size));
+            (start < end).then_some(PhysicalSpan { start, end, section, offset: offset + (start - base) as u64 })
+        })
+        .collect()
+}
+
+/// Calls `changed` for each part of title memory whose backing differs
+/// between `old` and `new`, walking the union of their boundaries (no page
+/// by page). Unmapped and mapped again to the same bytes is no change.
+pub(crate) fn physical_changes(mut old: &[PhysicalSpan], mut new: &[PhysicalSpan], mut changed: impl FnMut(std::ops::Range<usize>)) {
+    let mut at = old.first().into_iter().chain(new.first()).map(|s| s.start).min().unwrap_or(0);
+    while !old.is_empty() || !new.is_empty() {
+        let interval = |list: &[PhysicalSpan]| match list.first() {
+            Some(s) if s.start <= at => (s.end, Some((s.section, s.offset + (at - s.start) as u64))),
+            Some(s) => (s.start, None),
+            None => (usize::MAX, None),
+        };
+        let (old_end, old_bytes) = interval(old);
+        let (new_end, new_bytes) = interval(new);
+        let end = old_end.min(new_end);
+        if old_bytes != new_bytes {
+            changed(at..end);
+        }
+        if old.first().is_some_and(|s| s.end == end) {
+            old = &old[1..];
+        }
+        if new.first().is_some_and(|s| s.end == end) {
+            new = &new[1..];
+        }
+        at = end;
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn physical_replacement_keeps_the_unchanged_neighbors_of_a_split_view() {
+    let span = |start, end, section, offset| PhysicalSpan { start, end, section, offset };
+    let old = [span(100, 400, 1, 1000)];
+    let split = [span(100, 200, 1, 1000), span(200, 300, 2, 0), span(300, 400, 1, 1200)];
+    let mut changed = Vec::new();
+    physical_changes(&old, &split, |r| changed.push(r));
+    assert_eq!(changed, [200..300]);
+    changed.clear();
+    physical_changes(&split, &split, |r| changed.push(r));
+    assert!(changed.is_empty());
+    let shifted = [span(100, 400, 1, 2000)];
+    physical_changes(&old, &shifted, |r| changed.push(r));
+    assert_eq!(changed, [100..400]);
+    // A view gone, none in its place: a change; none before or after: none.
+    changed.clear();
+    physical_changes(&old, &[], |r| changed.push(r));
+    assert_eq!(changed, [100..400]);
+    changed.clear();
+    physical_changes(&[], &[], |r| changed.push(r));
+    assert!(changed.is_empty());
+}
+
 /// The address of the 64 KiB page shown at `page` in every title view that
 /// shows it, `page`'s own address included; empty if `page` is not a view.
 pub(crate) fn pages_of(page: usize) -> Vec<usize> {

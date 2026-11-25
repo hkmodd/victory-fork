@@ -1061,26 +1061,46 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
 static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
-/// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>, std::time::Instant);
+/// ([`title_memory_remapping`]): the lock, when it was asked for, and the
+/// range it changes with the physical backing that range had before.
+pub struct Remapping {
+    _held: std::sync::RwLockWriteGuard<'static, ()>,
+    asked: std::time::Instant,
+    range: std::ops::Range<usize>,
+    previous: Vec<crate::inplace::PhysicalSpan>,
+}
 
 impl Drop for Remapping {
     fn drop(&mut self) {
+        // Where the backing is not what it was, what shaders of flights in
+        // the air wrote there no longer lands (`crate::writeback`). Still
+        // under the lock: no merge writes before this is known.
+        let current = crate::inplace::physical_spans(&self.range);
+        crate::inplace::physical_changes(&self.previous, &current, crate::writeback::remapped);
         // From asking for the lock until it is let go (the frame log).
-        crate::framelog::add(crate::framelog::T::RemapUs, self.1.elapsed().as_micros() as u64);
+        crate::framelog::add(crate::framelog::T::RemapUs, self.asked.elapsed().as_micros() as u64);
     }
 }
 
 /// The runtime is about to map, unmap or move physical pages of title
 /// memory: until what it returns is dropped, no read of title memory in
 /// place is under way and none begins ([`title_memory_reading`]). Taken
-/// around the whole change, the unmapping and the mapping again.
+/// around the whole change, the unmapping and the mapping again. For a
+/// change whose extent is unknown: every view is looked at
+/// ([`title_memory_remapping_range`]).
 pub fn title_memory_remapping() -> Remapping {
+    title_memory_remapping_range(0..usize::MAX)
+}
+
+/// [`title_memory_remapping`] for a change inside `range`: the physical
+/// backing there is compared before and after.
+pub fn title_memory_remapping_range(range: std::ops::Range<usize>) -> Remapping {
     let asked = std::time::Instant::now();
     let held = MAPPING.write().unwrap_or_else(|e| e.into_inner());
     crate::framelog::add(crate::framelog::T::Remaps, 1);
     crate::framelog::add(crate::framelog::T::RemapWaitUs, asked.elapsed().as_micros() as u64);
-    Remapping(held, asked)
+    let previous = crate::inplace::physical_spans(&range);
+    Remapping { _held: held, asked, range, previous }
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
