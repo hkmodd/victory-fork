@@ -192,7 +192,7 @@ impl Owners {
     /// lock, shared: no backing changes between the look and the write.
     /// Returns the bytes written.
     pub(crate) fn publish(&self, shadow: u64, address: usize, len: usize, mut write: impl FnMut(Range<usize>) -> usize) -> usize {
-        let _mapped = crate::watch::title_memory_reading();
+        let _mapped = crate::watch::title_memory_reading_range(address..address.saturating_add(len));
         // Nothing changed backing since the first of these was prepared:
         // the history is not looked at (a lock each merge, on several
         // threads at once).

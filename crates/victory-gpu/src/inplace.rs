@@ -562,7 +562,8 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
     }
     // No mapping changes until the bytes are in: the view found below
     // shows these pages for as long as this is held.
-    let _still = crate::watch::title_memory_reading_now()?;
+    // Every view of the page is written: all of title memory is pinned.
+    let _still = crate::watch::title_memory_reading_now(0..usize::MAX)?;
     let (section, offset, shown, section_bytes) = {
         let v = views();
         let (&base, &(len, section, offset)) = v.views.range(..=at).next_back()?;
