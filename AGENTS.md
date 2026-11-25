@@ -74,8 +74,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\Tools\victory\run.ps1 -Na
 - Nessun bypass di licenza, XStore o DRM. Nessun servizio online. `XCL_NETWORK=0`.
 - Mai committare dati del gioco, dump, shader estratti, file SDK o chiavi. Gli intermedi derivati dal gioco in
   `D:\Temp\victory` si cancellano dopo l'analisi. Temp solo su D:; `D:\Temp\victory` sotto ~1 GB.
-- Licenze: questo repository è GPL-3.0-or-later. Si porta solo da GPL-3.0 (famiglia VIctory, §6) o MIT
-  (OpenScarlett), con crediti. **Mai codice XCL** (GPL-2.0-only), mai WinDurango.
 - Git: merge, mai rebase o force-push su rami condivisi. Il main locale = upstream + nostro. Nessuna PR verso
   fxceless (decisione dell'Host, 2026-11-25). Push solo sul fork `hk` (hkmodd/victory-fork), rami `hk/*`;
   il main del fork resta specchio di upstream. Identità dei commit:
