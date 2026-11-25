@@ -1799,7 +1799,7 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
-/// once (`VICTORY_CARD_REHASH_RUNS=1`; off by default), and not in a pass
+/// once (on by default, run fs1; `VICTORY_CARD_REHASH_RUNS=0` off), and not in a pass
 /// per range sent up.
 ///
 /// These passes are ours, they run on the card before every submission's
@@ -1819,9 +1819,9 @@ fn rehash_runs() -> bool {
     /// 0 off, 1 on, 2 in turn.
     static MODE: OnceLock<u8> = OnceLock::new();
     match *MODE.get_or_init(|| match std::env::var("VICTORY_CARD_REHASH_RUNS").as_deref() {
-        Ok("1") => 1,
+        Ok("0") => 0,
         Ok("alt") => 2,
-        _ => 0,
+        _ => 1,
     }) {
         0 => false,
         1 => true,
