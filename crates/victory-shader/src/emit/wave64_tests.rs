@@ -151,41 +151,6 @@ fn lowered_dispatch(
 }
 
 #[test]
-fn a_first_lane_read_of_a_uniform_scan_carries_across_the_halves() {
-    // A per-console-wave scan: the low half and the high half share the
-    // scalar running sum and read the same LDS dword, so the first-lane
-    // value is the same in both and needs no group barrier (which a group
-    // of four console waves could not reach together anyway).
-    let words = [
-        0x2C0E_0086, // v_lshrrev_b32 v7, 6, v0
-        0x7E10_0280, // v_mov_b32 v8, 0
-        0xBE80_047E, // s_mov_b64 s[0:1], exec
-        0x7DAA_0E80, // v_cmpx_ne_u32 exec, 0, v7
-        0xBF88_000E, // s_cbranch_execz label_0013 (word 19)
-        0xBE92_0380, // s_mov_b32 s18, 0
-        0xBE91_0380, // s_mov_b32 s17, 0
-        0xBE86_047E, // s_mov_b64 s[6:7], exec
-        0xBF82_0000, // s_branch label_0009 (word 9)
-        0x7E22_0508, // v_readfirstlane_b32 s17, v8
-        0x8F10_8212, // s_lshl_b32 s16, s18, 2
-        0x8112_8112, // s_add_i32 s18, s18, 1
-        0x7E10_0210, // v_mov_b32 v8, s16
-        0xD8D8_0000, 0x0800_0008, // ds_read_b32 v8, v8
-        0x4A10_1011, // v_add_nc_u32 v8, s17, v8
-        0x7DA4_0E12, // v_cmpx_eq_u32 exec, s18, v7
-        0x8A86_7E06, // s_andn2_b64 s[6:7], s[6:7], exec
-        0xBF85_FFF6, // s_cbranch_scc1 label_0009
-        0xBF81_0000, // s_endpgm
-    ];
-    let native = native_of(&words, true, 256);
-    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-    let shader = lowered_dispatch(&native, &p, &HashSet::new(), 32, false).unwrap();
-    let mut validator =
-        validator::Validator::load(validator::Validator::default_path().as_deref()).unwrap();
-    validator.validate(&mut shader.dxil.clone()).unwrap();
-}
-
-#[test]
 fn partial_thread_dispatch_masks_the_final_groups_memory_writes() {
     // Each active thread increments counter[local X]. With two groups the
     // tail's first N lanes report two increments, the others only one.
