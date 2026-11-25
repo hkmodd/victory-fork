@@ -58,6 +58,11 @@ pub(crate) struct HostHeap {
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// View heaps: the title address of the buffer view at each title slot,
+    /// two dwords per slot, for shaders that read a descriptor's address out
+    /// of a table at an index they compute
+    /// (`victory_shader::emit::SLOT_VIEWS`).
+    views: Option<(ID3D12Resource, u64, usize)>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -411,6 +416,42 @@ pub(crate) fn page_written(at: usize, len: usize) {
 /// texture pass last took the ranges ([`remapped`]).
 static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
+/// Keep the producer cheap while adjacent pages or repeated writes arrive.
+/// A full queue falls back to checking all tracked views once, so completed
+/// uploads are still invalidated when a remap arrives during a long pause.
+fn record_remap(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64, limit: usize) -> bool {
+    if start >= end {
+        return false;
+    }
+    if let Some(last) = ranges.last_mut()
+        && last.0 <= end
+        && start <= last.1
+    {
+        last.0 = last.0.min(start);
+        last.1 = last.1.max(end);
+    } else if ranges.len() >= limit {
+        ranges.clear();
+        ranges.push((0, u64::MAX));
+        return true;
+    } else {
+        ranges.push((start, end));
+    }
+    false
+}
+
+/// Before looking up descriptor spans, merge notifications from interleaved
+/// producers. The consumer cares only which addresses changed in this batch.
+fn merge_remaps(ranges: &mut Vec<(u64, u64)>) {
+    ranges.sort_unstable();
+    ranges.dedup_by(|next, previous| {
+        if next.0 > previous.1 {
+            return false;
+        }
+        previous.1 = previous.1.max(next.1);
+        true
+    });
+}
+
 /// The lowest start and the highest end of any span of [`Spans`] so far
 /// (the start is `u64::MAX` until there is one): what the runtime does to
 /// memory outside is none of the texture pass's business.
@@ -456,20 +497,9 @@ pub(crate) fn remapped(at: usize, len: usize) {
     }
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
-    // Pages are mapped one after the other.
-    if let Some(last) = ranges.last_mut()
-        && last.1 == start
-    {
-        last.1 = end;
-        return;
+    if record_remap(&mut ranges, start, end, MOST) {
+        STALE[2].fetch_add(1, Relaxed);
     }
-    if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
-        STALE[2].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
-    }
-    ranges.push((start, end));
 }
 
 /// Frames for which a slot a draw read through a table counts as a table's
@@ -943,6 +973,20 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        let views = (!sampler)
+            .then(|| {
+                let bytes = u64::from(victory_shader::emit::SLOT_VIEWS_COUNT)
+                    * u64::from(victory_shader::emit::SLOT_VIEW_BYTES);
+                let (buffer, data) = host.upload_buffer(bytes)?;
+                // SAFETY: the buffer's whole mapping; a live buffer.
+                let gpu = unsafe {
+                    std::ptr::write_bytes(data, 0, bytes as usize);
+                    buffer.GetGPUVirtualAddress()
+                };
+                crate::host::name(&buffer, || "view addresses by view heap slot".to_owned());
+                Some((buffer, gpu, data as usize))
+            })
+            .flatten();
         let h = HostHeap {
             heap,
             cpu,
@@ -957,6 +1001,7 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
+            views,
             buffers: Mutex::default(),
             changed: Mutex::default(),
             textures: Mutex::default(),
@@ -1063,12 +1108,16 @@ impl HostHeap {
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
+        // Search from `next` on, then from the start (extending past cursor by
+        // n - 1 so contiguous runs crossing the cursor are not missed).
+        let cursor = *next as usize;
+        let end = self.dynamic as usize;
+        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
+        let starts = (cursor..end).chain(0..second_end);
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
+        for at in starts.take(if enough { usize::MAX } else { 0 }) {
             // A run cannot wrap past the end.
             if at != last.wrapping_add(1) {
                 run = 0;
@@ -1117,6 +1166,16 @@ impl HostHeap {
     /// The table's buffer, for a list to hold.
     pub(crate) fn strides_buffer(&self) -> Option<&ID3D12Resource> {
         self.strides.as_ref().map(|s| &s.0)
+    }
+
+    /// The GPU address of the table of view addresses by title slot.
+    pub(crate) fn views_gpu(&self) -> Option<u64> {
+        self.views.as_ref().map(|s| s.1)
+    }
+
+    /// The view-address table's buffer, for a list to hold.
+    pub(crate) fn views_buffer(&self) -> Option<&ID3D12Resource> {
+        self.views.as_ref().map(|s| &s.0)
     }
 
     /// Up to `max` title slots whose texture view is due at `frame`, each
@@ -1212,10 +1271,11 @@ impl HostHeap {
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         self.texture_slots_page_written(frame);
-        let ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
             return 0;
         }
+        merge_remaps(&mut ranges);
         let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
@@ -1602,6 +1662,22 @@ impl HostHeap {
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+        }
+        let range = view.and_then(buffer_range);
+        if let Some((_, _, data)) = &self.views
+            && index < victory_shader::emit::SLOT_VIEWS_COUNT
+        {
+            // SAFETY: inside the mapping; a whole slot, written at once:
+            // the address, the byte length and the element stride.
+            unsafe {
+                let offset = index as usize * victory_shader::emit::SLOT_VIEW_BYTES as usize;
+                let at = (*data as *mut u8).add(offset).cast::<u32>();
+                let (address, len) = range.unwrap_or((0, 0));
+                at.write_volatile(address as u32);
+                at.add(1).write_volatile((address >> 32) as u32);
+                at.add(2).write_volatile(len as u32);
+                at.add(3).write_volatile(stride.unwrap_or(0));
+            };
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
@@ -3585,6 +3661,31 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// Contiguous free dynamic slot ranges that cross the search cursor are found.
+    #[test]
+    fn dynamic_allocation_finds_contiguous_range_crossing_search_cursor() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        // Fill the entire dynamic range, then position the search cursor at 12
+        // with all slots occupied so the only free run (10..14) actually
+        // crosses the cursor.
+        let a = heap.dynamic(8).unwrap();
+        let b = heap.dynamic(8).unwrap();
+        assert_eq!((a, b), (4, 12));
+        let rest = heap.dynamic - 16;
+        assert_eq!(heap.dynamic(rest), Some(20));
+        heap.release(4, 12);
+        assert_eq!(heap.dynamic(12), Some(4));
+
+        // Release dynamic slots 10..14 (heap slots 14..18, crossing cursor at 12).
+        // Before the fix, a request of 4 slots starting search at 12 scanned
+        // 12..end (2 free) then 0..12 (2 free), missing the contiguous run at 10..14.
+        heap.release(14, 4);
+        let c = heap.dynamic(4);
+        assert_eq!(c, Some(14));
     }
 }
 

@@ -25,7 +25,7 @@ use super::host::{GraphicsState, HostPipeline};
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
-    shaders: Vec<Arc<Shader>>,
+    pub(crate) shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queue_state: AtomicU8,
     made: OnceLock<Option<HostPipeline>>,
@@ -221,13 +221,37 @@ const MAKING: u8 = 3;
 
 struct Queue {
     early: VecDeque<Arc<Pending>>,
+    /// Depth-only / shadow-map prewarmed pipelines: rebuilt ahead of other
+    /// early pipelines while no draw is actively requesting one.
+    early_depth: VecDeque<Arc<Pending>>,
+    /// Requested vertex/pixel graphics pipelines (including screen composition
+    /// and tonemapping): compiled ahead of compute/mesh so the 3D image shows
+    /// up quickly when the shader cache is cold.
+    requested_graphics: VecDeque<Arc<Pending>>,
+    /// Requested compute pipelines (lighting resolve, tonemap, post-processing):
+    /// compiled ahead of mesh pipelines so the 3D screen lights up quickly.
+    requested_compute: VecDeque<Arc<Pending>>,
     requested: VecDeque<Arc<Pending>>,
+}
+
+/// Whether `p` is a traditional vertex graphics pipeline (as opposed to mesh
+/// or compute).
+fn is_vertex_graphics(p: &Pending) -> bool {
+    p.shaders.iter().any(|s| s.stage == "vertex")
+}
+
+/// Whether `p` is a compute pipeline.
+fn is_compute(p: &Pending) -> bool {
+    p.shaders.iter().any(|s| s.stage == "compute")
 }
 
 impl Queue {
     const fn new() -> Self {
         Self {
             early: VecDeque::new(),
+            early_depth: VecDeque::new(),
+            requested_graphics: VecDeque::new(),
+            requested_compute: VecDeque::new(),
             requested: VecDeque::new(),
         }
     }
@@ -241,7 +265,15 @@ impl Queue {
         }
         p.queue_state.store(priority, Ordering::Relaxed);
         if priority == REQUESTED {
-            self.requested.push_back(p.clone());
+            if is_vertex_graphics(p) {
+                self.requested_graphics.push_back(p.clone());
+            } else if is_compute(p) {
+                self.requested_compute.push_back(p.clone());
+            } else {
+                self.requested.push_back(p.clone());
+            }
+        } else if p.graphics.as_ref().is_some_and(|state| state.writes_depth_only()) {
+            self.early_depth.push_back(p.clone());
         } else {
             self.early.push_back(p.clone());
         }
@@ -249,11 +281,16 @@ impl Queue {
     }
 
     fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self.requested.pop_front().or_else(|| {
-            // An early entry can have been promoted and claimed already.
-            std::iter::from_fn(|| self.early.pop_front())
-                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
-        })?;
+        let p = self
+            .requested_graphics
+            .pop_front()
+            .or_else(|| self.requested_compute.pop_front())
+            .or_else(|| self.requested.pop_front())
+            .or_else(|| {
+                // An early entry can have been promoted and claimed already.
+                std::iter::from_fn(|| self.early_depth.pop_front().or_else(|| self.early.pop_front()))
+                    .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+            })?;
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }

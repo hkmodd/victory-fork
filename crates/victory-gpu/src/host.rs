@@ -3770,6 +3770,18 @@ impl Host {
         })
     }
 
+    /// Whether the device runs on a software adapter (WARP) or no DXGI adapter
+    /// handle was retained (e.g. headless CI WARP runners).
+    #[cfg(test)]
+    pub(crate) fn is_software_adapter(&self) -> bool {
+        self.adapter.as_ref().is_none_or(|a| {
+            // SAFETY: live DXGI adapter.
+            unsafe { a.GetDesc1() }.is_ok_and(|d| {
+                d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 || d.VendorId == 0x1414
+            })
+        })
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         #[cfg(feature = "diagnostics")]
@@ -4867,13 +4879,6 @@ impl Host {
                     }
                 }
                 relay_hand_back(&back);
-                // Only now, and flight by flight: a range another flight
-                // in the air declared too stays closed to refreshes.
-                for flight in &flights {
-                    for (shadow, ranges) in &flight.back {
-                        shadow.copy_back_done(ranges);
-                    }
-                }
                 copy_back(0, landing.elapsed().as_micros() as u64);
                 RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
@@ -4882,6 +4887,12 @@ impl Host {
         // In the order given: what tells the title the card is done.
         let mut last = 0;
         let mut landed = Vec::new();
+        // Collect each flight's back ranges before consuming `items` (without
+        // deduplicating across flights: `Shadow::copy_back_done` decrements
+        // `Flights` per flight!). Calling `copy_back_done` after `line.written`
+        // is updated and waiters are woken ensures no concurrent refresh sees a
+        // range as free while its merge is still in flight.
+        let mut backs: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
         for item in items {
             match item {
                 Late::Run(flight) => {
@@ -4893,6 +4904,7 @@ impl Host {
                         self.card_done(card);
                     }
                     landed.push((flight.lists, flight.order));
+                    backs.extend(flight.back);
                 }
                 Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
                 Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
@@ -4937,6 +4949,15 @@ impl Host {
         }
         LINE_MOVED.notify_all();
         LINE_LANDED.notify_all();
+        // Only now: release the declared ranges from `pending`, after
+        // `line.written` no longer names them and every waiter has been
+        // woken. Before this point a concurrent refresh could see the range
+        // as free while the merge was still writing title memory, leaving
+        // the title with stale or unmapped bytes (the 0xc0000005 crashes
+        // during loading with VICTORY_RELAY=2).
+        for (shadow, ranges) in &backs {
+            shadow.copy_back_done(ranges);
+        }
     }
 
     /// After a submission ran, for copies in the card's memory: the pieces

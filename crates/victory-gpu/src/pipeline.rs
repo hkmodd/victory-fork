@@ -67,6 +67,9 @@ pub(crate) struct Shader {
     /// ([`Shader::walks`]).
     #[cfg(windows)]
     walks: OnceLock<bool>,
+    /// Its result gets the depth-shaded ambient light fallback ([`crate::ambient`]).
+    #[cfg(windows)]
+    pub(crate) resolves_light: bool,
 }
 
 impl std::fmt::Debug for Shader {
@@ -119,6 +122,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 walks: OnceLock::new(),
+                #[cfg(windows)]
+                resolves_light: bytes
+                    .windows(crate::ambient::PROGRAM.len())
+                    .any(|w| w == crate::ambient::PROGRAM),
             })
         })
         .clone()
@@ -381,9 +388,24 @@ pub(crate) fn builder_runs() -> bool {
     if b.whole {
         return true;
     }
-    let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
+    let missing_pipelines: Vec<Arc<make::Pending>> = b
+        .pipelines
+        .iter()
+        .filter(|p| !make::now(p))
+        .cloned()
+        .collect();
+    let missing = missing_pipelines.len();
     if missing > 0 {
         b.off = true;
+        for p in &missing_pipelines {
+            if let Some(shader) = p.shaders.first() {
+                tracing::warn!(
+                    hash = %shader.hash,
+                    stage = %shader.stage,
+                    "the ray-tracing structure builder is missing this program's host pipeline"
+                );
+            }
+        }
         tracing::warn!(
             missing,
             of = b.pipelines.len(),

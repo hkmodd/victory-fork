@@ -1392,8 +1392,8 @@ fn hosted(this: This, make: bool) -> Option<Made> {
 }
 
 /// The host copy of title texture `this` if it is made, without making it
-/// (for diagnostics, which must not count as a use).
-#[cfg(all(windows, feature = "diagnostics"))]
+/// (for diagnostics and post-resolve passes, which must not count as a use).
+#[cfg(windows)]
 pub(crate) fn host_made<'a>(
     this: This,
 ) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
@@ -2549,7 +2549,7 @@ static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>
 static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// See [`PLACED_TWINS`].
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn placed_filler_twins() -> u64 {
     PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -2816,6 +2816,43 @@ static RESOURCE_FUNCTIONS: Table<32> = {
     f[14] = heap_properties as *const (); // 0x70
     Table(f)
 };
+
+#[cfg(test)]
+pub(crate) fn test_buffer(width: u64) -> This {
+    let heap = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 0,
+        visible_nodes: 0,
+    };
+    let desc = ResourceDesc {
+        dimension: BUFFER,
+        alignment: 0,
+        width,
+        height: 1,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format: 0,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 1,
+        flags: 0,
+    };
+    let mut out = std::ptr::null();
+    let hr = create_committed(
+        std::ptr::null(),
+        &heap,
+        0,
+        &desc,
+        0,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        &mut out,
+    );
+    assert_eq!(hr, S_OK);
+    out
+}
 
 #[cfg(test)]
 mod tests {

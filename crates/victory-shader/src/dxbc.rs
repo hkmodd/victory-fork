@@ -106,6 +106,15 @@ impl<'a> Container<'a> {
         })
     }
 
+    /// The container at the start of `data`, without whatever follows it
+    /// (a file holds many back to back): the `size` bytes its header gives,
+    /// which is what a title passes when it creates a pipeline, and so what
+    /// names the shader in the shader cache and in a run's log.
+    pub fn bytes_of(data: &'a [u8]) -> Result<&'a [u8], ShaderError> {
+        Self::parse(data)?;
+        Ok(&data[..u32_at(data, 0x18)? as usize])
+    }
+
     pub fn part(&self, fourcc: FourCC) -> Option<&Part<'a>> {
         self.parts.iter().find(|p| p.fourcc == fourcc)
     }
@@ -166,6 +175,21 @@ mod tests {
         assert_eq!(c.part(FourCC::SFI0).unwrap().data, &[1, 2, 3, 4]);
         assert_eq!(c.part(FourCC::HASH).unwrap().data.len(), 20);
         assert!(c.part(FourCC::DXIL).is_none());
+    }
+
+    #[test]
+    fn bytes_of_stops_at_the_containers_end() {
+        let one = build(&[(FourCC::SFI0, &[1, 2, 3, 4])]);
+        let mut file = one.clone();
+        file.extend_from_slice(&build(&[(FourCC::HASH, &[9; 20])]));
+        file.extend_from_slice(b"trailing bytes");
+        assert_eq!(Container::bytes_of(&file).unwrap(), one.as_slice());
+        assert_eq!(Container::bytes_of(&one).unwrap(), one.as_slice());
+        assert_eq!(
+            Container::bytes_of(b"nope").unwrap_err(),
+            ShaderError::NotDxbc
+        );
+        assert!(Container::bytes_of(&one[..one.len() - 1]).is_err());
     }
 
     #[test]

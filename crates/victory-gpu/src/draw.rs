@@ -1239,6 +1239,23 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_VIEWS {
+                        // Ours: the title addresses of the heap's buffer
+                        // views, for a descriptor read as data.
+                        match self.heap_views(list) {
+                            // SAFETY: an open list; the table lives as long
+                            // as the heap the list holds.
+                            Some(gpu) => unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                                }
+                            },
+                            None => once!("a shader reads view addresses of a heap that is not set"),
+                        }
+                        continue;
+                    }
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
@@ -1684,6 +1701,26 @@ impl State {
         Some(gpu)
     }
 
+    /// [`State::heap_buffers`] for a shader that reads a descriptor's
+    /// address as data: the GPU address of the host's table of the buffer
+    /// views' title addresses by heap slot. The pass that readies the
+    /// buffer views also fills the table.
+    fn heap_views(&self, list: &HostList) -> Option<u64> {
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let host = heap.host()?;
+        let gpu = host.views_gpu()?;
+        self.heap_buffers(list)?;
+        if let Some(buffer) = host.views_buffer() {
+            list.keep(buffer);
+        }
+        Some(gpu)
+    }
+
     /// Runs the pass that uploads textures picked by index
     /// ([`State::heap_textures`]) where nothing has asked for it yet
     /// ([`early_budgets`]): once a frame for a few milliseconds, at the
@@ -1950,6 +1987,10 @@ impl State {
             None => (span, per_frame),
         };
         let began = std::time::Instant::now();
+        // Bytes of textures uploaded in this pass so far: used to gate
+        // giant textures under a budget (one alone is allowed when nothing
+        // else has been done yet, to avoid starvation).
+        let mut done_bytes: u64 = 0;
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 break;
@@ -2072,6 +2113,24 @@ impl State {
                     );
                 }
             }
+            // Under a budget (early or bake pass): recheck time before the
+            // heavy work of making and staging a texture, and cap each
+            // texture at 64 MiB so one giant upload cannot alone blow the
+            // watchdog. One giant texture is still allowed when nothing
+            // else has been done yet, to avoid starvation of textures that
+            // are always large.
+            const PER_TEXTURE_BUDGET: u64 = 64 << 20;
+            if PASS_BUDGET.get().is_some() {
+                if began.elapsed() > span {
+                    break;
+                }
+                if done_bytes > 0
+                    && SPENT.load(Ordering::Relaxed).saturating_add(PER_TEXTURE_BUDGET)
+                        > bytes_at_most
+                {
+                    break;
+                }
+            }
             let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
@@ -2138,6 +2197,7 @@ impl State {
             };
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
+            done_bytes = done_bytes.saturating_add(bytes);
             since_asked += bytes;
             if room && since_asked >= 32 << 20 {
                 since_asked = 0;
@@ -2259,6 +2319,41 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        if self.ambient(list, p) {
+            self.host_heaps = [0; 2];
+        }
+    }
+
+    /// After a dispatch of `p`: replaces the indirect diffuse light with a
+    /// depth-shaded ambient floor while ray tracing is off (`crate::ambient`).
+    fn ambient(&self, list: &HostList, p: &crate::pipeline::host::HostPipeline) -> bool {
+        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+            return false;
+        };
+        let view = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            let u = stage.translated().used.iter().find(|u| {
+                u.kind == kind
+                    && u.root == RootType::Table
+                    && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })?;
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else {
+                return None;
+            };
+            crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+        };
+        let light = match view(ResourceType::Uav, crate::ambient::LIGHT) {
+            Some(View::Unordered(r, ..)) => r,
+            _ => 0,
+        };
+        if light == 0 {
+            once!("no ambient light: other tables");
+            return false;
+        }
+        let depth = match view(ResourceType::Srv, crate::ambient::DEPTH) {
+            Some(View::Shader(r, _)) => Some(r as This),
+            _ => None,
+        };
+        crate::ambient::raise(list, light as This, depth)
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -2574,7 +2669,7 @@ impl State {
             let draws: u32 = census.1.values().sum();
             if draws > 0 {
                 let mut rects: Vec<([i32; 4], u32)> = census.1.iter().map(|(r, n)| (*r, *n)).collect();
-                rects.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                rects.sort_unstable_by_key(|a| std::cmp::Reverse(a.1));
                 let scissors: Vec<String> = rects
                     .iter()
                     .take(5)

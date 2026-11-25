@@ -176,7 +176,7 @@ fn watch(base: usize, size: usize) {
                 // SAFETY: four bytes inside the mapped image, checked above.
                 let value = unsafe { ((base + rva) as *const u32).read_volatile() };
                 if *seen != Some(value) {
-                    eprintln!("VIctory: title+{rva:#x} = {value:#x}");
+                    eprintln!("VItoriaBr: title+{rva:#x} = {value:#x}");
                     *seen = Some(value);
                 }
             }

@@ -20,7 +20,7 @@ fn compiled_workspace_root() -> PathBuf {
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
     #[error(
-        "refusing to use {path} for game-derived data: it is inside the VIctory source tree \
+        "refusing to use {path} for game-derived data: it is inside the VItoriaBr source tree \
          ({root}). Keep game files, caches and outputs outside the repository \
          (see docs/asset-policy.md)"
     )]
