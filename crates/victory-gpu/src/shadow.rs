@@ -3967,6 +3967,15 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, false)
 }
 
+/// As [`find`], only for a title buffer whose copy is already made (the
+/// one shaders read, in the card's memory or not); never makes one.
+pub(crate) fn find_made(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let end = address.checked_add(len.max(1))?;
+    let map = buffers();
+    let (_, entry) = map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end)?;
+    entry.shadow.as_ref().filter(|s| s.left(address) >= len).cloned()
+}
+
 /// As [`find`], for an ask that is done with the copy when its list has
 /// run (a draw's vertex and index buffers, indirect arguments): outside
 /// buffer objects it takes a window that is there already and holds the

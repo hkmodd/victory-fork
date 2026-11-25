@@ -645,6 +645,47 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     Some(gpu)
 }
 
+/// A constant buffer a descriptor table names, read by the card straight
+/// out of its title buffer's copy (the one its shaders read and write, made
+/// already): its address there, with the range brought up to date when
+/// `list` is submitted. `None`: copied into upload memory as before (no
+/// such copy, or not 256-byte aligned there). `VICTORY_TABLE_CBV_CARD=0`
+/// always copies.
+///
+/// Why: such a copy is a fill, done on the CPU when the list is submitted.
+/// The title's compute shaders write constants in small buffers of their
+/// own (0xdc7d6aa00, 32,304 bytes, waited 144 times in run tc1), so the fill must
+/// wait until the flights that may write them have landed; reading ahead of
+/// them (`fill_ahead`) was caught taking old bytes once in every run (frame
+/// ~1464: 3,424 bytes at 0xdc6addb00), and from there on fills waited: run
+/// mk1, 1.9 waits a frame, ~40 ms of the submitting thread standing still.
+/// On the console the draw reads the buffer when it runs, behind the work
+/// before it; so it does here: the copy is in queue order behind the
+/// flights, and the title's own changes go in ahead of the list as for any
+/// view of it. (Run tc1 took only copies in the card's memory: the waits
+/// stayed, 2.0 a frame.)
+fn table_constants_on_card(list: &HostList, address: u64, size: u32) -> Option<u64> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_CBV_CARD").is_none_or(|v| v != "0")) {
+        return None;
+    }
+    let shadow = crate::shadow::find_made(address, u64::from(size))?;
+    let gpu = shadow.gpu(address);
+    if gpu % 256 != 0 {
+        return None;
+    }
+    // The view reads a whole number of 256 bytes, which may pass the title
+    // buffer's end (its 32,304 bytes at 0xdc7d6aa00): inside the host
+    // buffer (made a multiple of 64 KiB), past the title's bytes.
+    // SAFETY: a live buffer.
+    let width = unsafe { shadow.buffer.GetDesc() }.Width;
+    if shadow.offset(address) + u64::from(size.next_multiple_of(256)) > width {
+        return None;
+    }
+    shadow.refresh(list, address, u64::from(size));
+    Some(gpu)
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -2953,6 +2994,10 @@ impl State {
                         let size = crate::descriptor::host::constant_view_bytes(size);
                         if size == 0 || address == 0 {
                             host.constant_at(index, 0, 0);
+                            continue;
+                        }
+                        if let Some(gpu) = table_constants_on_card(list, address, size) {
+                            host.constant_at(index, gpu, size);
                             continue;
                         }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
