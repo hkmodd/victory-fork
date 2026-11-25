@@ -508,8 +508,12 @@ pub fn emit(
         // shadow-ray tiling). The wave-wide form as the last resort, by default, for these
         // programs only: the ones that translate otherwise keep their form (runs 121-124
         // lost the card with it ahead of the approximate forms, `VICTORY_WAVE_WIDE=1`).
-        // `VICTORY_WAVE_WIDE=0` refuses them as before.
-        if !wide_on && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") {
+        // `VICTORY_WAVE_WIDE=0` refuses them as before. Not a program counting lanes of a mask
+        // (`v_mbcnt`, a list compaction): sr_tracing's `CS_Tiling_Generate_Opaque` came out
+        // wrong in this form (runs ww1/ww2: walls and skin blotched, posterized; clean with
+        // that pipeline skipped), so those stay refused.
+        let counts_lanes = p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name().starts_with("v_mbcnt"));
+        if !wide_on && !counts_lanes && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") {
             let deep = form(ir::without_skips(p, true));
             let bases = [
                 deep.as_ref().map(|f| &f.0),
