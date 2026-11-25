@@ -1118,8 +1118,10 @@ impl Drop for Remapping {
         // Where the backing is not what it was, what shaders of flights in
         // the air wrote there no longer lands (`crate::writeback`). Still
         // announced: no merge writes there before this is known.
+        let compared = Spent::new(crate::framelog::T::RemapSpansNs);
         let current = crate::inplace::physical_spans(&self.range);
         crate::inplace::physical_changes(&self.previous, &current, crate::writeback::remapped);
+        drop(compared);
         mapping().changing = None;
         MAPPING_CHANGED.notify_all();
         // From asking for the change until it is let go (the frame log).
@@ -1153,8 +1155,25 @@ pub fn title_memory_remapping_range(range: std::ops::Range<usize>) -> Remapping 
     );
     crate::framelog::add(crate::framelog::T::Remaps, 1);
     crate::framelog::add(crate::framelog::T::RemapWaitUs, asked.elapsed().as_micros() as u64);
+    let compared = Spent::new(crate::framelog::T::RemapSpansNs);
     let previous = crate::inplace::physical_spans(&range);
+    drop(compared);
     Remapping { _turn: turn, asked, range, previous }
+}
+
+/// Adds the nanoseconds from its making to its drop to a frame-log total.
+pub(crate) struct Spent(crate::framelog::T, std::time::Instant);
+
+impl Spent {
+    pub(crate) fn new(t: crate::framelog::T) -> Self {
+        Spent(t, std::time::Instant::now())
+    }
+}
+
+impl Drop for Spent {
+    fn drop(&mut self) {
+        crate::framelog::add(self.0, self.1.elapsed().as_nanos() as u64);
+    }
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]):
@@ -1201,6 +1220,8 @@ pub fn title_memory_reading_now(range: std::ops::Range<usize>) -> Option<Reading
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    let _spent = Spent::new(crate::framelog::T::RemapHooksNs);
+    crate::framelog::add(crate::framelog::T::RemapPages, len.div_ceil(64 << 10) as u64);
     // Stored pages followed there end (`VICTORY_BACK_READS`): counted only.
     #[cfg(feature = "diagnostics")]
     crate::backreads::remapped(at, len);

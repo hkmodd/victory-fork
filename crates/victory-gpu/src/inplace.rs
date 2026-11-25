@@ -304,6 +304,7 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
+    let _spent = crate::watch::Spent::new(crate::framelog::T::RemapHooksNs);
     {
         let mut v = views();
         v.views.insert(at, (len, section, offset));

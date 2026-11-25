@@ -63,6 +63,12 @@ pub enum T {
     Remaps,
     RemapUs,
     RemapWaitUs,
+    /// Of a change: the 64 KiB pages it mapped or unmapped, the time in
+    /// our hooks on it (guards, views, descriptors: nanoseconds), and in
+    /// comparing the physical backing before and after (nanoseconds).
+    RemapPages,
+    RemapHooksNs,
+    RemapSpansNs,
     /// Texture refreshes on every thread, and of them the wait for title
     /// memory to hold still; uploads recorded.
     RefreshUs,
@@ -412,7 +418,7 @@ fn text(f: &Frame) -> String {
          send-and-hash lists {:.1} ms in {:.0}, our compare lists {:.1} ms in {:.0}, all other lists {:.1} ms in {:.0} | \
          recording, all threads: {:.1} ms in {:.0} calls; all submit calls {:.1} ms | textures: refresh {:.1} ms ({:.1} waiting for memory to hold \
          still), {:.0} uploads, staging {:.0} made {:.0} reused | remapping: {:.0} calls {:.1} ms ({:.1} waiting for \
-         readers) | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
+         readers), {:.0} pages, hooks {:.1} ms, backing compared {:.1} ms | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
          faults: {:.0} page, {:.0} guard | process: {:.0} user {:.0} kernel ms | pacing, all threads {:.1} ms | {:.0} \
          draws | {:.0} MB free | found on a slow core: the render thread {:.0} of {:.0} looks, the submit thread {:.0} of {:.0}, recording threads {:.0} of {:.0}",
         f.us / 1e3,
@@ -454,6 +460,9 @@ fn text(f: &Frame) -> String {
         t(T::Remaps),
         ms(T::RemapUs),
         ms(T::RemapWaitUs),
+        t(T::RemapPages),
+        t(T::RemapHooksNs) / 1e6,
+        t(T::RemapSpansNs) / 1e6,
         s(S_PIPELINES_MADE),
         s(S_PIPELINES_LOADED),
         ms(T::PipelineWaitUs),
