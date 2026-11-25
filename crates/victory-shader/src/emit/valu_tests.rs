@@ -2136,6 +2136,8 @@ fn a_format_load_read_as_halves_loads_the_integer() {
             root_srvs: l.root_srvs,
             root_uavs: l.root_uavs,
             root_indexed_views: res.root_indexed_views,
+            written_root_uavs: l.written_root_uavs,
+            writes_guest_memory: l.writes_guest_memory,
             half_views: l.half_views,
         }
     };
