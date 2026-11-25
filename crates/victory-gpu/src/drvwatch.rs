@@ -72,10 +72,14 @@ pub(crate) fn start() {
         let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
         let channel = wide("System");
         // The kernel drivers of the three vendors, and the system's own
-        // "display driver stopped responding" source.
+        // "display driver stopped responding" source; critical entries,
+        // errors and warnings only (levels 1-3). `Display` also writes an
+        // information entry (event 4125, automatic HDR turned on) each time
+        // the title's window opens: it tripped the switch four seconds into
+        // a run and kept the draw windows off for all of it.
         let query = wide(
             "*[System[Provider[@Name='nvlddmkm' or @Name='amdkmdag' or @Name='amdwddmg' or @Name='igfx' or @Name='igfxn' \
-             or @Name='Display']]]",
+             or @Name='Display'] and (Level=1 or Level=2 or Level=3)]]",
         );
         // SAFETY: valid strings for the call's length; the callback is a
         // plain function that touches only statics; the subscription is
