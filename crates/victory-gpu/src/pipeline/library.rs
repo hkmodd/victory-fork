@@ -447,8 +447,8 @@ fn library() -> Option<&'static Library> {
             // library is not for it, and what it would save is not for
             // the card. Neither read nor written in such a run.
             #[cfg(feature = "diagnostics")]
-            if crate::renderdoc::loaded() {
-                tracing::info!("RenderDoc is loaded: the host pipeline library is neither read nor saved in this run");
+            if crate::renderdoc::loaded() || crate::pix::loaded() {
+                tracing::info!("RenderDoc or PIX is loaded: the host pipeline library is neither read nor saved in this run");
                 return None;
             }
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;

@@ -67,7 +67,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\Tools\victory\run.ps1 -Na
 | Timeline CPU+GPU | Nsight Systems 2025.5.2 (`C:\Program Files\NVIDIA Corporation\Nsight Systems 2025.5.2`): thread di submit, code, fence |
 | Shader | `dxc` (`C:\VulkanSDK\1.4.363.0\Bin\dxc`) per disassemblare o validare il DXIL tradotto |
 | Driver | `drvwatch` registra nel log gli errori del driver (nvlddmkm 153); il primo spegne le draw window |
-| PIX / RenderDoc | Non installati. Per catture GPU di un frame servono; il download va chiesto all'Host |
+| PIX (GPU capture) | **PIX 2611.19 installato** (`C:\Program Files\Microsoft PIX\2611.19\`, OK dell'Host 2026-11-26). Cattura di un frame del titolo: run con `-Set "VICTORY_PIX=C:\Program Files\Microsoft PIX\2611.19\WinPixGpuCapturer.dll,VICTORY_PIX_FRAME=2000"` (diag; `VICTORY_PIX_FRAMES` 1-8, `VICTORY_PIX_OUT`, default `%TEMP%\victory_pix\frame.wpix`; la libreria PSO non si usa in quella run). Lettura: `pixtool open-capture f.wpix save-event-list ev.csv --counters=*` (tempo scheda per draw/dispatch), `save-screenshot`, `save-resource`; `WinPix.exe f.wpix` per l'ispezione a mano (shader, stato, risorse per draw). Si usa per: posterizzazione, specchio, nero in ombra, qualunque draw sbagliata = causa vista nella draw, non dedotta |
+| PIX (timing) | `pixtool attach <pid> take-new-timing-capture f.wpix --duration=2000`: timeline CPU+GPU di 2 s del processo in corso (thread di submit, code, fence), in alternativa a Nsight |
+| RenderDoc | Non installato (`VICTORY_RENDERDOC=<dll>` già supportato in diag, renderdoc.rs) |
 
 ## 5. Vincoli (non negoziabili)
 

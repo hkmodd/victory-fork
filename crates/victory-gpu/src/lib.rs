@@ -24,6 +24,8 @@ mod capture;
 #[cfg(windows)]
 mod cardmeter;
 #[cfg(all(windows, feature = "diagnostics"))]
+mod pix;
+#[cfg(all(windows, feature = "diagnostics"))]
 mod renderdoc;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod shot;

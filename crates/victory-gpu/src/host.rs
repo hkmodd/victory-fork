@@ -598,6 +598,9 @@ fn create() -> windows::core::Result<Host> {
     // is made (`VICTORY_RENDERDOC`).
     #[cfg(feature = "diagnostics")]
     crate::renderdoc::load();
+    // PIX's GPU capturer likewise (`VICTORY_PIX`).
+    #[cfg(feature = "diagnostics")]
+    crate::pix::load();
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
