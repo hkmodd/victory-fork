@@ -33,8 +33,6 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
-    /// What draws have waited for it, over all frames (microseconds).
-    waited_us: AtomicU64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -58,22 +56,12 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
-            waited_us: AtomicU64::new(0),
         }
     }
 
     fn make(&self) {
-        self.made.get_or_init(|| {
-            let started = Instant::now();
-            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
-            let ms = started.elapsed().as_millis();
-            if ms >= 2000 {
-                let shaders: Vec<String> =
-                    self.shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect();
-                tracing::warn!(ms, ?shaders, made = made.is_some(), "slow host pipeline");
-            }
-            made
-        });
+        self.made
+            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -177,16 +165,6 @@ fn wait(p: &Pending, frame: u64) {
     if budget.is_zero() {
         return;
     }
-    // One frame's budget per pipeline over all frames: one whose translation
-    // or driver compile takes longer is made in the background while its
-    // draws are dropped, instead of taking the whole budget of every frame
-    // until it is there (run p: one pipeline "being made" for minutes, 500
-    // ms of waiting in each frame, 1.2 fps with the card 16% busy).
-    let had = Duration::from_micros(p.waited_us.load(Ordering::Relaxed));
-    let own = budget.saturating_sub(had);
-    if own.is_zero() {
-        return;
-    }
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now).
     static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
@@ -196,7 +174,7 @@ fn wait(p: &Pending, frame: u64) {
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
-        let left = budget.saturating_sub(spent.1).min(own);
+        let left = budget.saturating_sub(spent.1);
         if shared {
             spent.1 += left;
         }
@@ -217,17 +195,6 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
-    let before = Duration::from_micros(p.waited_us.fetch_add(waited.as_micros() as u64, Ordering::Relaxed));
-    if before < budget && before + waited >= budget && p.made.get().is_none() {
-        // Which one is left to the background, and where it is: a shader
-        // not translated yet, or all translated and the driver compiling.
-        let shaders: Vec<String> = p
-            .shaders
-            .iter()
-            .map(|s| format!("{} {} {}", s.stage, s.hash, if s.translated.get().is_some() { "translated" } else { "translating" }))
-            .collect();
-        tracing::warn!(?shaders, "host pipeline past its wait budget; its draws are dropped until it is made");
-    }
     {
         let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
