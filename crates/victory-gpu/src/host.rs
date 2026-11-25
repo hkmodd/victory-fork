@@ -828,6 +828,10 @@ pub(crate) fn host() -> Option<&'static Host> {
 }
 
 fn create() -> windows::core::Result<Host> {
+    // PIX's GPU capturer, if asked for, before any graphics interface
+    // is made (`VICTORY_PIX`).
+    #[cfg(feature = "diagnostics")]
+    crate::pix::load();
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
