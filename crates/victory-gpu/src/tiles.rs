@@ -99,13 +99,16 @@ fn small_when_full_mb() -> u64 {
 const SMALL_TILES: u32 = 16;
 
 /// Whether textures are made this way: the switch
-/// (on by default, run fs3; `VICTORY_LEVELS_ON_DEMAND=0` off), and a card that reads
+/// (`VICTORY_LEVELS_ON_DEMAND=1`; off by default on this line: on, every
+/// host copy holds all its levels instead of the held ones, and the private
+/// memory passed 34 GB before the world at 77-88 s in runs avmfu1/avmfu2,
+/// against 30.7 GB at the same seconds with it off), and a card that reads
 /// zeros from, and drops writes to, levels without memory (tiled resources
 /// tier 2).
 pub(crate) fn wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "0") {
+        if !std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1") {
             return false;
         }
         let Some(host) = host() else {
