@@ -795,6 +795,8 @@ fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
 /// nothing, behind the flights in the air, or now.
 pub(super) fn signal(this: This, fence: This, value: u64) {
     let fence = fence as usize;
+    #[cfg(feature = "diagnostics")]
+    crate::host::tell_lag::asked(fence, value);
     LANE.push_behind(this as usize, false, Job::Signal(fence, value), || {
         if !crate::host::late_signal(fence, value) {
             crate::fence::set(fence as This, value);

@@ -88,7 +88,11 @@ impl Worker {
                 self.fence.SetEventOnCompletion(value, self.event)?;
                 WaitForSingleObject(self.event, INFINITE);
             }
-            self.device.GetDeviceRemovedReason()
+            let reason = self.device.GetDeviceRemovedReason();
+            if reason.is_err() {
+                tracing::warn!("the card was lost{}", removal(&self.device));
+            }
+            reason
         }
     }
 
@@ -97,6 +101,82 @@ impl Worker {
         let value = self.send(record)?;
         self.wait(value)
     }
+}
+
+/// What the runtime kept of a lost card (with `--breadcrumbs`): the page
+/// fault and the allocations at it, and every list that did not finish, by
+/// its name, with the commands around the one it stopped at.
+fn removal(device: &ID3D12Device) -> String {
+    let Ok(dred) = device.cast::<ID3D12DeviceRemovedExtendedData1>() else {
+        return String::new();
+    };
+    let mut text = String::new();
+    let name = |w: windows::core::PCWSTR, a: *const u8| {
+        // SAFETY: names the runtime keeps, null or terminated.
+        unsafe {
+            if !w.is_null() {
+                w.to_string().unwrap_or_default()
+            } else if !a.is_null() {
+                std::ffi::CStr::from_ptr(a.cast()).to_string_lossy().into_owned()
+            } else {
+                "unnamed".to_owned()
+            }
+        }
+    };
+    // SAFETY: the outputs are the runtime's, valid while the device lives;
+    // nodes are walked as linked, histories have their counts.
+    unsafe {
+        if let Ok(fault) = dred.GetPageFaultAllocationOutput1()
+            && fault.PageFaultVA != 0
+        {
+            text.push_str(&format!("; page fault at {:#x}", fault.PageFaultVA));
+            for (what, head) in [
+                ("inside", fault.pHeadExistingAllocationNode),
+                ("inside freed", fault.pHeadRecentFreedAllocationNode),
+            ] {
+                let mut names = Vec::new();
+                let mut node = head;
+                while let Some(n) = node.as_ref()
+                    && names.len() < 8
+                {
+                    names.push(format!(
+                        "{} (type {})",
+                        name(n.ObjectNameW, n.ObjectNameA),
+                        n.AllocationType.0
+                    ));
+                    node = n.pNext;
+                }
+                if !names.is_empty() {
+                    text.push_str(&format!("; {what} {names:?}"));
+                }
+            }
+        }
+        match dred.GetAutoBreadcrumbsOutput() {
+            Ok(crumbs) => {
+                let mut node = crumbs.pHeadAutoBreadcrumbNode;
+                while let Some(p) = node.as_ref() {
+                    let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
+                    if done < p.BreadcrumbCount && !p.pCommandHistory.is_null() {
+                        let history =
+                            std::slice::from_raw_parts(p.pCommandHistory, p.BreadcrumbCount as usize);
+                        let around: Vec<i32> = history
+                            [done.saturating_sub(3) as usize..(done as usize + 3).min(history.len())]
+                            .iter()
+                            .map(|o| o.0)
+                            .collect();
+                        text.push_str(&format!(
+                            "; list \"{}\" stopped at command {done} of {} (ops around it {around:?})",
+                            name(p.pCommandListDebugNameW, p.pCommandListDebugNameA),
+                            p.BreadcrumbCount,
+                        ));
+                    }
+                    node = p.pNext;
+                }
+            }
+            Err(e) => text.push_str(&format!("; no breadcrumbs ({e})")),
+        }
+    }
+    text
 }
 
 pub(super) fn buffer_desc(size: u64, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {

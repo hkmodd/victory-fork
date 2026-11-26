@@ -3155,12 +3155,19 @@ fn split<T>(lists: Vec<T>, order: Vec<usize>, cut: usize) -> Result<[Run<T>; 2],
 /// did; if not the caller sets the fence now.
 pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
     if !late() {
+        #[cfg(feature = "diagnostics")]
+        tell_lag::set_now(fence, value);
         return false;
     }
     let mut line = line();
     if line.line.is_empty() && !line.settling {
+        drop(line);
+        #[cfg(feature = "diagnostics")]
+        tell_lag::set_now(fence, value);
         return false;
     }
+    #[cfg(feature = "diagnostics")]
+    tell_lag::sent(tell_lag::Key::Signal(fence, value), line.target);
     line.line.push(Late::Signal(fence, value));
     LATE_STATS[14].fetch_add(1, Ordering::Relaxed);
     drop(line);
@@ -3169,6 +3176,183 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
     LINE_MOVED.notify_one();
     RELAY_MOVED.notify_one();
     true
+}
+
+/// How long what tells the title the card is done takes to tell it
+/// (diagnostics): for a fence signal, from the title's call to its place
+/// behind the flights ("lane"), from there to the landing that tells it
+/// ("air": the card, then the relay noticing), and the landing itself; for
+/// a bottom-of-pipe write, from its flight being sent. Per fence or
+/// address, the busiest ones in the frame-rate line.
+#[cfg(feature = "diagnostics")]
+pub(crate) mod tell_lag {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    pub(crate) enum Key {
+        Signal(usize, u64),
+        Write(usize),
+    }
+
+    #[derive(Default)]
+    struct Times {
+        asked: Option<Instant>,
+        sent: Option<Instant>,
+        /// The host fence's value of the last flight before it.
+        target: u64,
+    }
+
+    /// Per fence or address: told by a landing (count, lane, air, landing,
+    /// total in us), set at once (count, lane in us), and of those told
+    /// by a landing where the card's finish was seen (card = sent to the
+    /// card done, notice = done to the landing; count, card, notice in us).
+    #[derive(Default)]
+    struct Sum([u64; 10]);
+
+    static OPEN: Mutex<Option<HashMap<Key, Times>>> = Mutex::new(None);
+    static SUMS: Mutex<Option<HashMap<(bool, usize), Sum>>> = Mutex::new(None);
+    /// When the card was seen done with a value of the host fence, by a
+    /// thread of its own that waits for each value sent.
+    static DONE: Mutex<std::collections::VecDeque<(u64, Instant)>> = Mutex::new(std::collections::VecDeque::new());
+    static WATCH: std::sync::OnceLock<Mutex<std::sync::mpsc::Sender<u64>>> = std::sync::OnceLock::new();
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn watch(target: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if target == 0 || LAST.fetch_max(target, Relaxed) >= target {
+            return;
+        }
+        let tx = WATCH.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<u64>();
+            let _ = std::thread::Builder::new().name("victory-tell-lag".into()).spawn(move || {
+                let Some(host) = super::host() else {
+                    return;
+                };
+                // SAFETY: a plain event of our own.
+                let Ok(event) = (unsafe { super::CreateEventW(None, false, false, None) }) else {
+                    return;
+                };
+                while let Ok(value) = rx.recv() {
+                    // SAFETY: the host's fence and this thread's event.
+                    unsafe {
+                        if host.fence.GetCompletedValue() < value
+                            && host.fence.SetEventOnCompletion(value, event).is_ok()
+                        {
+                            super::WaitForSingleObject(event, super::INFINITE);
+                        }
+                    }
+                    let mut done = DONE.lock().unwrap_or_else(|e| e.into_inner());
+                    if done.len() >= 4096 {
+                        done.pop_front();
+                    }
+                    done.push_back((value, Instant::now()));
+                }
+            });
+            Mutex::new(tx)
+        });
+        let _ = tx.lock().unwrap_or_else(|e| e.into_inner()).send(target);
+    }
+
+    /// When the card was seen done with `target` (the first value at or
+    /// past it that was waited for).
+    fn done(target: u64) -> Option<Instant> {
+        let done = DONE.lock().unwrap_or_else(|e| e.into_inner());
+        let i = done.partition_point(|&(v, _)| v < target);
+        done.get(i).map(|&(_, at)| at)
+    }
+
+    fn open<R>(f: impl FnOnce(&mut HashMap<Key, Times>) -> R) -> R {
+        let mut g = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+        let m = g.get_or_insert_with(HashMap::new);
+        if m.len() > 1 << 16 {
+            m.clear();
+        }
+        f(m)
+    }
+
+    pub(crate) fn asked(fence: usize, value: u64) {
+        open(|m| m.entry(Key::Signal(fence, value)).or_default().asked = Some(Instant::now()));
+    }
+
+    pub(crate) fn sent(key: Key, target: u64) {
+        open(|m| {
+            let t = m.entry(key).or_default();
+            t.sent = Some(Instant::now());
+            t.target = target;
+        });
+        watch(target);
+    }
+
+    fn add(signal: bool, at: usize, first: usize, v: &[(usize, u64)]) {
+        let mut g = SUMS.lock().unwrap_or_else(|e| e.into_inner());
+        let s = g.get_or_insert_with(HashMap::new).entry((signal, at)).or_default();
+        s.0[first] += 1;
+        for &(k, us) in v {
+            s.0[k] += us;
+        }
+    }
+
+    /// Told by a landing that began at `landing`.
+    pub(crate) fn told(key: Key, landing: Instant) {
+        let Some(t) = open(|m| m.remove(&key)) else {
+            return;
+        };
+        let Some(sent) = t.sent else {
+            return;
+        };
+        let now = Instant::now();
+        let us = |a: Instant, b: Instant| b.saturating_duration_since(a).as_micros() as u64;
+        let (signal, at) = match key {
+            Key::Signal(f, _) => (true, f),
+            Key::Write(a) => (false, a),
+        };
+        let lane = t.asked.map_or(0, |a| us(a, sent));
+        let total = us(t.asked.unwrap_or(sent), now);
+        // (Not yet seen by the watching thread: the landing saw it first.)
+        let card = done(t.target).unwrap_or(landing).min(landing);
+        add(signal, at, 0, &[(1, lane), (2, us(sent, landing)), (3, us(landing, now)), (4, total)]);
+        add(signal, at, 9, &[(7, us(sent, card)), (8, us(card, landing))]);
+    }
+
+    /// A signal set at once, with no flight in the air.
+    pub(crate) fn set_now(fence: usize, value: u64) {
+        let Some(t) = open(|m| m.remove(&Key::Signal(fence, value))) else {
+            return;
+        };
+        let lane = t.asked.map_or(0, |a| a.elapsed().as_micros() as u64);
+        add(true, fence, 5, &[(6, lane)]);
+    }
+
+    pub(crate) fn line(frames: f64) {
+        let sums = SUMS.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+        let mut v: Vec<_> = sums.into_iter().collect();
+        v.sort_by_key(|(_, s)| std::cmp::Reverse(s.0[0] + s.0[5]));
+        let mut out = String::new();
+        for ((signal, at), s) in v.iter().take(6) {
+            let n = s.0[0].max(1) as f64;
+            let ms = |k: usize| s.0[k] as f64 / n / 1000.0;
+            out += &format!(
+                "; {} {:#x}: {:.2}/frame told by a landing (lane {:.1} ms, air {:.1} = card {:.1} + notice {:.1}, \
+                 landing {:.1}, total {:.1}), {:.2}/frame at once (lane {:.1})",
+                if *signal { "fence" } else { "write" },
+                at,
+                s.0[0] as f64 / frames,
+                ms(1),
+                ms(2),
+                ms(7),
+                ms(8),
+                ms(3),
+                ms(4),
+                s.0[5] as f64 / frames,
+                s.0[6] as f64 / s.0[5].max(1) as f64 / 1000.0,
+            );
+        }
+        if !out.is_empty() {
+            tracing::info!("how long the title is told the card is done, busiest first{out}");
+        }
+    }
 }
 
 /// A queue stands at `wait`, which memory does not meet now ([`late`]):
@@ -3618,6 +3802,8 @@ fn late_line(frames: f64) {
             w[WHY_FENCE],
         );
     }
+    #[cfg(feature = "diagnostics")]
+    tell_lag::line(frames);
     if relay() {
         let r: Vec<f64> = RELAY_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
@@ -4970,10 +5156,14 @@ impl Host {
                 }
                 Late::Write(at, what, bytes) => {
                     what.write(at as *mut u8, bytes);
+                    #[cfg(feature = "diagnostics")]
+                    tell_lag::told(tell_lag::Key::Write(at), landing);
                     crate::land::spent(crate::land::stat::TOLD, telling)
                 }
                 Late::Signal(fence, value) => {
                     crate::fence::set(fence as crate::object::This, value);
+                    #[cfg(feature = "diagnostics")]
+                    tell_lag::told(tell_lag::Key::Signal(fence, value), landing);
                     crate::land::spent(crate::land::stat::TOLD, telling)
                 }
             };
@@ -5237,6 +5427,10 @@ impl Host {
                 own: sent.own,
                 texture_back_ranges: sent.texture_back_ranges,
             }));
+            #[cfg(feature = "diagnostics")]
+            for &(at, ..) in &sent.writes {
+                tell_lag::sent(tell_lag::Key::Write(at), *target);
+            }
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
         };

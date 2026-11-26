@@ -21,6 +21,79 @@ use super::wire::{
 
 type Fault = Box<dyn std::error::Error + Send + Sync>;
 
+/// The process's private bytes and working set, in MB: where the capture's
+/// memory goes, said at its steps (a capture must fit beside the title).
+fn memory_mb() -> (u64, u64) {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut c = PROCESS_MEMORY_COUNTERS {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: our own process and a sized structure.
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    ((c.PagefileUsage >> 20) as u64, (c.WorkingSetSize >> 20) as u64)
+}
+
+/// Bytes in a view of a file in the capture's folder, zeros at first: what
+/// the recorder keeps of buffers the CPU sees lies there, not in the
+/// process's private memory (several GB of it beside a title near its limit).
+struct FileBytes {
+    at: *mut u8,
+    section: usize,
+}
+
+impl FileBytes {
+    /// `len` bytes at `offset` (a multiple of 64 KiB) of `file`, which grows
+    /// to hold them.
+    fn new(file: &File, offset: u64, len: usize) -> std::io::Result<FileBytes> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE};
+        let len = len.max(1);
+        let end = offset + len as u64;
+        // SAFETY: an open file of ours; a view inside the section.
+        unsafe {
+            let section = CreateFileMappingW(
+                file.as_raw_handle() as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                (end >> 32) as u32,
+                end as u32,
+                std::ptr::null(),
+            );
+            if section.is_null() {
+                return Err(std::io::Error::last_os_error());
+            }
+            let at = MapViewOfFile(section, FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, len).Value;
+            if at.is_null() {
+                let e = std::io::Error::last_os_error();
+                windows_sys::Win32::Foundation::CloseHandle(section);
+                return Err(e);
+            }
+            Ok(FileBytes {
+                at: at.cast(),
+                section: section as usize,
+            })
+        }
+    }
+}
+
+impl Drop for FileBytes {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        // SAFETY: the view and section made in `new`, given back once.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: self.at.cast() });
+            windows_sys::Win32::Foundation::CloseHandle(self.section as _);
+        }
+    }
+}
+
+fn say_memory(step: &str, detail: u64) {
+    let (private, set) = memory_mb();
+    tracing::info!(step, detail, private, set, "frame recorder: memory (MB)");
+}
+
 /// A read-back buffer contents go through, and how many there are.
 const STAGING: u64 = 256 << 20;
 const STAGINGS: usize = 4;
@@ -281,14 +354,13 @@ struct CpuBuffer {
     id: u32,
     /// Held by the recorder, not by this.
     res: std::mem::ManuallyDrop<ID3D12Resource>,
-    /// Where it is read: its mapping, or the read-back copy of it.
+    /// Its mapping, for one fast to read (null for a slow one).
     live: *const u8,
-    /// The read-back buffer and the offset in it, for one that is slow to
-    /// read.
-    through: Option<(usize, u64)>,
+    /// Slow to read: it goes through the read-back ring.
+    slow: bool,
     size: usize,
     /// What it held at the submission before (zeros before the first).
-    kept: Vec<u8>,
+    kept: FileBytes,
 }
 
 // SAFETY: the mapping is of a buffer the struct holds.
@@ -309,11 +381,15 @@ struct Capture {
     known: HashSet<u32>,
     /// Resources descriptors name, or named during the frame.
     viewed: HashSet<u32>,
-    /// Read-back buffers for the slow ones: the buffer, its mapping, size,
-    /// and how much of it is taken.
-    blocks: Vec<(ID3D12Resource, usize, u64, u64)>,
+    /// One read-back buffer of `STAGING` bytes the slow ones go through,
+    /// a round at a time (a block per buffer held their whole size: 1.8 GB
+    /// in avmrec2), and its mapping.
+    ring: Option<(ID3D12Resource, usize)>,
     deltas: File,
     delta_at: AtomicU64,
+    /// Where `CpuBuffer::kept` lies (gone with the capture), and its end.
+    kept_file: File,
+    kept_end: u64,
     lists: Vec<Arc<Vec<u8>>>,
     submits: Vec<wire::Submit>,
     presents: Vec<wire::Present>,
@@ -349,9 +425,22 @@ impl Capture {
             buffers: Vec::new(),
             known: HashSet::new(),
             viewed: HashSet::new(),
-            blocks: Vec::new(),
+            ring: None,
             deltas: File::create(r.folder.join("deltas.bin"))?,
             delta_at: AtomicU64::new(0),
+            kept_file: {
+                use std::os::windows::fs::OpenOptionsExt;
+                // FILE_FLAG_DELETE_ON_CLOSE: a scratch file, gone with its
+                // last handle (the views' sections hold it too).
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .custom_flags(0x0400_0000)
+                    .open(r.folder.join("kept.tmp"))?
+            },
+            kept_end: 0,
             lists: Vec::new(),
             submits: Vec::new(),
             presents: Vec::new(),
@@ -411,6 +500,7 @@ impl Capture {
             }
         }
         all.sort_by_key(|res| res.id);
+        say_memory("resources held", all.len() as u64);
         self.states = lock(&r.states).clone();
         self.idle = self.find_idle(&all);
         self.timed("contents of the card's memory", |c| c.snapshot(r, &all))?;
@@ -541,6 +631,10 @@ impl Capture {
                 D3D12_RESOURCE_FLAG_NONE,
             )?);
         }
+        say_memory(
+            "card contents to copy (MB)",
+            batches.iter().flatten().map(|p| p.len).sum::<u64>() >> 20,
+        );
         let file = File::create(r.folder.join("contents.bin"))?;
         let end = AtomicU64::new(0);
         let contents: std::sync::Mutex<Vec<Content>> = std::sync::Mutex::default();
@@ -593,7 +687,10 @@ impl Capture {
             }
             // Moved in: the writers end when it goes.
             let todo = todo;
-            for mut pieces in batches {
+            for (n, mut pieces) in batches.into_iter().enumerate() {
+                if n % 8 == 0 {
+                    say_memory("card contents: batches of 256 MB sent", n as u64);
+                }
                 {
                     let held = lock(&r.held);
                     pieces.retain(|p| held.contains_key(&p.res.id));
@@ -614,6 +711,7 @@ impl Capture {
             return Err(e.into());
         }
         self.contents = contents.into_inner().unwrap_or_else(|e| e.into_inner());
+        say_memory("card contents written (MB)", end.load(Ordering::Relaxed) >> 20);
         Ok(())
     }
 
@@ -639,39 +737,23 @@ impl Capture {
             }
             let object = res.object();
             let size = res.desc.width as usize;
-            let (live, through) = if res.seen == Seen::Cached {
+            let (live, slow) = if res.seen == Seen::Cached {
                 let mut data = std::ptr::null_mut();
                 // SAFETY: a live buffer in memory the CPU sees.
                 unsafe { object.Map(0, None, Some(&mut data))? };
-                (data.cast::<u8>().cast_const(), None)
+                (data.cast::<u8>().cast_const(), false)
             } else {
-                let room = self.blocks.iter().position(|b| b.3 + size as u64 <= b.2);
-                let i = match room {
-                    Some(i) => i,
-                    None => {
-                        let len = STAGING.max(size as u64);
-                        let (b, data) = gpu::buffer(
-                            &self.worker.device,
-                            D3D12_HEAP_TYPE_READBACK,
-                            len,
-                            D3D12_RESOURCE_FLAG_NONE,
-                        )?;
-                        self.blocks.push((b, data as usize, len, 0));
-                        self.blocks.len() - 1
-                    }
-                };
-                let b = &mut self.blocks[i];
-                let at = b.3;
-                b.3 = (at + size as u64).next_multiple_of(256);
-                ((b.1 + at as usize) as *const u8, Some((i, at)))
+                (std::ptr::null(), true)
             };
+            let kept = FileBytes::new(&self.kept_file, self.kept_end, size)?;
+            self.kept_end = (self.kept_end + size.max(1) as u64).next_multiple_of(64 << 10);
             self.buffers.push(CpuBuffer {
                 id: res.id,
                 res: object,
                 live,
-                through,
+                slow,
                 size,
-                kept: vec![0; size],
+                kept,
             });
         }
         Ok(())
@@ -681,7 +763,15 @@ impl Capture {
     /// of them, since they were last looked at (the first time: what is not
     /// zero).
     fn changed(&mut self, r: &Recorder, reads: &Reads) -> Result<Vec<Delta>, Fault> {
+        let known = self.buffers.len();
         self.new_buffers(r)?;
+        if self.buffers.len() != known {
+            say_memory(
+                "CPU buffers kept, MB (read-back ring: the next line)",
+                self.buffers.iter().map(|b| b.size as u64).sum::<u64>() >> 20,
+            );
+            say_memory("read-back ring, MB", if self.ring.is_some() { STAGING >> 20 } else { 0 });
+        }
         {
             let held = lock(&r.held);
             self.buffers.retain(|b| held.contains_key(&b.id));
@@ -697,42 +787,85 @@ impl Capture {
                     .map(move |(from, to)| (i, from, to))
             })
             .collect();
-        if parts.iter().any(|p| self.buffers[p.0].through.is_some()) {
-            let (buffers, blocks) = (&self.buffers, &self.blocks);
-            self.worker.run(|list| {
-                for &(i, from, to) in &parts {
-                    let b = &buffers[i];
-                    if let Some((block, at)) = b.through {
-                        // SAFETY: an open list and live buffers.
-                        unsafe {
-                            list.CopyBufferRegion(
-                                &blocks[block].0,
-                                at + from as u64,
-                                &*b.res,
-                                from as u64,
-                                (to - from) as u64,
-                            )
-                        };
-                    }
+        // Rounds of what fits in the ring at once: (buffer, from, to, offset
+        // in the ring, or usize::MAX for one read in place). The fast ones
+        // are all in the first; a slow one in pieces up to the ring's room.
+        let room = STAGING as usize;
+        let mut rounds: Vec<Vec<(usize, usize, usize, usize)>> = vec![Vec::new()];
+        let mut taken = 0usize;
+        for &(i, from, to) in &parts {
+            if !self.buffers[i].slow {
+                rounds[0].push((i, from, to, usize::MAX));
+                continue;
+            }
+            let mut at = from;
+            while at < to {
+                if taken >= room {
+                    rounds.push(Vec::new());
+                    taken = 0;
                 }
-            })?;
+                let len = (to - at).min(room - taken);
+                if let Some(round) = rounds.last_mut() {
+                    round.push((i, at, at + len, taken));
+                }
+                taken = (taken + len).next_multiple_of(256);
+                at += len;
+            }
         }
-        let chunks: Vec<(usize, usize, usize)> = parts
+        let mut out = Vec::new();
+        for round in &rounds {
+            if round.iter().any(|p| p.3 != usize::MAX) {
+                if self.ring.is_none() {
+                    let (b, data) = gpu::buffer(
+                        &self.worker.device,
+                        D3D12_HEAP_TYPE_READBACK,
+                        STAGING,
+                        D3D12_RESOURCE_FLAG_NONE,
+                    )?;
+                    self.ring = Some((b, data as usize));
+                }
+                let (buffers, ring) = (&self.buffers, &self.ring);
+                let Some((ring, _)) = ring else { continue };
+                self.worker.run(|list| {
+                    for &(i, from, to, at) in round {
+                        if at != usize::MAX {
+                            // SAFETY: an open list and live buffers.
+                            unsafe {
+                                list.CopyBufferRegion(
+                                    ring,
+                                    at as u64,
+                                    &*buffers[i].res,
+                                    from as u64,
+                                    (to - from) as u64,
+                                )
+                            };
+                        }
+                    }
+                })?;
+            }
+            out.extend(self.compare(round)?);
+        }
+        out.sort_by_key(|d| (d.res, d.at));
+        Ok(out)
+    }
+
+    /// The deltas of one round: each part compared with what is kept, from
+    /// its mapping or its place in the ring (whose copy has run).
+    fn compare(&self, round: &[(usize, usize, usize, usize)]) -> Result<Vec<Delta>, Fault> {
+        let ring = self.ring.as_ref().map_or(0, |r| r.1);
+        // (buffer, offset, length, where its bytes are read)
+        let chunks: Vec<(usize, usize, usize, usize)> = round
             .iter()
-            .flat_map(|&(i, from, to)| {
+            .flat_map(|&(i, from, to, place)| {
+                let base = if place == usize::MAX {
+                    self.buffers[i].live as usize
+                } else {
+                    ring + place - from
+                };
                 (from..to)
                     .step_by(CHUNK)
-                    .map(move |at| (i, at, CHUNK.min(to - at)))
+                    .map(move |at| (i, at, CHUNK.min(to - at), base + at))
             })
-            .collect();
-        // Each chunk is one thread's; threads share what is kept by parts.
-        struct Kept(*mut u8);
-        // SAFETY: parts of it are used by one thread each.
-        unsafe impl Sync for Kept {}
-        let kept: Vec<Kept> = self
-            .buffers
-            .iter_mut()
-            .map(|b| Kept(b.kept.as_mut_ptr()))
             .collect();
         let next = AtomicUsize::new(0);
         let out: std::sync::Mutex<Vec<Delta>> = std::sync::Mutex::default();
@@ -748,20 +881,18 @@ impl Capture {
                     let mut mine = Vec::new();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(&(b, at, len)) = chunks.get(i) else {
+                        let Some(&(b, at, len, src)) = chunks.get(i) else {
                             break;
                         };
-                        // SAFETY: a chunk of the buffer's memory (it may
-                        // change meanwhile: what is kept is what was read)
+                        let kept = buffers[b].kept.at;
+                        // SAFETY: a chunk of the buffer's bytes (in place they
+                        // may change meanwhile: what is kept is what was read)
                         // and of what is kept, which no other thread has.
-                        let runs = unsafe {
-                            changed_runs(buffers[b].live.add(at), kept[b].0.add(at), len)
-                        };
+                        let runs = unsafe { changed_runs(src as *const u8, kept.add(at), len) };
                         for (from, to) in runs {
                             // SAFETY: as above.
-                            let bytes = unsafe {
-                                std::slice::from_raw_parts(kept[b].0.add(at + from), to - from)
-                            };
+                            let bytes =
+                                unsafe { std::slice::from_raw_parts(kept.add(at + from), to - from) };
                             let file_at = end.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                             if let Err(e) = write_at(file, bytes, file_at) {
                                 lock(&failed).get_or_insert(e);
@@ -781,9 +912,7 @@ impl Capture {
         if let Some(e) = lock(&failed).take() {
             return Err(e.into());
         }
-        let mut out = out.into_inner().unwrap_or_else(|e| e.into_inner());
-        out.sort_by_key(|d| (d.res, d.at));
-        Ok(out)
+        Ok(out.into_inner().unwrap_or_else(|e| e.into_inner()))
     }
 
     fn submit(

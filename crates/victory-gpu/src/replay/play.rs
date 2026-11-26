@@ -747,8 +747,11 @@ impl Player {
                 _ => gpu::to_props(p),
             }
         };
-        // Flags a replay has no use for: sharing, display, not zeroed.
-        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x1000;
+        // Flags a replay has no use for: sharing, display, not zeroed, and
+        // not resident (the host makes those resident when it needs them; a
+        // replay never does: a page fault on its first copy, 3840x2160
+        // textures of capture-1).
+        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x800 | 0x1000;
         let used_by_buffers_only: HashSet<u32> = {
             let mut textures = HashSet::new();
             for r in &self.frame.resources {
@@ -788,7 +791,12 @@ impl Player {
                 let m = moves.entry(format!("{seen:?}")).or_insert((0u32, 0u64));
                 *m = (m.0 + 1, m.1 + r.desc.width);
             }
-            let desc = gpu::to_desc(&r.desc);
+            let mut desc = gpu::to_desc(&r.desc);
+            // The heaps lose their sharing flags (DROP): a resource that asks
+            // to be shared across adapters is refused in them (3885 of a
+            // capture whose heaps were opened from existing memory, and the
+            // card hung on the lists that named them).
+            desc.Flags &= !D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
             let mut made: Option<ID3D12Resource> = None;
             let clear: Option<D3D12_CLEAR_VALUE> = r.clear.map(|c| {
                 // SAFETY: 20 bytes that were a clear value.
@@ -843,6 +851,14 @@ impl Player {
             };
             match (result, made) {
                 (Ok(()), Some(res)) => {
+                    // Its name in what the runtime keeps of a lost card.
+                    // SAFETY: a live resource.
+                    let _ = unsafe {
+                        res.SetName(&windows::core::HSTRING::from(format!(
+                            "resource {} {:?} {:?} {}x{}",
+                            r.id, r.place, r.desc.dimension, r.desc.width, r.desc.height
+                        )))
+                    };
                     // SAFETY: a live resource.
                     let va = if is_buffer {
                         unsafe { res.GetGPUVirtualAddress() }
