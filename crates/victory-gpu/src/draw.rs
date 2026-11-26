@@ -5346,7 +5346,7 @@ impl State {
             self.batch = None;
         }
         // A draw after dispatches waits for them.
-        if kind != DISPATCH {
+        if kind != DISPATCH && kind != crate::indirect::batch::SPREAD {
             self.synced();
         }
         let (id, offset) = (args.id(), args.offset(arguments));
@@ -5471,14 +5471,15 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
-        // One record without a count: clamped in a batch (`batches`). Not a
-        // spread dispatch: its signature reads [row, asked x, x, y, z]
-        // records, and a batch writes [x, y, z] (read as spread words, its
-        // groups were wrong: the culling's mesh records asked for 102,272
-        // groups, the world drew nothing).
-        let batch = if batches() > 0 && max == 1 && count.is_none() && !is_spread {
+        // One record without a count: clamped in a batch (`batches`). A
+        // spread dispatch's signature reads [row, asked x, x, y, z] records:
+        // its job writes them (`batch::SPREAD`; read as spread words, plain
+        // [x, y, z] gave the culling's mesh records 102,272 groups and the
+        // world drew nothing; left out of batches, it ran at 14.6 fps
+        // against 20.7 with spreading off, run avmsp1).
+        let batch = if batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
-            self.batched(list, &args, arguments, kind)
+            self.batched(list, &args, arguments, if is_spread { crate::indirect::batch::SPREAD } else { kind })
         } else {
             None
         };

@@ -3809,7 +3809,9 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             return;
         };
         let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
-        let kinds = [0u32, 1, 2, 10];
+        // (A spread dispatch's job, against the clamp of one spread
+        // dispatch: [row, asked x, x, y, z] out.)
+        let kinds = [0u32, 1, 2, 10, batch::SPREAD];
         let values = [0u32, 1, 3, 100, 65_535, 65_536, 1 << 20, (1 << 23) - 1, 1 << 23, 1 << 24, (1 << 26) + 1, u32::MAX];
         // Every kind with many records, in two sources.
         let mut records: Vec<(u32, [u32; 5])> = Vec::new();
@@ -3841,9 +3843,11 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             let offset = i as u64 * 32;
             let words = batch::words(*kind).unwrap();
             let stride = words * 4;
+            let spread = *kind == batch::SPREAD;
+            let out = if spread { 5 } else { words };
             let read = |p: *mut u8| -> Vec<u32> {
                 // SAFETY: the mapping holds more.
-                (0..words as usize).map(|w| unsafe { p.cast::<u32>().add(w).read_volatile() }).collect()
+                (0..out as usize).map(|w| unsafe { p.cast::<u32>().add(w).read_volatile() }).collect()
             };
             let mut seen = Vec::new();
             for batched in [false, true] {
@@ -3855,21 +3859,23 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                     let mut table = unsafe { batch::Table::new(table_ptr, 0, [1, 2, 0, 0]) };
                     assert_eq!(table.place(1 + i as u64 % 2, offset, *kind), Some(0));
                 } else {
-                    assert!(record_clamp_as(
+                    assert!(record_clamp_with(
                         &warp.clamp,
                         &warp.list,
                         (&dst, D3D12_RESOURCE_STATE_COMMON),
                         budget_gpu,
                         (&src, offset),
                         None,
-                        (*kind, stride, 1),
+                        (if spread { 2 } else { *kind }, stride, 1),
+                        false,
+                        spread,
                         false,
                     ));
                 }
                 // SAFETY: an open list; the records are readable as arguments.
                 unsafe {
                     warp.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-                    warp.list.CopyBufferRegion(&back, 0, &dst, 0, u64::from(stride));
+                    warp.list.CopyBufferRegion(&back, 0, &dst, 0, u64::from(out * 4));
                     warp.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
                 }
                 warp.submit_and_wait();

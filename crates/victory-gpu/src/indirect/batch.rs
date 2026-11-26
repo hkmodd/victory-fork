@@ -28,6 +28,10 @@ pub(crate) const SOURCES: usize = 4;
 /// The most executions charged by one job: the most a record costs (2^26)
 /// as often still fits 32 bits.
 pub(crate) const TIMES: u32 = 31;
+/// The job kind of a dispatch of a program that takes the spread words:
+/// its [x, y, z] record is read and [row, asked x, x, y, z] stored, as the
+/// clamp of one spread dispatch writes it (`super::SOURCE`).
+pub(crate) const SPREAD: u32 = 12;
 
 pub(crate) const SOURCE: &str = r#"
 #define RS "SRV(t0), SRV(t1), SRV(t2), SRV(t3), SRV(t4), UAV(u0), UAV(u1)"
@@ -64,6 +68,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint asked = 0;
     uint kind = 0;
     uint words = 0;
+    uint stores = 0;
     if (gi == 0) {
         largest_asked = 0;
         all_asked = 0;
@@ -73,6 +78,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         job = jobs.Load4(16 + id.x * 16);
         kind = (job.x >> 4) & 15;
         words = min((job.x >> 8) & 15, 5);
+        stores = kind == 12 ? 5u : words;
         for (uint w = 0; w < words; w++) {
             record[w] = load(job.x & 3, job.y + w * 4);
         }
@@ -83,6 +89,30 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             }
             record[1] = min(record[1], (1u << 26) / max(record[0], 1u));
             cost = record[0] * record[1];
+        } else if (kind == 12) {
+            // A spread dispatch: past 65,535 groups in x (one row), spread
+            // across z, the program takes (x + z * row, y, 0) and leaves
+            // past the asked x (after upstream VIctory pull request #2312).
+            uint3 raw = uint3(record[0], record[1], record[2]);
+            asked = max(raw.x, max(raw.y, raw.z));
+            uint row = 0;
+            uint3 g;
+            if (raw.x > 65535u && raw.y >= 1u && raw.y <= 65535u && raw.z == 1u) {
+                uint rows = (raw.x + 65534u) / 65535u;
+                row = (raw.x + rows - 1u) / rows;
+                g = uint3(row, raw.y, rows);
+            } else {
+                g = min(raw, uint3(raw.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
+            }
+            if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
+                g = uint3(0, 0, 0);
+            }
+            cost = g.x * g.y * g.z * 64u;
+            record[0] = row;
+            record[1] = raw.x;
+            record[2] = g.x;
+            record[3] = g.y;
+            record[4] = g.z;
         } else if (kind == 2) {
             // As the clamp of one: what the record asked for, for the meter.
             asked = max(record[0], max(record[1], record[2]));
@@ -169,21 +199,28 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         return;
     }
     if (fits[gi] == 0) {
-        record[0] = 0;
-        record[1] = 0;
-        if (kind > 1) {
+        if (kind == 12) {
             record[2] = 0;
+            record[3] = 0;
+            record[4] = 0;
+        } else {
+            record[0] = 0;
+            record[1] = 0;
+            if (kind > 1) {
+                record[2] = 0;
+            }
         }
     }
-    for (uint s = 0; s < words; s++) {
+    for (uint s = 0; s < stores; s++) {
         dst_args.Store(job.z + s * 4, record[s]);
     }
 }
 "#;
 
 /// The words of a record of `kind` (PC argument numbering).
+/// A [`SPREAD`] job reads a dispatch's three.
 pub(crate) fn words(kind: u32) -> Option<u32> {
-    super::min_stride(kind).map(|bytes| bytes / 4)
+    super::min_stride(if kind == SPREAD { 2 } else { kind }).map(|bytes| bytes / 4)
 }
 
 /// A job's first word.
