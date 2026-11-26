@@ -507,6 +507,22 @@ pub fn with_wave_wide<R>(on: bool, f: impl FnOnce() -> R) -> R {
     out
 }
 
+/// Whether `VICTORY_WAVE_WIDE_ONLY` (16-hex-digit hashes, comma separated)
+/// names the container `hash`, for tools that translate offline.
+pub fn wave_wide_only(hash: &str) -> bool {
+    static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    ONLY.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_WIDE_ONLY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty() && h != "none")
+            .collect()
+    })
+    .iter()
+    .any(|h| hash.to_lowercase().starts_with(h.as_str()))
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
