@@ -1292,12 +1292,17 @@ mod host {
     /// what is on screen (the account screen's prompt, a turn of the
     /// camera) while someone else uses the desktop. Unset: nothing is read.
     fn asked_keys() -> Vec<u8> {
-        static FILE: LazyLock<Option<std::path::PathBuf>> =
-            LazyLock::new(|| std::env::var_os("VICTORY_KEYS_FILE").map(Into::into));
+        /// The file, and the name it is taken to before it is read ([`take`]).
+        static FILE: LazyLock<Option<(std::path::PathBuf, std::path::PathBuf)>> = LazyLock::new(|| {
+            let file = std::env::var_os("VICTORY_KEYS_FILE")?;
+            let mut taken = file.clone();
+            taken.push(".taken");
+            Some((file.into(), taken.into()))
+        });
         /// Keys held, until when; when the file was last looked at.
         type Held = (Vec<(Instant, u8)>, Option<Instant>);
         static HELD: Mutex<Held> = Mutex::new((Vec::new(), None));
-        let Some(file) = &*FILE else {
+        let Some((file, taken)) = &*FILE else {
             return Vec::new();
         };
         let now = Instant::now();
@@ -1305,13 +1310,23 @@ mod host {
         let due = held.1.is_none_or(|last| now.duration_since(last) >= Duration::from_millis(50));
         if due {
             held.1 = Some(now);
-            if let Ok(text) = std::fs::read_to_string(file) {
-                let _ = std::fs::remove_file(file);
+            if let Some(text) = take(file, taken) {
                 held.0.extend(asked(&text, now));
             }
         }
         held.0.retain(|&(until, _)| until > now);
         held.0.iter().map(|&(_, vk)| vk).collect()
+    }
+
+    /// What the keys file holds, taken away: it is first renamed to `taken`
+    /// (one step), then read and removed there. A batch the script moves in
+    /// after the rename is a new file at `file`, read by the next look; read
+    /// and removed by name, it could be removed unread between the two.
+    fn take(file: &std::path::Path, taken: &std::path::Path) -> Option<String> {
+        std::fs::rename(file, taken).ok()?;
+        let text = std::fs::read_to_string(taken);
+        let _ = std::fs::remove_file(taken);
+        text.ok()
     }
 
     /// The keys of a [`asked_keys`] file read at `now`: each with the time
@@ -1464,6 +1479,20 @@ mod host {
             asked,
             [(now + Duration::from_millis(200), 0x0D), (now + Duration::from_millis(1500), b'J')]
         );
+    }
+
+    #[test]
+    fn a_batch_written_after_the_file_is_taken_waits_for_the_next_look() {
+        let dir = tempfile::tempdir().unwrap();
+        let (file, taken) = (dir.path().join("keys.txt"), dir.path().join("keys.txt.taken"));
+        assert_eq!(take(&file, &taken), None);
+        std::fs::write(&file, "Enter 0.3\n").unwrap();
+        assert_eq!(take(&file, &taken).as_deref(), Some("Enter 0.3\n"));
+        assert!(!file.exists() && !taken.exists());
+        // the script's next batch, after the take: still there, and the next look's
+        std::fs::write(&file, "L 1.5\n").unwrap();
+        assert!(file.exists());
+        assert_eq!(take(&file, &taken).as_deref(), Some("L 1.5\n"));
     }
 
     #[test]
