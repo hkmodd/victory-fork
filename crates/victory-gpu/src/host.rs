@@ -8779,7 +8779,118 @@ fn buffers() -> u32 {
     })
 }
 
+/// What the driver waits for inside the host's Present (avmpf5/avmte1: the
+/// lane sleeps 15-19% of its samples in nvwgf2umx under Present, with three
+/// buffers and with tearing alike). Every 64 presents: the time in Present,
+/// the submissions the card had still to run when Present was called and
+/// when it returned, and how many presents returned with the card done with
+/// everything sent before them (a driver that drains the card before it
+/// lets the frame go).
+#[cfg(feature = "diagnostics")]
+fn present_wait((sent, done_before, at): (u64, u64, std::time::Instant), done_after: u64) {
+    use std::sync::atomic::AtomicU64;
+    // presents, µs in Present, submissions behind before, behind after, drained.
+    static SUM: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    let us = at.elapsed().as_micros() as u64;
+    let add = |i: usize, v: u64| SUM[i].fetch_add(v, Ordering::Relaxed);
+    add(1, us);
+    add(2, sent.saturating_sub(done_before));
+    add(3, sent.saturating_sub(done_after));
+    add(4, u64::from(done_after >= sent));
+    if add(0, 1) % 64 == 63 {
+        let [n, us, before, after, drained] = [0, 1, 2, 3, 4].map(|i| SUM[i].swap(0, Ordering::Relaxed) as f64);
+        let waited = LANE_WAITED.swap(0, Ordering::Relaxed) as f64;
+        tracing::info!(
+            "the host's Present, over {n:.0} presents: {:.2} ms each; submissions the card had still to run {:.2} when \
+             it was called and {:.2} when it returned; {drained:.0} returned with the card done with all sent before; \
+             the lane waited {:.2} ms each for the Present before",
+            us / n / 1000.0,
+            before / n,
+            after / n,
+            waited / n / 1000.0,
+        );
+    }
+}
+
+/// Diagnostics: µs the presenting lane waited for the Present before it
+/// (with [`present_thread`]).
+#[cfg(feature = "diagnostics")]
+static LANE_WAITED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether the swap chain's Present runs on a thread of its own
+/// (`VICTORY_PRESENT_THREAD=1`). The driver holds Present 9-15 ms a frame
+/// with the card still ~4 submissions behind when it lets go (avmpw1), and
+/// on the submit lane that time is serial: the lane sends the copy into the
+/// back buffer, hands the swap chain over and goes on.
+fn present_thread() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PRESENT_THREAD").as_deref() == Ok("1"))
+}
+
+/// The swap chain, handed to the presenting thread.
+struct Chain(IDXGISwapChain3);
+
+// SAFETY: DXGI objects are free-threaded; the lane calls nothing on the swap
+// chain while the thread presents it (it waits for [`Shower::wait`] first).
+unsafe impl Send for Chain {}
+
+/// The thread that presents ("victory-present"), one Present at a time.
+struct Shower {
+    to: std::sync::mpsc::SyncSender<Chain>,
+    done: std::sync::mpsc::Receiver<()>,
+    /// A Present was handed over and has not been seen to return.
+    pending: bool,
+}
+
+impl Shower {
+    fn new() -> Option<Self> {
+        let (to, presents) = std::sync::mpsc::sync_channel::<Chain>(1);
+        let (finished, done) = std::sync::mpsc::sync_channel::<()>(1);
+        std::thread::Builder::new()
+            .name("victory-present".into())
+            .spawn(move || {
+                for Chain(chain) in presents {
+                    #[cfg(feature = "diagnostics")]
+                    let before = host().map(Host::present_mark);
+                    // SAFETY: our swap chain; nothing else calls it until `done`.
+                    let _ = unsafe { chain.Present(0, DXGI_PRESENT(0)) };
+                    #[cfg(feature = "diagnostics")]
+                    if let (Some(before), Some(h)) = (before, host()) {
+                        // SAFETY: a live fence.
+                        present_wait(before, unsafe { h.fence.GetCompletedValue() });
+                    }
+                    if finished.send(()).is_err() {
+                        break;
+                    }
+                }
+            })
+            .ok()?;
+        Some(Self { to, done, pending: false })
+    }
+
+    /// Waits for the Present handed over before, if it has not returned.
+    fn wait(&mut self) {
+        if !self.pending {
+            return;
+        }
+        #[cfg(feature = "diagnostics")]
+        let at = std::time::Instant::now();
+        let _ = self.done.recv();
+        self.pending = false;
+        #[cfg(feature = "diagnostics")]
+        LANE_WAITED.fetch_add(at.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+
+    /// Hands `chain` over to be presented; false if the thread is gone.
+    fn send(&mut self, chain: &IDXGISwapChain3) -> bool {
+        self.pending = self.to.send(Chain(chain.clone())).is_ok();
+        self.pending
+    }
+}
+
 struct Presenter {
+    /// With [`present_thread`]: the thread that calls Present.
+    shower: Option<Shower>,
     swap_chain: IDXGISwapChain3,
     width: u32,
     height: u32,
@@ -9170,6 +9281,18 @@ impl Meter {
 }
 
 impl Host {
+    /// Diagnostics: the submissions sent, those the card has finished, and
+    /// now (for [`present_wait`]).
+    #[cfg(feature = "diagnostics")]
+    fn present_mark(&self) -> (u64, u64, std::time::Instant) {
+        (
+            *self.submitted.lock().unwrap_or_else(|e| e.into_inner()),
+            // SAFETY: a live fence.
+            unsafe { self.fence.GetCompletedValue() },
+            std::time::Instant::now(),
+        )
+    }
+
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
@@ -9192,6 +9315,11 @@ impl Host {
             };
         }
         let p = presenter.as_mut()?;
+        // The back buffer index and a resize read the swap chain: the
+        // Present handed over before has returned first.
+        if let Some(shower) = p.shower.as_mut() {
+            shower.wait();
+        }
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
@@ -9303,7 +9431,17 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let handed = match p.shower.as_mut() {
+                Some(shower) => shower.send(&p.swap_chain),
+                None => false,
+            };
+            if !handed {
+                #[cfg(feature = "diagnostics")]
+                let before = self.present_mark();
+                let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+                #[cfg(feature = "diagnostics")]
+                present_wait(before, self.fence.GetCompletedValue());
+            }
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
@@ -9350,7 +9488,10 @@ impl Host {
             copy.close();
             tracing::info!(width, height, format = format.0, buffers = buffers(), "presenting to a window");
             self.log_video_memory("right after the swap chain is made");
+            let shower = present_thread().then(Shower::new).flatten();
+            tracing::info!(on = shower.is_some(), "the swap chain presented by a thread of its own");
             Ok(Presenter {
+                shower,
                 swap_chain,
                 width,
                 height,
