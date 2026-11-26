@@ -3088,6 +3088,50 @@ pub(crate) fn joins() -> (usize, usize) {
     if ahead_of_writes() { joins_asked() } else { (1, 1) }
 }
 
+/// Whether the parts of a submission go to the queue in one call
+/// (`VICTORY_JOIN_CALLS=1`; off by default), a list between them that waits
+/// for everything before it ([`place::wait_for_all`]) instead of a call of
+/// their own. On an RTX 4080 each call leaves the card standing 0.15 to
+/// 0.2 ms: the replayed frame of capture-1 (43 calls) took 51.2 ms on the
+/// card, in one call with such lists between its submissions 45.1 ms, the
+/// same picture.
+fn join_calls() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_JOIN_CALLS").is_some_and(|v| v == "1");
+        tracing::info!("the parts of a submission go to the queue in one call: {on}");
+        on
+    })
+}
+
+/// The lists [`join_calls`] puts between parts, closed once, each with the
+/// submission it was last sent in; one is sent again when the card is past it.
+static JOINTS: Mutex<Vec<(ID3D12CommandAllocator, ID3D12CommandList, u64)>> = Mutex::new(Vec::new());
+
+impl Host {
+    /// A list that waits for everything before it, free on the card, for the
+    /// submission `value`.
+    fn joint(&self, value: u64) -> Option<ID3D12CommandList> {
+        // SAFETY: our fence.
+        let done = unsafe { self.fence.GetCompletedValue() };
+        let mut joints = JOINTS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(joint) = joints.iter_mut().find(|j| j.2 <= done) {
+            joint.2 = value;
+            return Some(joint.1.clone());
+        }
+        // SAFETY: plain creation; a barrier recorded in the open list.
+        let (allocator, list) = unsafe {
+            let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
+            let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).ok()?;
+            place::wait_for_all(self, &list);
+            list.Close().ok()?;
+            (allocator, list.cast::<ID3D12CommandList>().ok()?)
+        };
+        joints.push((allocator, list.clone(), value));
+        Some(list)
+    }
+}
+
 fn joins_asked() -> (usize, usize) {
     static MOST: OnceLock<(usize, usize)> = OnceLock::new();
     let of = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<usize>().ok());
@@ -5936,11 +5980,31 @@ impl Host {
             }
             let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
             // SAFETY: closed lists; the fence is ours.
+            // With [`join_calls`] the parts go in one call, a joint between them.
+            let joined = (join_calls() && !cuts.is_empty())
+                .then(|| {
+                    let mut all = Vec::with_capacity(lists.len() + cuts.len());
+                    let mut from = 0;
+                    for &to in &cuts {
+                        all.extend_from_slice(&lists[from..to.max(from)]);
+                        if !all.is_empty() && to < lists.len() {
+                            all.push(Some(self.joint(*submitted)?));
+                        }
+                        from = to.max(from);
+                    }
+                    all.extend_from_slice(&lists[from..]);
+                    Some(all)
+                })
+                .flatten();
             let signalled = unsafe {
-                let mut from = 0;
-                for to in cuts.into_iter().chain([lists.len()]) {
-                    self.queue.ExecuteCommandLists(&lists[from..to]);
-                    from = to;
+                if let Some(all) = joined {
+                    self.queue.ExecuteCommandLists(&all);
+                } else {
+                    let mut from = 0;
+                    for to in cuts.into_iter().chain([lists.len()]) {
+                        self.queue.ExecuteCommandLists(&lists[from..to]);
+                        from = to;
+                    }
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
