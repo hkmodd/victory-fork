@@ -1597,6 +1597,8 @@ pub(crate) fn log(frames: f64) {
     log_memory();
     #[cfg(feature = "diagnostics")]
     crate::watch::alone_line(frames);
+    #[cfg(feature = "diagnostics")]
+    crate::watch::ahead_line(frames);
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));

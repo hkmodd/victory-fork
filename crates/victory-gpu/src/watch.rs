@@ -779,7 +779,11 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
     if journal().kept {
         return;
     }
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
     let _all = (!held).then(Asking::hold_all);
+    #[cfg(feature = "diagnostics")]
+    let holding = began.elapsed();
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut runs = Vec::new();
     let mut i = 0;
@@ -805,6 +809,8 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
         asked.extend(a);
         written.extend(w);
     }
+    #[cfg(feature = "diagnostics")]
+    ahead_count(held, runs.len(), &asked, written.len(), holding, began.elapsed());
     note_hot(&written);
     if port_journal() {
         // Renderer port #7: the pages noted shared, under their parts; then
@@ -1129,6 +1135,78 @@ fn alone(start: usize, end: usize, pages: usize, took: std::time::Duration) {
     let mut all = ALONE.lock().unwrap_or_else(|e| e.into_inner());
     let e = all.get_or_insert_with(Default::default).entry((start, end)).or_default();
     *e = (e.0 + 1, e.1 + pages as u64, e.2 + took.as_micros() as u64);
+}
+
+/// Diagnostics: grouped askings ([`ask_ahead_held`]), [held by the
+/// submission's one asking, by a flush]: askings, groups, pages asked, pages
+/// asked again in the frame, pages found written, us holding, us in all;
+/// and the pages asked in the frame `.1`.
+#[cfg(feature = "diagnostics")]
+struct AheadStat {
+    by: [[u64; 7]; 2],
+    frame: u64,
+    pages: std::collections::HashSet<usize>,
+}
+
+#[cfg(feature = "diagnostics")]
+static AHEAD_STAT: Mutex<Option<AheadStat>> = Mutex::new(None);
+
+#[cfg(feature = "diagnostics")]
+fn ahead_count(
+    held: bool,
+    groups: usize,
+    asked: &[(usize, usize)],
+    written: usize,
+    holding: std::time::Duration,
+    took: std::time::Duration,
+) {
+    let frame = crate::queue::presented();
+    let mut all = AHEAD_STAT.lock().unwrap_or_else(|e| e.into_inner());
+    let a = all.get_or_insert_with(|| AheadStat { by: [[0; 7]; 2], frame, pages: Default::default() });
+    if a.frame != frame {
+        a.frame = frame;
+        a.pages.clear();
+    }
+    let (mut pages, mut again) = (0u64, 0u64);
+    for &(first, last) in asked {
+        for page in first..last {
+            pages += 1;
+            if !a.pages.insert(page) {
+                again += 1;
+            }
+        }
+    }
+    let e = &mut a.by[held as usize];
+    for (k, v) in [1, groups as u64, pages, again, written as u64, holding.as_micros() as u64, took.as_micros() as u64]
+        .into_iter()
+        .enumerate()
+    {
+        e[k] += v;
+    }
+}
+
+/// Diagnostics, for the frame lines: [`AHEAD_STAT`] per frame.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn ahead_line(frames: f64) {
+    let by = {
+        let mut all = AHEAD_STAT.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(a) = all.as_mut() else { return };
+        std::mem::replace(&mut a.by, [[0; 7]; 2])
+    };
+    let f = |e: &[u64; 7]| {
+        format!(
+            "{:.1} askings, {:.1} groups, {:.0} pages asked, {:.0} asked again in the frame ({:.0}%), {:.1} found written, {:.2} ms holding, {:.2} ms in all",
+            e[0] as f64 / frames,
+            e[1] as f64 / frames,
+            e[2] as f64 / frames,
+            e[3] as f64 / frames,
+            100.0 * e[3] as f64 / e[2].max(1) as f64,
+            e[4] as f64 / frames,
+            e[5] as f64 / 1e3 / frames,
+            e[6] as f64 / 1e3 / frames
+        )
+    };
+    tracing::info!("grouped askings ahead per frame: by a flush {}; by the submission's one asking {}", f(&by[0]), f(&by[1]));
 }
 
 /// Diagnostics, for the frame lines: [`ALONE`] per frame, the busiest.
