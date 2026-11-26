@@ -4083,6 +4083,7 @@ impl State {
         let (row, asked, gx, gy, gz) = victory_shader::emit::spread_groups(x, y, z, spreads(p).is_some());
         if row != 0 {
             SPREAD[0].fetch_add(1, Ordering::Relaxed);
+            note_spread(&p.name, format_args!("direct, {x}x{y}x{z} groups asked"));
         } else if gx > 65_535 || gy > 65_535 || gz > 65_535 {
             once!(gx, gy, gz, "a dispatch asks for more than 65,535 groups in a dimension and is not spread");
         }
@@ -5459,6 +5460,9 @@ impl State {
             .flatten()
             .and_then(|(param, index)| host_spread_signature(&p.root, param, index));
         let is_spread = spread.is_some();
+        if is_spread {
+            note_spread(&p.name, format_args!("indirect"));
+        }
         let Some(signature) = spread.or_else(|| {
             matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
                 .then(|| host_signature(kind, stride))
@@ -5826,7 +5830,7 @@ fn dispatch_dimensions(dims: [u32; 3], group: [u32; 3], flags: u32) -> Option<([
 /// the spread words, and the index of the first in it (the second follows:
 /// one root-constant argument sets both); `None` for any other pipeline.
 fn spreads(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
-    if !spread_on() {
+    if !spread_on() || spread_skipped(&p.name) {
         return None;
     }
     let stage = p.stages.first()?;
@@ -5838,6 +5842,32 @@ fn spreads(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
         .iter()
         .any(|u| u.root == kind && u.dword == 1 && u.index == first + 1)
         .then_some((param, first))
+}
+
+/// `VICTORY_DISPATCH_SPREAD_SKIP=<a|b|...>`: pipelines whose name holds one of
+/// these (comma or `|` apart) are never spread (clamped to 65,535 as with
+/// the spread off), to find by halves which spread program draws the
+/// posterized faces and walls (seen only with the spread on: runs avmfx1,
+/// avmsb1, avmtk2 against avmsp1).
+fn spread_skipped(name: &str) -> bool {
+    static SKIP: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let skip = SKIP.get_or_init(|| {
+        std::env::var("VICTORY_DISPATCH_SPREAD_SKIP")
+            .map(|v| v.split([',', '|']).map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect())
+            .unwrap_or_default()
+    });
+    !skip.is_empty() && skip.iter().any(|s| name.contains(s.as_str()))
+}
+
+/// Says once per pipeline that its dispatches are spread (`how`: direct,
+/// with the groups asked, or indirect, whose counts the card writes).
+fn note_spread(name: &str, how: std::fmt::Arguments) {
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.iter().any(|s| s == name) {
+        seen.push(name.to_string());
+        tracing::info!(pipeline = name, "a program's dispatches spread across z (VICTORY_DISPATCH_SPREAD): {how}");
+    }
 }
 
 /// Whether dispatches past 65,535 groups in x are spread across z
