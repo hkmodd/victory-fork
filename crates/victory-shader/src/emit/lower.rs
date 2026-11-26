@@ -117,6 +117,14 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 /// two host waves of 32 stand for a console wave (they exchange, which takes
 /// all lanes) the lanes past the count stay and are left out of memory, EXEC's
 /// ballots and the wave's reductions instead (`Lower::partial_active`).
+/// `VICTORY_NAN_SCRUB=1` (off by default): see `Lower::scrub_nan`. Port of
+/// trustno1-coder/VIctory-NVIDIA 77e13a974 as kyouma-vi/rtx-vi 38247eebf has
+/// it (GPL-3.0).
+pub(crate) fn nan_scrub() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NAN_SCRUB").is_some_and(|v| v == "1"))
+}
+
 fn counted_in_threads(parts: &Parts) -> bool {
     let crate::native::StageIo::Cs(cs) = &parts.native.io else {
         return false;
@@ -12013,6 +12021,10 @@ impl<'a> Lower<'a> {
                     self.float_of(v)?
                 });
             }
+            // `VICTORY_NAN_SCRUB=1` (see `scrub_nan`).
+            for v in &mut vals {
+                *v = self.scrub_nan(*v);
+            }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
             let mut args = vec![h];
@@ -13223,6 +13235,29 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// With `VICTORY_NAN_SCRUB=1` (off by default), `f` or 0 where it is NaN
+    /// or infinite. Used on the colours pixel shaders write and on float
+    /// image stores: a NaN or infinity that reaches the title's bloom, blur,
+    /// exposure or temporal upscaler spreads into black patches that stay in
+    /// its history (on NVIDIA: the sun drawn as a black disc). Not what the
+    /// console does, so it is a switch; part of the shader cache key.
+    fn scrub_nan(&mut self, f: V) -> V {
+        if !nan_scrub() {
+            return f;
+        }
+        // The IEEE-754 bits, not float compares: NVIDIA's compiler may
+        // simplify unordered compares under fast math.
+        let c = self.cur;
+        let bits = self.as_int(f);
+        let mask = self.s.m.i32(0x7fff_ffff);
+        let magnitude = self.s.m.bin(c, Bin::And, bits, mask);
+        let inf = self.s.m.i32(0x7f80_0000);
+        let bad = self.s.m.cmp(c, pred::IUGE, magnitude, inf);
+        let zero = self.s.m.i32(0);
+        let clean = self.s.m.select(c, bad, zero, bits);
+        self.as_float(clean)
+    }
+
     fn export(&mut self, b: usize, i: usize) -> Result<(), Why> {
         let e = *self
             .exports
@@ -13408,6 +13443,8 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
+        // A colour a pixel shader writes (`VICTORY_NAN_SCRUB`).
+        let colour = self.s.pixel && matches!(e.target, Target::Color(_));
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
             if let Some(high) = half {
@@ -13426,12 +13463,19 @@ impl<'a> Lower<'a> {
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
             let (suffix, x) = match el.comp {
-                9 if half.is_some() => (".f32", self.as_float(x)),
+                9 if half.is_some() => {
+                    let f = self.as_float(x);
+                    (".f32", if colour { self.scrub_nan(f) } else { f })
+                }
                 9 => {
                     let f = match self.floats.get(&value) {
                         Some(&f) => f,
                         None => self.as_float(x),
                     };
+                    // `VICTORY_NAN_SCRUB=1`: a colour a pixel shader writes is
+                    // 0 where it is NaN or infinite, so one bad value does not
+                    // spread through the title's blur and temporal passes.
+                    let f = if colour { self.scrub_nan(f) } else { f };
                     (".f32", f)
                 }
                 _ => (".i32", x),

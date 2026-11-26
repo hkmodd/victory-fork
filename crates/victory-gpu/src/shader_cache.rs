@@ -135,6 +135,12 @@ fn build() -> [u8; 32] {
             }
             bytes.push(0);
         }
+        // `VICTORY_NAN_SCRUB=1` (colours and image stores without NaN or
+        // infinity). Only when on, so the translations cached without it
+        // keep their key.
+        if std::env::var_os("VICTORY_NAN_SCRUB").is_some_and(|v| v == "1") {
+            bytes.extend_from_slice(b"VICTORY_NAN_SCRUB=1");
+        }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
         // Renderer port 5 (`VICTORY_PORT_CBV=1`): constant buffers read as raw
