@@ -251,7 +251,7 @@ impl<'a> Progress<'a> {
 
 fn device_loss(status: ExitStatus) -> bool {
     // DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_HUNG, DXGI_ERROR_DEVICE_RESET.
-    matches!(status.code().map(|code| code as u32), Some(0x887A0005 | 0x887A0006 | 0x887A0007))
+    matches!(status.code().map(|code| code as u32), Some(0x887A0005..=0x887A0007))
 }
 
 /// Only return a bad pipeline for a failure attributable to an active pipeline.
