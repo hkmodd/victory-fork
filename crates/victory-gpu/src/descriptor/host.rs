@@ -1273,6 +1273,12 @@ fn view_stride(view: &View) -> Option<u32> {
     })
 }
 
+/// The word of the table of strides for `view` (its stride and kind; 0 if it
+/// is no buffer view). (port of codec-d/cool_fox 8cc31ab3, GPL-3.0)
+fn view_stride_word(view: &View) -> u32 {
+    view_stride(view).unwrap_or(0) | view_kind(view)
+}
+
 /// What else the table of strides says of a typed buffer view of an integer
 /// format (`victory_shader::emit::VIEW_INTEGER`); 0 for any other view.
 fn view_kind(view: &View) -> u32 {
@@ -2507,6 +2513,7 @@ impl HostHeap {
         }
         self.put(index);
         self.clear_twin(index);
+        self.write_stride(index, 0);
         self.keep(index, None);
     }
 
@@ -2767,7 +2774,21 @@ impl HostHeap {
         }
         self.put(index);
         self.twin_made(index, kept.is_some() && twinned(view));
+        self.write_stride(index, if kept.is_some() { view_stride_word(view) } else { 0 });
         self.keep(index, kept.flatten());
+    }
+
+    /// Writes slot `index`'s word of the table of strides, which shaders read
+    /// for views chosen by index (dynamic slots too: `SLOT_TABLE_STRIDES`).
+    #[inline]
+    fn write_stride(&self, index: u32, word: u32) {
+        if let Some((_, _, data)) = &self.strides
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            // SAFETY: inside the mapping; a single aligned dword (shaders read
+            // either value the slot had).
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(word) };
+        }
     }
 
     /// Makes slot `index` (a dynamic one) the view the record `words` names,
@@ -2805,7 +2826,8 @@ impl HostHeap {
                     ready: (0, 0, false),
                     tabled: None,
                 };
-                views.made.insert(words, ListView { view, at, twin, kept, listed });
+                let stride_word = view_stride_word(&view);
+                views.made.insert(words, ListView { view, at, twin, stride_word, kept, listed });
             }
             let made = &views.made[&words];
             self.copy_from(index, views.slot(made.at));
@@ -2815,6 +2837,7 @@ impl HostHeap {
             } else {
                 self.clear_twin(index);
             }
+            self.write_stride(index, made.stride_word);
             self.keep(index, made.kept.clone());
             Some(made.listed)
         })
@@ -2839,6 +2862,7 @@ impl HostHeap {
         } else {
             null_view(self.at(index));
             self.put(index);
+            self.write_stride(index, 0);
         }
         self.clear_twin(index);
         self.keep(index, None);
@@ -2925,6 +2949,7 @@ impl HostHeap {
         self.put(index);
         // (Bound by its handle, not read by index.)
         self.clear_twin(index);
+        self.write_stride(index, 1);
         self.keep(index, Some(buffer.clone()));
     }
 
@@ -2934,6 +2959,7 @@ impl HostHeap {
         null_buffer_view(self.at(index));
         self.put(index);
         self.clear_twin(index);
+        self.write_stride(index, 0);
         self.keep(index, None);
     }
 
@@ -2968,6 +2994,7 @@ impl HostHeap {
         };
         self.put(index);
         self.clear_twin(index);
+        self.write_stride(index, 1);
         self.keep(index, Some(buffer.clone()));
     }
 
@@ -2997,6 +3024,7 @@ impl HostHeap {
         };
         self.put(index);
         self.clear_twin(index);
+        self.write_stride(index, 0);
         self.keep(index, None);
     }
 
@@ -3054,6 +3082,7 @@ impl HostHeap {
             unsafe { host.device.CreateShaderResourceView(buffer, Some(&raw), twin) };
         }
         self.twin_made(index, twin.is_some());
+        self.write_stride(index, 0);
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
         self.keep(index, holds.then(|| buffer.clone()));
@@ -5895,6 +5924,8 @@ struct ListView {
     /// Its descriptor's slot in [`ListViews`]; its raw twin's is the next.
     at: u32,
     twin: bool,
+    /// Its word of the table of strides.
+    stride_word: u32,
     kept: Kept,
     listed: Listed,
 }
