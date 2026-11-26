@@ -319,6 +319,8 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
             };
             let found = (p + 1..does.len()).find(|&i| taken[i] && in_the_way(i));
             *behind = found.map(|i| (p, i));
+            #[cfg(feature = "diagnostics")]
+            LAST_PLACED.store(p, Ordering::Relaxed);
             if !by_order || found.is_some() {
                 return Err(BEHIND_PLACED);
             }
@@ -480,6 +482,71 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     let place = |i: usize| runs.iter().position(|l| std::ptr::from_ref::<HostList>(l) as usize == steps[i].0);
     let cut = place(placed)? + 1;
     (place(reader)? >= cut).then_some(cut)
+}
+
+/// The copy at its place that [`plan`] last refused for (diagnostics).
+#[cfg(feature = "diagnostics")]
+static LAST_PLACED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Refusals for [`BEHIND_PLACED`] since the start (diagnostics).
+#[cfg(feature = "diagnostics")]
+static BEHIND_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Diagnostics, at powers of two of the refusals for [`BEHIND_PLACED`]:
+/// the copy at its place, the step behind it in its way (if any), and the
+/// steps the flights' writes asked for, each with its list's place in the
+/// submission, its place in that list, its kind and its bytes.
+#[cfg(feature = "diagnostics")]
+fn behind_placed_why(does: &[Does], steps: &[(usize, usize)], runs: &[&HostList], behind: Option<(usize, usize)>) {
+    let n = BEHIND_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    if !n.is_power_of_two() {
+        return;
+    }
+    let describe = |i: usize| -> String {
+        let Some(&(list, at)) = steps.get(i) else {
+            return format!("step {i}: none");
+        };
+        let place = runs.iter().position(|l| std::ptr::from_ref::<HostList>(l) as usize == list);
+        let kind = place
+            .and_then(|r| {
+                runs[r].deferred().copies.get(at).map(|s| match s {
+                    Step::Fill(_, _, _, None) => "fill (to the CPU only)",
+                    Step::Fill(_, _, _, Some(FillTo::Slot(..))) => "fill of a table's constant buffer (slot)",
+                    Step::Fill(_, _, _, Some(FillTo::Buffer(_))) => "fill of an upload buffer (texture copy source)",
+                    Step::Copy(..) => "title buffer copy",
+                    Step::Placed(_) => "copy at its place",
+                    Step::Texture(_) => "texture",
+                    Step::Refresh(..) => "refresh",
+                    Step::Run(_) => "run",
+                    Step::Host(..) => "host read",
+                    Step::GpuWrite(..) => "gpu write",
+                })
+            })
+            .unwrap_or("?");
+        let bytes = match does[i] {
+            Does::Copy { dst, src, len, .. } => format!("{src:#x}->{dst:#x}+{len:#x}"),
+            Does::Fill { src, len, .. } => format!("{src:#x}+{len:#x}"),
+            Does::Placed { dst, src, len } => format!("{src:#x}->{dst:#x}+{len:#x}"),
+            Does::Read { from, to, .. } | Does::Refresh { from, to, .. } => format!("{from:#x}..{to:#x}"),
+            Does::Run => String::new(),
+        };
+        format!("step {i} (list {place:?} of {}, its step {at}): {kind} {bytes}", runs.len())
+    };
+    let p = LAST_PLACED.load(Ordering::Relaxed);
+    let asked: Vec<String> = does
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| matches!(d, Does::Copy { asked: true, .. } | Does::Fill { asked: true, .. }))
+        .take(4)
+        .map(|(i, _)| describe(i))
+        .collect();
+    let in_way = behind.map_or_else(|| "none behind it (a taken step ahead of it touches its bytes)".to_string(), |(_, i)| describe(i));
+    tracing::info!(
+        "card steps refused for a copy at its place, {n} times since the start: the copy {}; in its way {in_way}; asked first ({} in all): {}",
+        describe(p),
+        does.iter().filter(|d| matches!(d, Does::Copy { asked: true, .. } | Does::Fill { asked: true, .. })).count(),
+        asked.join("; ")
+    );
 }
 
 /// Whether every page of `[from, to)` can be read (through the kernel:
@@ -683,7 +750,14 @@ impl Host {
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
         let (does, steps) = does_of(written, runs);
-        let chosen = plan(&does, stage(), placed_order(), &mut None)?;
+        let mut behind = None;
+        let chosen = plan(&does, stage(), placed_order(), &mut behind);
+        #[cfg(feature = "diagnostics")]
+        if chosen == Err(BEHIND_PLACED) {
+            behind_placed_why(&does, &steps, runs, behind);
+        }
+        let _ = behind;
+        let chosen = chosen?;
         if chosen.is_empty() {
             return Ok(None);
         }
