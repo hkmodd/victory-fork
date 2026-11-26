@@ -4062,6 +4062,50 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    /// A constant view is made in 256-byte steps and at most 64 KiB, the
+    /// most the host takes (a larger size removes the device on NVIDIA).
+    #[test]
+    fn constant_views_are_at_most_64_kib() {
+        assert_eq!(constant_view_size(0), 0);
+        assert_eq!(constant_view_size(1), 256);
+        assert_eq!(constant_view_size(16), 256);
+        assert_eq!(constant_view_size(256), 256);
+        assert_eq!(constant_view_size(65_536), 65_536);
+        assert_eq!(constant_view_size(1_306_368), 65_536);
+        assert_eq!(constant_view_size(65_537), 65_536);
+        assert_eq!(constant_view_size(u32::MAX), 65_536);
+        assert_eq!(constant_view_size(u32::MAX - 100), 65_536);
+    }
+
+    /// Typed buffer views of 32-bit integer formats are made in the float
+    /// format of the same width (the shaders' float loads and stores then
+    /// move the bits); every other format is the title's.
+    #[test]
+    fn typed_buffer_views_of_32_bit_integers_move_bits() {
+        for (title, host) in [
+            (DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_FLOAT),
+            (DXGI_FORMAT_R32_SINT, DXGI_FORMAT_R32_FLOAT),
+            (DXGI_FORMAT_R32G32_UINT, DXGI_FORMAT_R32G32_FLOAT),
+            (DXGI_FORMAT_R32G32B32_SINT, DXGI_FORMAT_R32G32B32_FLOAT),
+            (DXGI_FORMAT_R32G32B32A32_UINT, DXGI_FORMAT_R32G32B32A32_FLOAT),
+        ] {
+            assert_eq!(bit_exact_format(title), host);
+            assert_eq!(
+                crate::resource::element(title.0 as u32),
+                crate::resource::element(host.0 as u32)
+            );
+        }
+        for kept in [
+            DXGI_FORMAT_R32_FLOAT,
+            DXGI_FORMAT_R32_TYPELESS,
+            DXGI_FORMAT_UNKNOWN,
+            DXGI_FORMAT_R16G16_UINT,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+        ] {
+            assert_eq!(bit_exact_format(kept), kept);
+        }
+    }
+
     /// The unsigned twin of a 16-bit float or signed format has its layout,
     /// and only buffer views in such a format are shown as another view.
     #[test]
@@ -4297,50 +4341,6 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
             unsigned, 65_536,
             "patterns unchanged, moved as unsigned integers"
         );
-    }
-
-    /// A constant view is made in 256-byte steps and at most 64 KiB, the
-    /// most the host takes (a larger size removes the device on NVIDIA).
-    #[test]
-    fn constant_views_are_at_most_64_kib() {
-        assert_eq!(constant_view_size(0), 0);
-        assert_eq!(constant_view_size(1), 256);
-        assert_eq!(constant_view_size(16), 256);
-        assert_eq!(constant_view_size(256), 256);
-        assert_eq!(constant_view_size(65_536), 65_536);
-        assert_eq!(constant_view_size(1_306_368), 65_536);
-        assert_eq!(constant_view_size(65_537), 65_536);
-        assert_eq!(constant_view_size(u32::MAX), 65_536);
-        assert_eq!(constant_view_size(u32::MAX - 100), 65_536);
-    }
-
-    /// Typed buffer views of 32-bit integer formats are made in the float
-    /// format of the same width (the shaders' float loads and stores then
-    /// move the bits); every other format is the title's.
-    #[test]
-    fn typed_buffer_views_of_32_bit_integers_move_bits() {
-        for (title, host) in [
-            (DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_FLOAT),
-            (DXGI_FORMAT_R32_SINT, DXGI_FORMAT_R32_FLOAT),
-            (DXGI_FORMAT_R32G32_UINT, DXGI_FORMAT_R32G32_FLOAT),
-            (DXGI_FORMAT_R32G32B32_SINT, DXGI_FORMAT_R32G32B32_FLOAT),
-            (DXGI_FORMAT_R32G32B32A32_UINT, DXGI_FORMAT_R32G32B32A32_FLOAT),
-        ] {
-            assert_eq!(bit_exact_format(title), host);
-            assert_eq!(
-                crate::resource::element(title.0 as u32),
-                crate::resource::element(host.0 as u32)
-            );
-        }
-        for kept in [
-            DXGI_FORMAT_R32_FLOAT,
-            DXGI_FORMAT_R32_TYPELESS,
-            DXGI_FORMAT_UNKNOWN,
-            DXGI_FORMAT_R16G16_UINT,
-            DXGI_FORMAT_R8G8B8A8_UNORM,
-        ] {
-            assert_eq!(bit_exact_format(kept), kept);
-        }
     }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
