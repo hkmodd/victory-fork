@@ -207,10 +207,10 @@ enum Blob {
 
 impl Blob {
     /// The library file in `dir`: a library a save left beside it
-    /// ([`NEXT_FILE`]) takes its place first.
+    /// ([`next_file`]) takes its place first.
     fn of(dir: &std::path::Path) -> Blob {
-        let path = dir.join(LIBRARY_FILE);
-        let next = dir.join(NEXT_FILE);
+        let path = dir.join(library_file());
+        let next = dir.join(next_file());
         if next.exists() && std::fs::rename(&next, &path).is_err() {
             tracing::warn!("the host pipeline library saved last could not take the old one's place");
         }
@@ -433,13 +433,37 @@ fn one_call() -> Option<MutexGuard<'static, ()>> {
         .then(|| CALLING.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-const LIBRARY_FILE: &str = "host-pipelines.bin";
+/// The first part of the library's file names: `host-pipelines-` and the
+/// first 8 bytes of the translation set's key ([`crate::shader_cache::translation`]:
+/// the translator's version and the switches that change translations),
+/// set when the library is opened. A run with other translation switches
+/// keeps a library of its own. One library for all of them went bad: runs
+/// avmps1 and avmps2 (library later kept as `.aside2`, 441 MB) and avmbv4
+/// and avmref5 (463 MB, grown by runs with `VICTORY_NAN_SCRUB=1`,
+/// `VICTORY_WAVE_WIDE_ONLY` and the ray-tracing builder) drew the cell's
+/// wall and faces in blotches, while a run from an empty library (avmps3)
+/// and the next one from what it saved (avmps4, 236 MB) drew them clean.
+/// How the entries of other runs did it is not shown (names are by
+/// content); what is shown is that the library one set of switches builds
+/// for itself draws clean. Without a key (tests): `host-pipelines`.
+static STEM: OnceLock<String> = OnceLock::new();
+fn stem() -> &'static str {
+    STEM.get().map_or("host-pipelines", String::as_str)
+}
+/// The library's file.
+fn library_file() -> String {
+    format!("{}.bin", stem())
+}
 /// A library the driver refused, kept as it was ([`open`]).
-const REJECTED_FILE: &str = "host-pipelines.rejected.bin";
-/// A saved library that could not replace [`LIBRARY_FILE`] while this run
+fn rejected_file() -> String {
+    format!("{}.rejected.bin", stem())
+}
+/// A saved library that could not replace [`library_file`] while this run
 /// had it mapped (a system that refuses to replace a mapped file): the next
 /// start renames it over the library first ([`Blob::of`]).
-const NEXT_FILE: &str = "host-pipelines.next";
+fn next_file() -> String {
+    format!("{}.next", stem())
+}
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 100_000;
@@ -458,6 +482,9 @@ fn library() -> Option<&'static Library> {
                 return None;
             }
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
+            let key: String = crate::shader_cache::translation()[..8].iter().map(|b| format!("{b:02x}")).collect();
+            let _ = STEM.set(format!("host-pipelines-{key}"));
+            tracing::info!(file = %library_file(), "host pipeline library of this translation set");
             let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
             let library = open(&device, blob);
             if library.is_none() {
@@ -498,7 +525,7 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
             }
             Err(e) => {
                 rejected = true;
-                tracing::warn!(error = %e, "host pipeline library rejected; starting an empty one (the rejected file is kept as {REJECTED_FILE})");
+                tracing::warn!(error = %e, "host pipeline library rejected; starting an empty one (the rejected file is kept as {})", rejected_file());
             }
         }
     } else {
@@ -513,7 +540,7 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     // saved over 366 MB of built pipelines, and the next run drew black
     // until they were built again).
     if rejected && let Some(dir) = DIR.get()
-        && let Err(e) = std::fs::rename(dir.join(LIBRARY_FILE), dir.join(REJECTED_FILE)) {
+        && let Err(e) = std::fs::rename(dir.join(library_file()), dir.join(rejected_file())) {
             tracing::warn!(error = %e, "the rejected host pipeline library could not be kept under its other name");
         }
     let library = make(&[]).ok()?;
@@ -619,7 +646,7 @@ pub(crate) fn save(now: bool) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
-    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
+    let tmp = dir.join(library_file()).with_extension("tmp");
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
@@ -655,7 +682,7 @@ pub(crate) fn save(now: bool) {
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
-        let in_place = !dir.join(NEXT_FILE).exists();
+        let in_place = !dir.join(next_file()).exists();
         if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
             REPLACED[1].store(crate::host::now_ms(), Ordering::Relaxed);
             REPLACED[0].fetch_add(1, Ordering::Relaxed);
@@ -708,9 +735,9 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
 /// the mapping goes on reading the old one for as long as a handle on it
 /// is open ([`holds`]; with none, only the pages in memory at that moment
 /// stay: the rest read as zeros). Where a system refuses, the new library
-/// is left beside it as [`NEXT_FILE`] for the next start.
+/// is left beside it as [`next_file`] for the next start.
 fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
+    std::fs::rename(tmp, dir.join(library_file())).or_else(|_| std::fs::rename(tmp, dir.join(next_file())))
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
@@ -847,7 +874,7 @@ mod tests {
     #[test]
     fn the_library_file_is_mapped_and_replaced() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(LIBRARY_FILE);
+        let path = dir.path().join(library_file());
         assert!(matches!(Blob::of(dir.path()), Blob::None), "no file yet");
         std::fs::write(&path, b"").unwrap();
         assert!(matches!(Blob::of(dir.path()), Blob::None), "an empty file");
@@ -871,7 +898,7 @@ mod tests {
         drop(blob);
         // The next start reads the new one, wherever the save left it.
         assert_eq!(Blob::of(dir.path()).bytes(), &new[..]);
-        assert!(!dir.path().join(NEXT_FILE).exists());
+        assert!(!dir.path().join(next_file()).exists());
     }
 
     /// The bytes at `at` of the pattern the test below writes.
@@ -923,7 +950,7 @@ mod tests {
     fn a_replaced_library_file_still_reads_from_the_disk() {
         const LEN: usize = 8 << 20;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(LIBRARY_FILE);
+        let path = dir.path().join(library_file());
         if !write_uncached(&path, LEN) {
             return; // no uncached writes here: nothing to show
         }
