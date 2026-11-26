@@ -544,37 +544,37 @@ pub fn emit(
         };
         // The program in two other forms: without its early-outs, and
         // without any branch that only skips code no lane is left for.
+        // `VICTORY_WAVE_WHY`: why a form is missing (no such branch, or the
+        // stage that refused the changed program, with its reason).
+        let form_why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
         let form = |label: &str, p: Option<ir::Program>| {
-            let Some(p) = p else {
-                if why {
-                    eprintln!("WAVE64-FORM {label}: ir returned None");
+            let say = |what: &dyn std::fmt::Display| {
+                if form_why {
+                    eprintln!("WAVE64-FORM {label}: {what}");
                 }
+            };
+            let Some(p) = p else {
+                say(&"not made (no such branch in the program, or its blocks could not be made reducible)");
                 return None;
             };
             let st = match structure::structure(&p) {
                 Ok(st) => st,
                 Err(e) => {
-                    if why {
-                        eprintln!("WAVE64-FORM {label}: structure failed: {e}");
-                    }
+                    say(&format_args!("structure: {e}"));
                     return None;
                 }
             };
             let io = match io::raise(&p, native) {
                 Ok(io) => io,
                 Err(e) => {
-                    if why {
-                        eprintln!("WAVE64-FORM {label}: io::raise failed: {e}");
-                    }
+                    say(&format_args!("io: {e}"));
                     return None;
                 }
             };
             let res = match resource::track(&p, &native.layout, native.stage, Some(&st)) {
                 Ok(res) => res,
                 Err(e) => {
-                    if why {
-                        eprintln!("WAVE64-FORM {label}: resource::track failed: {e}");
-                    }
+                    say(&format_args!("resources: {e}"));
                     return None;
                 }
             };
