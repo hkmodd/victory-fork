@@ -8827,6 +8827,40 @@ fn present_thread() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_PRESENT_THREAD").as_deref() == Ok("1"))
 }
 
+/// Whether the swap chain has a direct queue of its own
+/// (`VICTORY_PRESENT_QUEUE=1`, off by default). The driver sleeps inside
+/// Present holding a lock that ExecuteCommandLists on the same queue takes
+/// (avmpf6: 16.6% of the lane's samples waited on it in D3D12Core under
+/// Host::submit, the same share avmpf5 slept under Present). With a queue of
+/// its own the copy into the back buffer and the Present go there: that
+/// queue waits for the title's queue to reach the frame, the title's queue
+/// waits for the copy before it goes on (the title draws into the frame's
+/// texture again), and the sleep holds the presenting queue's lock.
+fn present_queue() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PRESENT_QUEUE").as_deref() == Ok("1"))
+}
+
+/// The swap chain's own queue ([`present_queue`]), its fence and the value
+/// last signalled on it.
+struct OwnQueue {
+    queue: ID3D12CommandQueue,
+    fence: ID3D12Fence,
+    value: u64,
+}
+
+impl OwnQueue {
+    /// Waits, on this thread, until the queue has run up to `value`.
+    fn wait(&self, value: u64) {
+        // SAFETY: a live fence; a null event blocks until the value is reached.
+        unsafe {
+            if self.fence.GetCompletedValue() < value {
+                let _ = self.fence.SetEventOnCompletion(value, HANDLE::default());
+            }
+        }
+    }
+}
+
 /// The swap chain, handed to the presenting thread.
 struct Chain(IDXGISwapChain3);
 
@@ -8891,6 +8925,8 @@ impl Shower {
 struct Presenter {
     /// With [`present_thread`]: the thread that calls Present.
     shower: Option<Shower>,
+    /// With [`present_queue`]: the queue the swap chain presents on.
+    own: Option<OwnQueue>,
     swap_chain: IDXGISwapChain3,
     width: u32,
     height: u32,
@@ -9323,6 +9359,9 @@ impl Host {
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
+            if let Some(own) = &p.own {
+                own.wait(own.value);
+            }
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
@@ -9361,7 +9400,11 @@ impl Host {
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
             let slot = if late_free_present() && !read_now {
-                let finished = FINISHED.load(Ordering::Acquire);
+                // On the swap chain's own queue a list's flight is its value there.
+                let finished = match &p.own {
+                    Some(own) => own.fence.GetCompletedValue(),
+                    None => FINISHED.load(Ordering::Acquire),
+                };
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
                     let list = self.new_list().ok()?;
                     list.close();
@@ -9407,7 +9450,29 @@ impl Host {
                 ),
             ]);
             copy.close();
-            let flown = match slot {
+            #[cfg(feature = "diagnostics")]
+            let wait_now = slot.is_none() || watched.is_some();
+            #[cfg(not(feature = "diagnostics"))]
+            let wait_now = slot.is_none();
+            let flown = if let Some(own) = p.own.as_mut() {
+                // Behind every submission sent so far on the title's queue,
+                // and the title's queue behind the copy.
+                let after = *self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+                own.value += 1;
+                let lists = [copy.list.cast::<ID3D12CommandList>().ok()];
+                let _ = own.queue.Wait(&self.fence, after);
+                own.queue.ExecuteCommandLists(&lists);
+                let _ = own.queue.Signal(&own.fence, own.value);
+                let _ = self.queue.Wait(&own.fence, own.value);
+                if let Some(i) = slot {
+                    p.ahead[i].1 = own.value;
+                }
+                if wait_now {
+                    own.wait(own.value);
+                }
+                0
+            } else {
+                match slot {
                 Some(i) => {
                     let flown = self.execute_own(copy);
                     p.ahead[i].1 = flown;
@@ -9416,6 +9481,7 @@ impl Host {
                 None => {
                     self.execute(&[copy]);
                     0
+                }
                 }
             };
             #[cfg(feature = "diagnostics")]
@@ -9481,9 +9547,20 @@ impl Host {
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
+            let own = if present_queue() {
+                let queue: ID3D12CommandQueue = self.device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })?;
+                let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+                Some(OwnQueue { queue, fence, value: 0 })
+            } else {
+                None
+            };
             let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
+                .CreateSwapChainForHwnd(own.as_ref().map_or(&self.queue, |o| &o.queue), hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
+            tracing::info!(on = own.is_some(), "the swap chain presented on a queue of its own");
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, buffers = buffers(), "presenting to a window");
@@ -9492,6 +9569,7 @@ impl Host {
             tracing::info!(on = shower.is_some(), "the swap chain presented by a thread of its own");
             Ok(Presenter {
                 shower,
+                own,
                 swap_chain,
                 width,
                 height,
