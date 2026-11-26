@@ -2232,6 +2232,10 @@ struct Deferred {
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// The list's own buffer on the card for constant buffers copied at
+    /// their place ([`HostList::constants_at_place`]): the buffer, the bytes
+    /// handed out of it, whether shaders may read it now.
+    constants_here: Option<(ID3D12Resource, u64, bool)>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,

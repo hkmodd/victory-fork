@@ -282,6 +282,102 @@ impl HostList {
         Some(between)
     }
 
+    /// For a table's constant buffer view of `size` bytes at `address`, where
+    /// a copy at its place earlier in this list wrote some of them: a buffer
+    /// on the card and its address that hold them at this place, copied out
+    /// of that copy's host copy. The view reads that instead of a fill done
+    /// at submission, which would read title memory before the copy, and
+    /// whose bytes, when flights write the copy's source, stopped every step
+    /// of the submission on the card (card_steps' "a copy at its place in a
+    /// list writes what it reads", 0.5-0.7 waits for the flights a frame,
+    /// 31-41 ms, runs avmtl to avmbp1). `None`: no such copy (or
+    /// `VICTORY_CONSTANTS_AT_PLACE=0`), the fill as before.
+    pub(crate) fn constants_at_place(&self, address: u64, size: u32) -> Option<(ID3D12Resource, u64)> {
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| on() && std::env::var_os("VICTORY_CONSTANTS_AT_PLACE").is_none_or(|v| v != "0")) {
+            return None;
+        }
+        // Diagnostics: calls, a copy found, out of its host copy, no host,
+        // too big, refreshed and handed out.
+        static PATHS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+        let path = |i: usize| {
+            PATHS[i].fetch_add(1, Ordering::Relaxed);
+            let calls = PATHS[0].load(Ordering::Relaxed);
+            if i == 0 && calls.is_power_of_two() || i > 0 && PATHS[i].load(Ordering::Relaxed).is_power_of_two() {
+                let n: Vec<u64> = PATHS.iter().map(|p| p.load(Ordering::Relaxed)).collect();
+                tracing::info!(
+                    "constant buffers at their place (VICTORY_CONSTANTS_AT_PLACE), since the start: {} asked, {} behind a copy \
+                     at its place, {} out of its host copy, {} no host, {} too big, {} refreshed, {} copied",
+                    n[0], n[1], n[2], n[3], n[4], n[5], n[6]
+                );
+            }
+        };
+        path(0);
+        let (from, to) = (address as usize, address as usize + size as usize);
+        let shadow = self.deferred().copies.iter().rev().find_map(|s| match s {
+            Step::Placed(p) if p.dst < to && from < p.dst + p.len => Some(p.shadow.clone()),
+            _ => None,
+        })?;
+        path(1);
+        let (start, len) = shadow.span();
+        // (The title's lists are all direct ones: copies and shaders both.)
+        if address < start || address + u64::from(size) > start + len {
+            path(2);
+            return None;
+        }
+        let Some(host) = host() else {
+            path(3);
+            return None;
+        };
+        const CHUNK: u64 = 1 << 16;
+        let rounded = u64::from(size).next_multiple_of(256);
+        if rounded > CHUNK {
+            path(4);
+            return None;
+        }
+        path(5);
+        // What the title's CPU wrote around the copy's bytes goes first.
+        shadow.refresh(self, address, u64::from(size));
+        let readable = D3D12_RESOURCE_STATE_COPY_SOURCE
+            | D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER
+            | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+            | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        let (buffer, at, was_readable) = {
+            let mut deferred = self.deferred();
+            let fresh = deferred.constants_here.as_ref().is_none_or(|h| h.1 + rounded > CHUNK);
+            if fresh {
+                let buffer = host.uav_buffer(CHUNK)?;
+                name(&buffer, || "constant buffers copied at their place".into());
+                // Kept by the list as `keep` does, under the lock held here
+                // (`keep` itself would take it again and hang the thread).
+                if let Ok(object) = windows::core::Interface::cast::<windows::core::IUnknown>(&buffer) {
+                    deferred.kept.push(object);
+                }
+                deferred.constants_here = Some((buffer, 0, false));
+            }
+            let here = deferred.constants_here.as_mut()?;
+            let at = here.1;
+            here.1 += rounded;
+            let was = here.2;
+            here.2 = true;
+            (here.0.clone(), at, was)
+        };
+        // SAFETY: an open list; live buffers (the list holds both), ranges
+        // inside them.
+        unsafe {
+            if was_readable {
+                self.list.ResourceBarrier(&[transition(&buffer, readable, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            }
+            wait_for_all(host, &self.list);
+            self.list.CopyBufferRegion(&buffer, at, &shadow.buffer, shadow.offset(address), u64::from(size));
+            self.list.ResourceBarrier(&[transition(&buffer, D3D12_RESOURCE_STATE_COPY_DEST, readable)]);
+        }
+        path(6);
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() } + at;
+        Some((buffer, gpu))
+    }
+
     /// A buffer on the card for this recording alone.
     fn between(&self, host: &Host, len: u64) -> Option<ID3D12Resource> {
         let buffer = host.uav_buffer(len.next_multiple_of(1 << 16))?;
