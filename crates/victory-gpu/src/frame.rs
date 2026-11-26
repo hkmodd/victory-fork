@@ -153,6 +153,22 @@ fn next_tick(kind: u32) -> (u64, Duration) {
     )
 }
 
+/// The next tick of the clock after now and after `shown`, and how long until
+/// it, for showing a frame on it (the host's `VICTORY_PRESENT_TICK`). `None`
+/// with no clock yet or with no wait at all (interval zero).
+pub(crate) fn show_tick(shown: u64) -> Option<(u64, Duration)> {
+    let clock = clock();
+    let c = clock.as_ref()?;
+    if c.interval.is_zero() {
+        return None;
+    }
+    let elapsed = c.start.elapsed().as_nanos();
+    let interval = c.interval.as_nanos().max(1);
+    let tick = (c.first + (elapsed / interval + 1) as u64).max(shown + 1);
+    let at = u128::from(tick - c.first) * interval;
+    Some((tick, Duration::from_nanos(at.saturating_sub(elapsed) as u64)))
+}
+
 /// Device method: blocks until the next tick (or the time-out); an origin
 /// wait then hands out the new frame's token. Other events keep the token
 /// the title passes. Ticks are absolute (start plus whole intervals), so

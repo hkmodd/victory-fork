@@ -10348,8 +10348,23 @@ impl OwnQueue {
     }
 }
 
-/// The swap chain, handed to the presenting thread.
-struct Chain(IDXGISwapChain3);
+/// The swap chain, handed to the presenting thread, and the fence value the
+/// frame's copy into the back buffer signals (with [`present_queue`]).
+struct Chain(IDXGISwapChain3, Option<(ID3D12Fence, u64)>);
+
+/// Whether a frame is shown on a tick of the title's frame clock
+/// (`VICTORY_PRESENT_TICK=1`, off): the presenting thread waits for the
+/// frame's copy, then for the next tick of [`crate::frame`] it has not shown
+/// a frame on, then presents. On the console the flip comes at the vblank of
+/// the title's interval (33,333 us); here Present(0) showed each frame when
+/// the card finished it, and the boot logo video stepped 50 ms, 17 ms, 33 ms
+/// on the screen (screen recording of run logo6 at 60 a second, 21-29 s:
+/// 64 steps of 33 ms, 32 of 17, 24 of 50) though the title's frames were
+/// 33 ms apart. Needs [`present_thread`] and [`present_queue`].
+fn present_tick() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PRESENT_TICK").as_deref() == Ok("1"))
+}
 
 // SAFETY: DXGI objects are free-threaded; the lane calls nothing on the swap
 // chain while the thread presents it (it waits for [`Shower::wait`] first).
@@ -10370,7 +10385,45 @@ impl Shower {
         std::thread::Builder::new()
             .name("victory-present".into())
             .spawn(move || {
-                for Chain(chain) in presents {
+                let tick = present_tick();
+                tracing::info!(on = tick, "frames shown on the ticks of the title's frame clock (VICTORY_PRESENT_TICK)");
+                let mut shown = 0u64;
+                #[cfg(feature = "diagnostics")]
+                let mut gaps = ([0u32; 5], None::<std::time::Instant>);
+                for Chain(chain, copied) in presents {
+                    if tick {
+                        if let Some((fence, value)) = &copied {
+                            // SAFETY: a live fence; a null event blocks until the value is reached.
+                            unsafe {
+                                if fence.GetCompletedValue() < *value {
+                                    let _ = fence.SetEventOnCompletion(*value, HANDLE::default());
+                                }
+                            }
+                        }
+                        if let Some((at, wait)) = crate::frame::show_tick(shown) {
+                            if !wait.is_zero() {
+                                std::thread::sleep(wait);
+                            }
+                            shown = at;
+                        }
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        // Every 64 presents: how far apart they were called
+                        // (<25, 25-42, 42-58, 58-75, 75 ms or more).
+                        let now = std::time::Instant::now();
+                        if let Some(last) = gaps.1.replace(now) {
+                            let ms = now.duration_since(last).as_secs_f64() * 1000.0;
+                            let i = [25.0, 42.0, 58.0, 75.0].iter().take_while(|&&b| ms >= b).count();
+                            gaps.0[i] += 1;
+                            if gaps.0.iter().sum::<u32>() == 64 {
+                                let [a, b, c, d, e] = std::mem::take(&mut gaps.0);
+                                tracing::info!(
+                                    "presents called, 64 apart by: under 25 ms {a}, 25-42 {b}, 42-58 {c}, 58-75 {d}, 75 or more {e}"
+                                );
+                            }
+                        }
+                    }
                     #[cfg(feature = "diagnostics")]
                     let before = host().map(Host::present_mark);
                     // SAFETY: our swap chain; nothing else calls it until `done`.
@@ -10403,8 +10456,8 @@ impl Shower {
     }
 
     /// Hands `chain` over to be presented; false if the thread is gone.
-    fn send(&mut self, chain: &IDXGISwapChain3) -> bool {
-        self.pending = self.to.send(Chain(chain.clone())).is_ok();
+    fn send(&mut self, chain: &IDXGISwapChain3, copied: Option<(ID3D12Fence, u64)>) -> bool {
+        self.pending = self.to.send(Chain(chain.clone(), copied)).is_ok();
         self.pending
     }
 }
@@ -11143,11 +11196,13 @@ impl Host {
             let wait_now = slot.is_none() || watched.is_some();
             #[cfg(not(feature = "diagnostics"))]
             let wait_now = slot.is_none();
+            let mut copied: Option<(ID3D12Fence, u64)> = None;
             let flown = if let Some(own) = p.own.as_mut() {
                 // Behind every submission sent so far on the title's queue,
                 // and the title's queue behind the copy.
                 let after = *self.submitted.lock().unwrap_or_else(|e| e.into_inner());
                 own.value += 1;
+                copied = Some((own.fence.clone(), own.value));
                 let lists = [copy.list.cast::<ID3D12CommandList>().ok()];
                 let _ = own.queue.Wait(&self.fence, after);
                 own.queue.ExecuteCommandLists(&lists);
@@ -11187,7 +11242,7 @@ impl Host {
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
             let handed = match p.shower.as_mut() {
-                Some(shower) => shower.send(&p.swap_chain),
+                Some(shower) => shower.send(&p.swap_chain, copied),
                 None => false,
             };
             // A Present handed to its own thread is counted as shown: that
