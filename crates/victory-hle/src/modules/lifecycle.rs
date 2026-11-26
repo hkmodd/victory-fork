@@ -238,6 +238,26 @@ fn hook(hwnd: HWND) {
         wm::SetPropW(hwnd, TITLE_PROC, title as *mut c_void);
         wm::SetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC, window_proc as *const () as isize);
     }
+    note_shown(hwnd);
+}
+
+/// The title's window: the first of its top-level windows (no owner) seen
+/// visible. A close sent to it ends the title; one sent to another window
+/// of the title's (a helper it shows too) closes only that window.
+static TITLE_WINDOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Takes `hwnd` as [`TITLE_WINDOW`] if there is none yet and it is a
+/// visible top-level window.
+fn note_shown(hwnd: HWND) {
+    use std::sync::atomic::Ordering;
+    if TITLE_WINDOW.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    // SAFETY: both queries borrow a window of this thread's.
+    let top = unsafe { wm::IsWindowVisible(hwnd) != 0 && wm::GetAncestor(hwnd, wm::GA_ROOTOWNER) == hwnd };
+    if top {
+        let _ = TITLE_WINDOW.compare_exchange(0, hwnd as usize, Ordering::Relaxed, Ordering::Relaxed);
+    }
 }
 
 extern "system" fn window_proc(
@@ -253,17 +273,19 @@ extern "system" fn window_proc(
         end_title("window closed", Box::new(|| {}));
         return 0;
     }
-    // Automation and other applications can send WM_CLOSE directly. Owned
-    // dialogs and hidden helper windows still handle their own close messages.
-    // SAFETY: both queries borrow the window being dispatched.
-    if message == wm::WM_CLOSE
-        && unsafe {
-            wm::IsWindowVisible(hwnd) != 0 && wm::GetAncestor(hwnd, wm::GA_ROOTOWNER) == hwnd
-        }
-    {
+    // Automation and other applications can send WM_CLOSE directly. Only the
+    // title's window ends the title; owned dialogs, hidden helper windows and
+    // the title's other top-level windows handle their own close messages.
+    note_shown(hwnd);
+    let title_window = TITLE_WINDOW.load(std::sync::atomic::Ordering::Relaxed) == hwnd as usize;
+    if message == wm::WM_CLOSE && title_window {
         note_close("WM_CLOSE to the title's window");
         end_title("window closed", Box::new(|| {}));
         return 0;
+    }
+    if message == wm::WM_NCDESTROY && title_window {
+        // a window the title makes again is its window then
+        TITLE_WINDOW.store(0, std::sync::atomic::Ordering::Relaxed);
     }
     // Alt or F10 puts a window into menu mode: the system runs a modal menu
     // loop on the thread that owns the window, which is the title's. The
@@ -652,11 +674,17 @@ mod tests {
         assert!(!title.is_null());
         let dialog = create(title);
         assert!(!dialog.is_null());
-        // SAFETY: both windows belong to this test thread. Closing the dialog
-        // goes to its original procedure and leaves the title window alive.
+        // a second visible top-level window of the title's, a helper
+        let helper = create(null);
+        assert!(!helper.is_null());
+        // SAFETY: the windows belong to this test thread. Closing the dialog
+        // or the helper goes to its original procedure and leaves the title
+        // window alive.
         unsafe {
             wm::SendMessageW(dialog, wm::WM_CLOSE, 0, 0);
             assert_eq!(wm::IsWindow(dialog), 0);
+            wm::SendMessageW(helper, wm::WM_CLOSE, 0, 0);
+            assert_eq!(wm::IsWindow(helper), 0);
             assert_ne!(wm::IsWindow(title), 0);
         }
         let mut registration = 0;
