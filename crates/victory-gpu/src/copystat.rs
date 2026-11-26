@@ -57,6 +57,13 @@ pub(crate) enum C {
     DynamicFreeAtRefuse,
     DynamicLenAtRefuse,
     DynamicTooLong,
+    /// Of every table asked for: its slots; tables (and slots) made afresh
+    /// for a constant buffer in them; slots of tables another list asked
+    /// for with the same key in the same frame.
+    DynamicLenAsked,
+    DynamicCbvTables,
+    DynamicCbvLen,
+    DynamicDupLen,
     /// Marker texts for device-removed data (`HostList::note`).
     NoteNs,
     /// Ranges given to shaders (steps), their snapshots, and the bytes
@@ -947,6 +954,32 @@ fn now_us() -> u64 {
 /// ([`now_us`]), and whether a list call and a submission followed that
 /// present yet.
 static PRESENTED_AT: AtomicU64 = AtomicU64::new(0);
+static FRAME_NO: AtomicU64 = AtomicU64::new(0);
+
+/// Counts the `n` slots of a table asked for with `key` by list `list`
+/// towards [`C::DynamicDupLen`] if another list asked for the same key in
+/// this frame.
+pub(crate) fn dynamic_key(key: (u64, u32, u64), list: u64, n: u32) {
+    type Seen = (u64, std::collections::HashMap<(u64, u32, u64), u64>);
+    static SEEN: std::sync::Mutex<Option<Seen>> = std::sync::Mutex::new(None);
+    let frame = FRAME_NO.load(Relaxed);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let (at, keys) = seen.get_or_insert_with(|| (frame, Default::default()));
+    if *at != frame {
+        *at = frame;
+        keys.clear();
+    }
+    match keys.entry(key) {
+        std::collections::hash_map::Entry::Occupied(e) => {
+            if *e.get() != list {
+                add(C::DynamicDupLen, u64::from(n));
+            }
+        }
+        std::collections::hash_map::Entry::Vacant(e) => {
+            e.insert(list);
+        }
+    }
+}
 static SUBMITTED_AT: AtomicU64 = AtomicU64::new(0);
 static RECORDED_SINCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static SUBMITTED_SINCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -1118,6 +1151,7 @@ pub(crate) fn present_begins() {
 /// A frame was presented.
 pub(crate) fn presented() {
     add(C::Frames, 1);
+    FRAME_NO.fetch_add(1, Relaxed);
     PRESENTED_AT.store(now_us(), Relaxed);
     RECORDED_SINCE.store(false, Relaxed);
     SUBMITTED_SINCE.store(false, Relaxed);
@@ -1185,7 +1219,7 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
          threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \
-         refused (free then {:.0}, length {:.1}, by too_long {:.0}), {:.1} ms searching; notes {:.1} ms; shader-written ranges: {:.0} steps in \
+         refused (free then {:.0}, length {:.1}, by too_long {:.0}), {:.0} slots asked ({:.0} tables {:.0} slots with constants, {:.0} slots asked by another list this frame), {:.1} ms searching; notes {:.1} ms; shader-written ranges: {:.0} steps in \
          {:.1} submissions, snapshots {:.1} ms, {:.1} MB compared back; sparse reads {:.1} ms; \
          guards {:.1} ms; {:.1} MB copied whole (memory not watched); {:.1} frame waits \
          sleeping {:.1} ms (all threads); ranges of shaders that cannot store to buffers: \
@@ -1198,6 +1232,10 @@ pub(crate) fn log(frames: f64) {
         c[C::DynamicFreeAtRefuse as usize] / c[C::DynamicRefused as usize].max(1.0),
         c[C::DynamicLenAtRefuse as usize] / c[C::DynamicRefused as usize].max(1.0),
         c[C::DynamicTooLong as usize],
+        c[C::DynamicLenAsked as usize],
+        c[C::DynamicCbvTables as usize],
+        c[C::DynamicCbvLen as usize],
+        c[C::DynamicDupLen as usize],
         c[C::DynamicNs as usize] / 1e6,
         c[C::NoteNs as usize] / 1e6,
         c[C::GpuWrites as usize],

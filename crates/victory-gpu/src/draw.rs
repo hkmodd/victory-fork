@@ -3298,6 +3298,16 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::DynamicLenAsked, u64::from(n));
+                if entries().any(|u| u.kind == ResourceType::Cbv) {
+                    add(C::DynamicCbvTables, 1);
+                    add(C::DynamicCbvLen, u64::from(n));
+                }
+                crate::copystat::dynamic_key(key, std::ptr::from_ref(list) as u64, n);
+            }
             let Some(first) = host.dynamic(n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
