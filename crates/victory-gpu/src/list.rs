@@ -203,6 +203,18 @@ impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
     }
+
+    /// It has run on the card: its dynamic descriptor slots are given back
+    /// now, while the list itself and its upload memory wait out the bury
+    /// lag (`crate::host::bury_lag`, 64 submissions). That lag is for memory
+    /// and objects the card may still name; the card read the slots when the
+    /// list ran. Held through the lag, the slots of about two frames were
+    /// taken at once: a host heap of 1,000,000 views (NVIDIA) leaves 2^18 of
+    /// them, which ran out from the world on (run avm5: free 15,000 to 27,000
+    /// of 262,144, 2,700 tables refused a frame and the draws of them lost).
+    pub(crate) fn tables_done(&mut self) {
+        self._state.tables_done();
+    }
 }
 
 /// A host list that has run and waits to be used again, and the bytes of
