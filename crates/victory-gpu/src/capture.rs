@@ -172,13 +172,23 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
 pub(crate) fn wanted(n: u64) -> bool {
     // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too
     // (small pictures of menus, loading screens and title cards).
-    let before_world = world_on() && n.is_multiple_of(16) && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
+    // `VICTORY_CAPTURE_BOOT_EVERY`: another step, 0 none (a saved picture
+    // holds its frame ~235 ms: the boot logo video stutters at that beat).
+    static BOOT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let boot = *BOOT.get_or_init(|| {
+        std::env::var("VICTORY_CAPTURE_BOOT_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(16)
+    });
+    let before_world = world_on()
+        && boot != 0
+        && n.is_multiple_of(boot)
+        && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
     // In the world: every 8th frame's picture, a timeline of the opening
     // cutscene (its shots do not fall on the same frame numbers from run to
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(world_every());
-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+    let quiet_boot = world_on() && boot == 0 && first == u64::MAX;
+    folder().is_some() && ((n.is_power_of_two() && !quiet_boot) || listed(n) || before_world || in_world)
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
