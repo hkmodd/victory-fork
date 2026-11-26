@@ -1589,6 +1589,40 @@ pub(crate) fn staged(resource: This, ask: bool) -> Option<(u64, bool)> {
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
 /// unmapped until their pages arrive).
+/// For each address: whether its kernel page can be read (as [`committed`]
+/// for one byte), asking the kernel about up to 256 pages at once.
+pub(crate) fn first_pages_there(at: &[usize]) -> Vec<bool> {
+    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if by_query() {
+        return at.iter().map(|&a| committed_by_query(a as *const u8, 1)).collect();
+    }
+    const KERNEL_PAGE: usize = 4096;
+    let mut there = Vec::with_capacity(at.len());
+    // SAFETY: plain data.
+    let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
+    for part in at.chunks(info.len()) {
+        for (entry, &a) in info.iter_mut().zip(part) {
+            entry.VirtualAddress = (a / KERNEL_PAGE * KERNEL_PAGE) as *mut _;
+        }
+        // SAFETY: `part.len()` entries of the size given; our own process.
+        let asked = unsafe {
+            K32QueryWorkingSetEx(
+                GetCurrentProcess(),
+                info.as_mut_ptr().cast(),
+                (part.len() * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+            )
+        } != 0;
+        for (entry, &a) in info.iter().zip(part) {
+            // SAFETY: plain data the query filled in.
+            let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
+            let mut byte = [0u8];
+            there.push(valid || crate::host::read_into((a / KERNEL_PAGE * KERNEL_PAGE) as *const u8, &mut byte));
+        }
+    }
+    there
+}
+
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     if by_query() {
         return committed_by_query(at, len);

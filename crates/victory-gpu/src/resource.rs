@@ -2124,6 +2124,91 @@ pub(crate) fn let_go_idle() {
             crate::host::retire(host);
         }
     }
+    // Host copies of placed textures whose title memory is not mapped any
+    // more (its first page: mapped first, unmapped last), idle for 2 s and
+    // held by their title texture alone: under the card's line the rule
+    // above keeps them 10 minutes, and on this driver each byte of the card
+    // counts as private memory too (2.2-2.6 GB of them in run avmcf1). A
+    // later use fills a new copy from title memory, as after any let go.
+    // `VICTORY_DEAD_PLACED=1` (off by default until measured).
+    static DEAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DEAD.get_or_init(|| std::env::var_os("VICTORY_DEAD_PLACED").is_some_and(|v| v == "1")) {
+        const DEAD_IDLE_MS: u64 = 2000;
+        const DEAD_LOOK: usize = 4096;
+        static DEAD_FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static DEAD_GONE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+        let mut asked: Vec<(usize, usize)> = Vec::with_capacity(DEAD_LOOK);
+        let mut next = 0;
+        for &at in all.range(DEAD_FROM.load(Relaxed)..) {
+            if asked.len() == DEAD_LOOK {
+                next = at;
+                break;
+            }
+            // SAFETY: as above.
+            let r = unsafe { &*(at as *const Resource) };
+            let used = r.host.used.load(Relaxed);
+            if !r.host.placed.load(Relaxed)
+                || used == 0
+                || !fills(&r.desc)
+                || !crate::host::long_ago(used, DEAD_IDLE_MS, IDLE_FRAMES)
+                || crate::texture::host_wrote(at)
+            {
+                continue;
+            }
+            asked.push((at, r.data() as usize));
+        }
+        DEAD_FROM.store(next, Relaxed);
+        let addresses: Vec<usize> = asked.iter().map(|&(_, a)| a).collect();
+        let there = crate::texture::first_pages_there(&addresses);
+        let (mut dead_went, mut dead_bytes) = (0u64, 0u64);
+        for (&(at, _), there) in asked.iter().zip(there) {
+            if there {
+                continue;
+            }
+            // SAFETY: as above.
+            let r = unsafe { &*(at as *const Resource) };
+            let gone = {
+                let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+                let idle = made.as_ref().is_some_and(|(host, _)| {
+                    crate::host::long_ago(r.host.used.load(Relaxed), DEAD_IDLE_MS, IDLE_FRAMES)
+                        && std::sync::Arc::strong_count(host) == 1
+                        && crate::host::references(&host.texture) == 1
+                });
+                if idle {
+                    crate::texture::unstage(at as This);
+                    r.host.wanted.store(u32::MAX, Relaxed);
+                    made.take()
+                } else {
+                    None
+                }
+            };
+            if let Some((host, _)) = gone {
+                r.host.gone.store(true, Relaxed);
+                KINDS[2].fetch_add(1, Relaxed);
+                KINDS[3].fetch_add(host.bytes, Relaxed);
+                dead_went += 1;
+                dead_bytes += host.bytes;
+                crate::host::retire(host);
+            }
+        }
+        let looks = DEAD_GONE[0].fetch_add(1, Relaxed) + 1;
+        DEAD_GONE[1].fetch_add(dead_went, Relaxed);
+        DEAD_GONE[2].fetch_add(dead_bytes, Relaxed);
+        DEAD_GONE[3].fetch_add(asked.len() as u64, Relaxed);
+        went += dead_went;
+        bytes += dead_bytes;
+        if looks.is_multiple_of(30) {
+            tracing::info!(
+                "host copies of placed textures whose title memory is not mapped any more let go: {} ({:.0} MB) \
+                 since the start, {} asked about in {} looks; this look {} us in all",
+                DEAD_GONE[1].load(Relaxed),
+                DEAD_GONE[2].load(Relaxed) as f64 / 1048576.0,
+                DEAD_GONE[3].load(Relaxed),
+                looks,
+                began.elapsed().as_micros()
+            );
+        }
+    }
     SWEPT_US[0].fetch_add(1, Relaxed);
     SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     SWEPT_US[2].fetch_max(began.elapsed().as_micros() as u64, Relaxed);
