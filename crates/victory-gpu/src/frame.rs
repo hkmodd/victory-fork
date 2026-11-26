@@ -153,20 +153,31 @@ fn next_tick(kind: u32) -> (u64, Duration) {
     )
 }
 
-/// The next tick of the clock after now and after `shown`, and how long until
-/// it, for showing a frame on it (the host's `VICTORY_PRESENT_TICK`). `None`
-/// with no clock yet or with no wait at all (interval zero).
+/// The tick to show a frame on after the one shown last (`shown`), and how
+/// long until it (the host's `VICTORY_PRESENT_TICK`). A frame on time waits
+/// for the tick after `shown`; a frame that missed it is shown at once, on
+/// the tick now running: waiting on for the next one made the world's
+/// ~55 ms frames 33, 67, 33, 67 ms on the screen (run avmtk1). `None` with
+/// no clock yet or with no wait at all (interval zero).
 pub(crate) fn show_tick(shown: u64) -> Option<(u64, Duration)> {
     let clock = clock();
     let c = clock.as_ref()?;
     if c.interval.is_zero() {
         return None;
     }
-    let elapsed = c.start.elapsed().as_nanos();
-    let interval = c.interval.as_nanos().max(1);
-    let tick = (c.first + (elapsed / interval + 1) as u64).max(shown + 1);
-    let at = u128::from(tick - c.first) * interval;
-    Some((tick, Duration::from_nanos(at.saturating_sub(elapsed) as u64)))
+    let (tick, wait) = pick_tick(shown, c.first, c.start.elapsed().as_nanos(), c.interval.as_nanos().max(1));
+    Some((tick, Duration::from_nanos(wait as u64)))
+}
+
+/// [`show_tick`] on numbers: the clock's tick at its start (`first`), the
+/// nanoseconds since and the interval.
+fn pick_tick(shown: u64, first: u64, elapsed: u128, interval: u128) -> (u64, u128) {
+    let now = first + (elapsed / interval) as u64;
+    if shown < now {
+        return (now, 0);
+    }
+    let tick = shown + 1;
+    (tick, (u128::from(tick - first) * interval).saturating_sub(elapsed))
 }
 
 /// Device method: blocks until the next tick (or the time-out); an origin
@@ -338,6 +349,17 @@ pub(crate) extern "system" fn statistics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frames_on_time_wait_for_their_tick_and_late_ones_show_at_once() {
+        // Ticks of 33 ms from tick 10. Shown on tick 12, the next frame done
+        // at 80 ms (inside tick 12) waits for tick 13, at 99 ms.
+        assert_eq!(pick_tick(12, 10, 80, 33), (13, 19));
+        // Done at 101 ms (tick 13 running): it missed tick 13, shown at once on it.
+        assert_eq!(pick_tick(12, 10, 101, 33), (13, 0));
+        // Far behind: at once, on the tick running.
+        assert_eq!(pick_tick(12, 10, 200, 33), (16, 0));
+    }
 
     #[test]
     fn the_switch_reads_milliseconds() {
