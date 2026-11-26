@@ -4,8 +4,8 @@
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -79,7 +79,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         start_worker,
         |n, ms, there| {
             if ms >= SLOW_MS {
-                let _ = writeln!(lock(&slow_out), "\n{} {ms:.0}", keys[n]);
+                writeln!(lock(&slow_out), "\n{} {ms:.0}", keys[n]).context("writing slow-pipelines.txt")?;
             }
             let mut state = lock(&state);
             state.0.push(ms);
@@ -89,12 +89,13 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                 println!("{count} of {}, {:.0} s", all.len(), began.elapsed().as_secs_f64());
             }
             drop(state);
-            let _ = writeln!(lock(&done_out), "{fingerprint} {}", keys[n]);
+            writeln!(lock(&done_out), "{fingerprint} {}", keys[n]).context("writing warm-done.txt")
         },
         |n, why| {
             println!("pipeline {n} {}: {why}", keys[n]);
-            let _ = writeln!(lock(&bad_out), "{} {why}", keys[n]);
+            writeln!(lock(&bad_out), "{} {why}", keys[n]).context("writing warm-bad.txt")?;
             lock(&state).2 += 1;
+            Ok(())
         },
     )?;
     let (mut times, refused, crashed) = state.into_inner().unwrap_or_else(|e| e.into_inner());
@@ -117,8 +118,8 @@ fn run_batches(
     all: &[usize],
     jobs: usize,
     start: impl Fn(&[usize]) -> Result<Child> + Sync,
-    each: impl Fn(usize, f64, bool) + Sync,
-    bad: impl Fn(usize, String) + Sync,
+    each: impl Fn(usize, f64, bool) -> Result<()> + Sync,
+    bad: impl Fn(usize, String) -> Result<()> + Sync,
 ) -> Result<()> {
     let chunks: Vec<&[usize]> = all.chunks(AT_ONCE).collect();
     let next = AtomicUsize::new(0);
@@ -135,14 +136,15 @@ fn run_batches(
                         }
                         let outcome = start(rest)
                             .context("could not start warm worker")
-                            .and_then(|process| child(process, &each));
+                            .and_then(|process| child(process, rest, &each));
                         match outcome {
                             Ok(Some((made, why))) => {
-                                let remaining = &rest[made.min(rest.len())..];
-                                let Some((&n, after)) = remaining.split_first() else {
-                                    break;
-                                };
-                                bad(n, why);
+                                // child only returns a failure index after a validated start.
+                                let (n, after) = rest[made..].split_first().expect("active pipeline");
+                                if let Err(error) = bad(*n, why) {
+                                    let _ = failure.set(error);
+                                    return;
+                                }
                                 rest = after;
                             }
                             Ok(None) => break,
@@ -178,52 +180,134 @@ fn start_worker(these: &[usize]) -> Result<Child> {
         .with_context(|| format!("could not spawn {}", exe.display()))
 }
 
-/// On abnormal exit, return the number of reports before the failure and the exit reason.
-fn child(mut process: Child, mut each: impl FnMut(usize, f64, bool)) -> Result<Option<(usize, String)>> {
+/// The worker reports a start and a completion for each requested index, in order.
+struct Progress<'a> {
+    expected: &'a [usize],
+    made: usize,
+    active: bool,
+}
+
+impl<'a> Progress<'a> {
+    fn new(expected: &'a [usize]) -> Self {
+        Self { expected, made: 0, active: false }
+    }
+
+    fn line(&mut self, line: &str) -> Result<Option<(usize, f64, bool)>> {
+        let mut words = line.split_whitespace();
+        match words.next() {
+            Some("at") => {
+                let n: usize = words.next().context("missing pipeline index")?.parse()?;
+                anyhow::ensure!(
+                    !self.active && self.expected.get(self.made) == Some(&n) && words.next().is_none(),
+                    "unexpected pipeline start: {line}"
+                );
+                self.active = true;
+                Ok(None)
+            }
+            Some("made") => {
+                let n: usize = words.next().context("missing pipeline index")?.parse()?;
+                let ms: f64 = words.next().context("missing pipeline duration")?.parse()?;
+                let there = match words.next() {
+                    Some("0") => false,
+                    Some("1") => true,
+                    _ => anyhow::bail!("invalid pipeline result: {line}"),
+                };
+                anyhow::ensure!(
+                    self.active && self.expected.get(self.made) == Some(&n)
+                        && ms.is_finite() && ms >= 0.0 && words.next().is_none(),
+                    "unexpected pipeline completion: {line}"
+                );
+                self.made += 1;
+                self.active = false;
+                Ok(Some((n, ms, there)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn finish(self, status: ExitStatus, timed_out: bool) -> Result<Option<(usize, String)>> {
+        if status.success() && !timed_out {
+            anyhow::ensure!(
+                self.made == self.expected.len() && !self.active,
+                "warm worker exited successfully after reporting only {} of {} pipelines",
+                self.made, self.expected.len()
+            );
+            return Ok(None);
+        }
+        let why = if timed_out {
+            format!("hung for {} s", LONGEST.as_secs())
+        } else {
+            status.to_string()
+        };
+        // Retain the existing compiler-hang policy, but only after a valid start.
+        // For process exits, require a specific DXGI device-loss HRESULT, not
+        // just a negative exit code (which includes unrelated NTSTATUS errors).
+        if self.active && (timed_out || device_loss(status)) {
+            return Ok(Some((self.made, why)));
+        }
+        anyhow::bail!("warm worker failed after {} of {} pipelines: {why}", self.made, self.expected.len())
+    }
+}
+
+fn device_loss(status: ExitStatus) -> bool {
+    // DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_HUNG, DXGI_ERROR_DEVICE_RESET.
+    matches!(status.code().map(|code| code as u32), Some(0x887A0005 | 0x887A0006 | 0x887A0007))
+}
+
+/// Only return a bad pipeline for a failure attributable to an active pipeline.
+fn child(
+    mut process: Child,
+    these: &[usize],
+    mut each: impl FnMut(usize, f64, bool) -> Result<()>,
+) -> Result<Option<(usize, String)>> {
     let Some(out) = process.stdout.take() else {
         let _ = process.kill();
         process.wait().context("warm worker stdout unavailable, failed to reap worker")?;
         anyhow::bail!("warm worker stdout unavailable");
     };
     let process = Mutex::new(process);
-    let (heard, over) = (Mutex::new(Instant::now()), AtomicBool::new(false));
+    let heard = Mutex::new(Instant::now());
     let hung = AtomicBool::new(false);
-    let mut made = 0;
-    std::thread::scope(|s| {
-        s.spawn(|| {
-            while !over.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(500));
-                if lock(&heard).elapsed() > LONGEST {
-                    hung.store(true, Ordering::Relaxed);
-                    let _ = lock(&process).kill();
+    let mut progress = Progress::new(these);
+    let status = std::thread::scope(|s| -> Result<ExitStatus> {
+        let (finished, wake) = mpsc::channel::<()>();
+        let (watch_heard, watch_hung, watch_process) = (&heard, &hung, &process);
+        s.spawn(move || {
+            while let Err(mpsc::RecvTimeoutError::Timeout) = wake.recv_timeout(Duration::from_millis(500)) {
+                if lock(watch_heard).elapsed() > LONGEST {
+                    let mut worker = lock(watch_process);
+                    if matches!(worker.try_wait(), Ok(None)) && worker.kill().is_ok() {
+                        watch_hung.store(true, Ordering::Relaxed);
+                    }
                     return;
                 }
             }
         });
-        for line in BufReader::new(out).lines().map_while(Result::ok) {
-            *lock(&heard) = Instant::now();
-            let mut words = line.split(' ');
-            if words.next() == Some("made")
-                && let (Some(n), Some(ms), Some(there)) = (words.next(), words.next(), words.next())
-                && let (Ok(n), Ok(ms)) = (n.parse(), ms.parse())
-            {
-                made += 1;
-                each(n, ms, there == "1");
+        let result = (|| -> Result<ExitStatus> {
+            for line in BufReader::new(out).lines() {
+                let line = line.context("reading warm worker output")?;
+                if let Some((n, ms, there)) = progress.line(&line)? {
+                    each(n, ms, there)?;
+                }
+                *lock(&heard) = Instant::now();
             }
+            // Keep the watchdog alive even if stdout closes before the process exits.
+            loop {
+                if let Some(status) = lock(&process).try_wait().context("waiting for warm worker")? {
+                    return Ok(status);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })();
+        if result.is_err() {
+            let mut worker = lock(&process);
+            let _ = worker.kill();
+            let _ = worker.wait();
         }
-        over.store(true, Ordering::Relaxed);
-    });
-    let status = lock(&process).wait();
-    let well = status.as_ref().is_ok_and(|s| s.success());
-    if well {
-        return Ok(None);
-    }
-    let why = if hung.load(Ordering::Relaxed) {
-        format!("hung for {} s", LONGEST.as_secs())
-    } else {
-        status.map_or_else(|e| e.to_string(), |s| format!("{s}"))
-    };
-    Ok(Some((made, why)))
+        drop(finished);
+        result
+    })?;
+    progress.finish(status, hung.load(Ordering::Relaxed))
 }
 
 /// What such a process does.
@@ -277,8 +361,8 @@ mod tests {
                 starts.fetch_add(1, Ordering::Relaxed);
                 Ok(Command::new(&missing).spawn()?)
             },
-            |n, _, _| lock(&done).push(n),
-            |n, _| lock(&bad).push(n),
+            |n, _, _| { lock(&done).push(n); Ok(()) },
+            |n, _| { lock(&bad).push(n); Ok(()) },
         );
         assert_eq!(starts.load(Ordering::Relaxed), 1);
         assert!(lock(&done).is_empty());
@@ -302,19 +386,19 @@ mod tests {
     }
 
     #[test]
-    fn worker_exit_records_the_failed_pipeline_and_resumes() {
+    fn device_loss_records_only_the_active_pipeline_and_resumes() {
         let done = Mutex::new(Vec::new());
         let bad = Mutex::new(Vec::new());
         run_batches(
             &[7, 8, 9],
             1,
             |rest| match rest {
-                [7, 8, 9] => fake_child("echo made 7 3.5 1&exit /b 7", Stdio::piped()),
-                [9] => fake_child("echo made 9 2.0 0", Stdio::piped()),
+                [7, 8, 9] => fake_child("echo at 7&echo made 7 3.5 1&echo at 8&exit /b -2005270523", Stdio::piped()),
+                [9] => fake_child("echo at 9&echo made 9 2.0 0", Stdio::piped()),
                 _ => panic!("unexpected batch {rest:?}"),
             },
-            |n, ms, there| lock(&done).push((n, ms, there)),
-            |n, why| lock(&bad).push((n, why)),
+            |n, ms, there| { lock(&done).push((n, ms, there)); Ok(()) },
+            |n, why| { lock(&bad).push((n, why)); Ok(()) },
         )
         .unwrap();
         assert_eq!(*lock(&done), [(7, 3.5, true), (9, 2.0, false)]);
@@ -338,12 +422,98 @@ mod tests {
                     assert_eq!(lock(&received).recv_timeout(Duration::from_secs(5)).unwrap(), AT_ONCE);
                     anyhow::bail!("worker unavailable")
                 }
-                fake_child(&format!("echo made {AT_ONCE} 1 1"), Stdio::piped())
+                fake_child(&format!("echo at {AT_ONCE}&echo made {AT_ONCE} 1 1"), Stdio::piped())
             },
-            |n, _, _| confirmed.send(n).unwrap(),
+            |n, _, _| { confirmed.send(n).unwrap(); Ok(()) },
             |_, _| panic!("unexpected bad pipeline"),
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("worker unavailable"));
+    }
+
+    #[test]
+    fn generic_exit_leaves_active_pipeline_pending() {
+        for code in [7, -1073741510, -1073741819] {
+            let done = Mutex::new(Vec::new());
+            let error = run_batches(
+                &[7, 8, 9],
+                1,
+                |_| fake_child(&format!("echo at 7&echo made 7 3.5 1&echo at 8&exit /b {code}"), Stdio::piped()),
+                |n, _, _| { lock(&done).push(n); Ok(()) },
+                |_, _| panic!("generic failures must not blacklist a pipeline"),
+            ).unwrap_err();
+            assert!(error.to_string().contains("after 1 of 3 pipelines"));
+            assert_eq!(*lock(&done), [7]);
+        }
+    }
+
+    #[test]
+    fn incomplete_success_leaves_unreported_pipelines_pending() {
+        for (script, completed) in [
+            ("exit /b 0", vec![]),
+            ("echo at 7&echo made 7 1 1&exit /b 0", vec![7]),
+            ("echo at 7&exit /b 0", vec![]),
+        ] {
+            let done = Mutex::new(Vec::new());
+            let error = run_batches(
+                &[7, 8], 1,
+                |_| fake_child(script, Stdio::piped()),
+                |n, _, _| { lock(&done).push(n); Ok(()) },
+                |_, _| panic!("incomplete success must not blacklist a pipeline"),
+            ).unwrap_err();
+            assert!(error.to_string().contains("exited successfully after reporting only"));
+            assert_eq!(*lock(&done), completed);
+        }
+    }
+
+    #[test]
+    fn device_loss_and_timeout_require_an_active_pipeline() {
+        use std::os::windows::process::ExitStatusExt;
+        for code in [0x887A0005, 0x887A0006, 0x887A0007] {
+            let status = ExitStatus::from_raw(code);
+            assert!(Progress::new(&[7]).finish(status, false).is_err());
+            let mut progress = Progress::new(&[7]);
+            assert_eq!(progress.line("at 7").unwrap(), None);
+            assert_eq!(progress.finish(status, false).unwrap().unwrap().0, 0);
+        }
+        let status = ExitStatus::from_raw(1);
+        assert!(Progress::new(&[7]).finish(status, true).is_err());
+        let mut progress = Progress::new(&[7]);
+        assert_eq!(progress.line("at 7").unwrap(), None);
+        assert_eq!(progress.finish(status, true).unwrap().unwrap().0, 0);
+        let mut finished = Progress::new(&[7]);
+        assert_eq!(finished.line("at 7").unwrap(), None);
+        assert!(finished.line("made 7 0 1").unwrap().is_some());
+        assert!(finished.finish(ExitStatus::from_raw(0x887A0005), false).is_err());
+    }
+
+    #[test]
+    fn malformed_reports_do_not_complete_or_blacklist_pipelines() {
+        for script in [
+            "echo at 8",
+            "echo made 7 1 1",
+            "echo at 7&echo at 7",
+            "echo at 7&echo made 8 1 1",
+            "echo at 7&echo made 7 NaN 1",
+            "echo at 7&echo made 7 1 2",
+        ] {
+            assert!(run_batches(
+                &[7, 8], 1,
+                |_| fake_child(script, Stdio::piped()),
+                |_, _, _| panic!("invalid report"),
+                |_, _| panic!("invalid report"),
+            ).is_err());
+        }
+    }
+
+    #[test]
+    fn journal_failure_reaches_the_caller() {
+        let error = run_batches(
+            &[7, 8], 1,
+            |_| fake_child("echo at 7&echo made 7 1 1", Stdio::piped()),
+            |_, _, _| anyhow::bail!("journal unavailable"),
+            |_, _| panic!("journal error must not blacklist a pipeline"),
+        ).unwrap_err();
+        assert_eq!(error.to_string(), "journal unavailable");
     }
 }
