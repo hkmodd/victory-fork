@@ -2162,7 +2162,7 @@ impl<'a> Lower<'a> {
             // Three dwords past the table count meetings, wait polls and wait atomics.
             let spare = HOST_LDS_DWORDS.saturating_sub(s.lds_dwords).saturating_sub(3);
             let per = 2 * waves;
-            let cap = if per == 0 { 0 } else { spare / per };
+            let cap = spare.checked_div(per).unwrap_or(0);
             let base = s.lds_dwords;
             s.lds_dwords += cap * per;
             let tally = s.lds_dwords;
