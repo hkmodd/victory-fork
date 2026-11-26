@@ -58,7 +58,12 @@ impl StaticSampler {
             2 => 3,
             _ => 0,
         };
-        let filter = if mag >= 2 || min >= 2 {
+        // XY filters: 0 point, 1 bilinear, 2 aniso point, 3 aniso bilinear. A driver
+        // writes aniso point for a nearest filter with anisotropy on; the host's
+        // anisotropic filter is linear, so only aniso bilinear with a ratio above 1x
+        // becomes it, and aniso point samples points (logic of XCL #1117). An
+        // anisotropic filter keeps a point mip filter ([`Self::filter_for_host`]).
+        let filter = if (mag == 3 || min == 3) && bits(w[0], 9, 3) != 0 {
             0x54 | u32::from(mip == 2) | reduction << 7
         } else {
             (min & 1) << 4 | (mag & 1) << 2 | u32::from(mip == 2) | reduction << 7
@@ -133,12 +138,18 @@ mod tests {
             ),
             (0x1D5, 16, 15.0)
         );
+        // Aniso point min and mag: a point filter, ratio set or not; aniso
+        // bilinear at a 1x ratio: bilinear.
+        let aniso_point = StaticSampler::from_words([0x369E, 0x00FF_F000, 0x18A0_0000, 0x8000_0000]);
+        assert_eq!(aniso_point.filter, 0x01);
+        let one_x = StaticSampler::from_words([0x3000, 0x00FF_F000, 0x18F0_0000, 0x8000_0000]);
+        assert_eq!(one_x.filter, 0x15);
     }
 
     #[test]
     fn anisotropic_samplers_preserve_mip_point_filtering() {
         for (reduction, base) in [(0u32, 0x54u32), (1, 0x154), (2, 0x1D4)] {
-            let w0 = reduction << 29;
+            let w0 = reduction << 29 | 1 << 9; // anisotropy ratio 2x
             for mip in [0u32, 1] {
                 let w2 = (mip << 26) | 0x00F0_0000; // mag = 3, min = 3
                 let s = StaticSampler::from_words([w0, 0x00FF_F000, w2, 0]);
@@ -148,8 +159,8 @@ mod tests {
             let s = StaticSampler::from_words([w0, 0x00FF_F000, w2, 0]);
             assert_eq!(s.filter, base | 1, "reduction={reduction} mip=2");
         }
-        // Mixed anisotropic mag (2) with linear min (1) and point mip (1).
-        let mixed = StaticSampler::from_words([0, 0, (1 << 26) | (1 << 22) | (2 << 20), 0]);
+        // Mixed aniso bilinear mag (3) with linear min (1) and point mip (1).
+        let mixed = StaticSampler::from_words([1 << 9, 0, (1 << 26) | (1 << 22) | (3 << 20), 0]);
         assert_eq!(mixed.filter, 0x54);
     }
 

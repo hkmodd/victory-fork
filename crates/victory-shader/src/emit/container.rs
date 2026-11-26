@@ -553,4 +553,27 @@ mod tests {
         same_mode_per_row(&mut outputs, false);
         assert_eq!(outputs.iter().map(|e| e.interp).collect::<Vec<_>>(), [1, 1]);
     }
+
+    #[test]
+    fn signature_keeps_the_console_element_order_within_a_row() {
+        // Two semantics share row 2 (columns 0 and 3). The module's signature
+        // metadata lists TEXCOORD first and the validator compares the part
+        // to it element by element, so the part must keep that order rather
+        // than sort by column.
+        let part = signature(
+            &[
+                el("TEXCOORD", 0, 9, 1, 2, 0, 7),
+                el("COLOR", 0, 9, 1, 2, 3, 8),
+            ],
+            true,
+        );
+        let name_at = |i: usize| {
+            let at = 8 + 32 * i;
+            let offset = u32::from_le_bytes(part[at + 4..at + 8].try_into().unwrap()) as usize;
+            let end = part[offset..].iter().position(|&b| b == 0).unwrap();
+            std::str::from_utf8(&part[offset..offset + end]).unwrap()
+        };
+        assert_eq!(name_at(0), "TEXCOORD");
+        assert_eq!(name_at(1), "COLOR");
+    }
 }

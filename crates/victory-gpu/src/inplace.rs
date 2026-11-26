@@ -37,6 +37,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::HANDLE;
@@ -311,12 +312,22 @@ fn views_mut() -> std::sync::RwLockWriteGuard<'static, Views> {
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
-    let mut v = views_mut();
-    v.sections.retain(|s| s.0 != section);
-    // A handle's number given out again: the view was of the section that
-    // had it before (it stays mapped: someone may be writing through it).
-    v.whole.retain(|w| w.0 != section);
-    v.sections.push((section, bytes, committed));
+    {
+        let mut v = views_mut();
+        v.sections.retain(|s| s.0 != section);
+        // A handle's number given out again: the view was of the section that
+        // had it before (it stays mapped: someone may be writing through it).
+        v.whole.retain(|w| w.0 != section);
+        v.sections.push((section, bytes, committed));
+    }
+    // A view of our own made on an earlier section that had this handle's
+    // number shows that section's pages, not this one's: it is forgotten
+    // (left mapped: nothing reads it any more) and the next store through
+    // a view of ours maps this section.
+    let gone = OWN.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|own| own.remove(&section)).flatten();
+    if gone.is_some() {
+        tracing::info!(section, "a section handle's number came round again: our own view of the earlier section is forgotten");
+    }
 }
 
 /// The runtime lets go of a section, and of its handle: no view the title
@@ -338,6 +349,7 @@ pub fn title_memory_section_gone(section: usize) {
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
+    let _spent = crate::watch::Spent::new(crate::framelog::T::RemapHooksNs);
     {
         let mut v = views_mut();
         v.views.insert(at, (len, section, offset));
@@ -407,6 +419,87 @@ pub(crate) fn shown_elsewhere(start: usize, end: usize) -> Vec<(usize, Vec<usize
         }
     }
     out
+}
+
+/// Physical backing, clipped to the title range being changed: a view's
+/// part with the section and the offset in it. A view the runtime splits
+/// still shows the same section bytes on either side
+/// (`crate::watch::title_memory_remapping_range`, `crate::writeback`;
+/// from DexNom's bc3cd4b0).
+#[derive(Clone, Copy)]
+pub(crate) struct PhysicalSpan {
+    start: usize,
+    end: usize,
+    section: usize,
+    offset: u64,
+}
+
+/// The views' backing of `range`, in order.
+pub(crate) fn physical_spans(range: &std::ops::Range<usize>) -> Vec<PhysicalSpan> {
+    if range.is_empty() {
+        return Vec::new();
+    }
+    let v = views();
+    let search = v.views.range(..=range.start).next_back().map_or(range.start, |(&at, _)| at);
+    v.views
+        .range(search..range.end)
+        .filter_map(|(&base, &(size, section, offset))| {
+            let start = range.start.max(base);
+            let end = range.end.min(base.saturating_add(size));
+            (start < end).then_some(PhysicalSpan { start, end, section, offset: offset + (start - base) as u64 })
+        })
+        .collect()
+}
+
+/// Calls `changed` for each part of title memory whose backing differs
+/// between `old` and `new`, walking the union of their boundaries (no page
+/// by page). Unmapped and mapped again to the same bytes is no change.
+pub(crate) fn physical_changes(mut old: &[PhysicalSpan], mut new: &[PhysicalSpan], mut changed: impl FnMut(std::ops::Range<usize>)) {
+    let mut at = old.first().into_iter().chain(new.first()).map(|s| s.start).min().unwrap_or(0);
+    while !old.is_empty() || !new.is_empty() {
+        let interval = |list: &[PhysicalSpan]| match list.first() {
+            Some(s) if s.start <= at => (s.end, Some((s.section, s.offset + (at - s.start) as u64))),
+            Some(s) => (s.start, None),
+            None => (usize::MAX, None),
+        };
+        let (old_end, old_bytes) = interval(old);
+        let (new_end, new_bytes) = interval(new);
+        let end = old_end.min(new_end);
+        if old_bytes != new_bytes {
+            changed(at..end);
+        }
+        if old.first().is_some_and(|s| s.end == end) {
+            old = &old[1..];
+        }
+        if new.first().is_some_and(|s| s.end == end) {
+            new = &new[1..];
+        }
+        at = end;
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn physical_replacement_keeps_the_unchanged_neighbors_of_a_split_view() {
+    let span = |start, end, section, offset| PhysicalSpan { start, end, section, offset };
+    let old = [span(100, 400, 1, 1000)];
+    let split = [span(100, 200, 1, 1000), span(200, 300, 2, 0), span(300, 400, 1, 1200)];
+    let mut changed = Vec::new();
+    physical_changes(&old, &split, |r| changed.push(r));
+    assert_eq!(changed, [200..300]);
+    changed.clear();
+    physical_changes(&split, &split, |r| changed.push(r));
+    assert!(changed.is_empty());
+    let shifted = [span(100, 400, 1, 2000)];
+    physical_changes(&old, &shifted, |r| changed.push(r));
+    assert_eq!(changed, [100..400]);
+    // A view gone, none in its place: a change; none before or after: none.
+    changed.clear();
+    physical_changes(&old, &[], |r| changed.push(r));
+    assert_eq!(changed, [100..400]);
+    changed.clear();
+    physical_changes(&[], &[], |r| changed.push(r));
+    assert!(changed.is_empty());
 }
 
 /// The address of the 64 KiB page shown at `page` in every title view that
@@ -497,6 +590,145 @@ pub(crate) fn shown_runs(at: usize, len: usize) -> Vec<(usize, usize)> {
         }
     }
     runs
+}
+
+/// Whether what shaders wrote goes back into title view memory through a
+/// view of our own (on by default, run fs1; `VICTORY_BACK_OWN_VIEW=0` off).
+///
+/// The copy-back writes title memory at the title's address, so it opens
+/// the guard on the 64 KiB block first (and on every other view of the
+/// page), and the block then counts as written by the title: the host
+/// copy that just put the bytes there copies all 64 KiB of it back in at
+/// its next refresh, and sends them up to the card again if it lives
+/// there. In runs 218-222 the bytes copied in went with the bytes copied
+/// back, 0.83 MB for each MB (78 readings), some 50 MB of 142 MB a frame.
+///
+/// With the switch the bytes are stored through a view of our own on the
+/// same section, which no guard covers: the title's views stay read-only
+/// (a title write still faults and is seen), the write-watch journal is
+/// told the page was written (`crate::watch::wrote_own`) so that every
+/// other copy of it takes it again, and the copy that wrote it notes the
+/// page current (`put_back_own` in `crate::shadow`).
+///
+/// `VICTORY_BACK_OWN_VIEW=alt`: twenty seconds with, twenty without, in
+/// turn, each change said in the log, for measuring it in one scene.
+pub(crate) fn back_own() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_BACK_OWN_VIEW").as_deref() {
+        Ok("0") => 0,
+        Ok("alt") => 2,
+        _ => 1,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "copy-back through views of our own from now (VICTORY_BACK_OWN_VIEW=alt): {}",
+                    if on { "ON" } else { "off, as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// A view of our own on a whole section of the title's physical pages:
+/// where it is, its bytes, and which of its 64 KiB blocks we have asked
+/// to be committed through it (a bit each).
+struct Own {
+    base: usize,
+    bytes: u64,
+    committed: Vec<u64>,
+}
+
+/// Our own views by section handle; `None` in a section's place if the
+/// host refused the view (not asked again).
+static OWN: Mutex<Option<std::collections::HashMap<usize, Option<Own>>>> = Mutex::new(None);
+
+/// Stores `bytes` at title address `at` through a view of our own
+/// ([`back_own`]), if `[at, at + bytes.len())` lies in one 64 KiB page of
+/// a title view of a section. Gives the addresses of that page in every
+/// title view that shows it (the page of `at` among them), or `None` with
+/// nothing written: not view memory, a page of very many views, the
+/// runtime changing mappings at this moment, or the host refusing.
+pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
+    if bytes.is_empty() || at / K64 != (at + bytes.len() - 1) / K64 {
+        return None;
+    }
+    // No mapping changes until the bytes are in: the view found below
+    // shows these pages for as long as this is held.
+    // Every view of the page is written: all of title memory is pinned.
+    let _still = crate::watch::title_memory_reading_now(0..usize::MAX)?;
+    let (section, offset, shown, section_bytes) = {
+        let v = views();
+        let (&base, &(len, section, offset)) = v.views.range(..=at).next_back()?;
+        if at + bytes.len() > base + len {
+            return None;
+        }
+        let offset = offset + (at - base) as u64;
+        let shown = v.pages.get(&(section, offset - offset % K64 as u64))?.clone();
+        if shown.len() > crate::watch::MANY_VIEWS {
+            return None;
+        }
+        let section_bytes = v.sections.iter().find(|s| s.0 == section)?.1;
+        (section, offset, shown, section_bytes)
+    };
+    if offset + bytes.len() as u64 > section_bytes {
+        return None;
+    }
+    let mut own = OWN.lock().unwrap_or_else(|e| e.into_inner());
+    let view = own
+        .get_or_insert_with(Default::default)
+        .entry(section)
+        .or_insert_with(|| {
+            // SAFETY: a section handle the runtime gave us, alive as long
+            // as the title's views of it are; the view is ours and stays.
+            let at = unsafe { mem::MapViewOfFile(section as *mut c_void, mem::FILE_MAP_WRITE, 0, 0, 0) };
+            if at.Value.is_null() {
+                tracing::warn!(
+                    section,
+                    error = %std::io::Error::last_os_error(),
+                    "no view of our own on a section of title pages: what shaders wrote goes back the old way there"
+                );
+                return None;
+            }
+            tracing::info!(
+                section,
+                mb = section_bytes >> 20,
+                "a view of our own on a section of title pages, for what shaders wrote (VICTORY_BACK_OWN_VIEW=1)"
+            );
+            Some(Own {
+                base: at.Value as usize,
+                bytes: section_bytes,
+                committed: vec![0; (section_bytes as usize).div_ceil(K64).div_ceil(64)],
+            })
+        })
+        .as_mut()?;
+    if offset + bytes.len() as u64 > view.bytes {
+        return None;
+    }
+    let block = offset as usize / K64;
+    if (view.committed[block / 64] & (1u64 << (block % 64))) == 0 {
+        // The title's view committed these pages of the section; asked
+        // once more through ours, which changes nothing if they are.
+        // SAFETY: a block inside our own view.
+        let there = unsafe {
+            mem::VirtualAlloc((view.base + block * K64) as *const c_void, K64, mem::MEM_COMMIT, mem::PAGE_READWRITE)
+        };
+        if there.is_null() {
+            return None;
+        }
+        view.committed[block / 64] |= 1u64 << (block % 64);
+    }
+    // SAFETY: committed bytes inside our own view; the source is the
+    // caller's slice.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (view.base + offset as usize) as *mut u8, bytes.len()) };
+    Some(shown)
 }
 
 /// How the views cover `[at, at + len)`.

@@ -24,7 +24,14 @@
 //! counts at all ([`writing`], [`landed_beside`], [`wrote`]). Not so for a
 //! page shown in more than [`MANY_VIEWS`] places (what the title shows where
 //! it has nothing). `VICTORY_VIEW_GUARD=0`: each address for itself, as
-//! before.
+//! before. A system call writing into a guarded block fails (none is known
+//! to).
+//!
+//! With the light refresh (on unless `VICTORY_LIGHT_REFRESH=0`) a block
+//! that is read-only by our hand, unwritten since, and whose earlier writes
+//! are all in the journal has a bit ([`PUBLISHED`]): a range whose blocks
+//! all have theirs is answered from the journal alone, with no lock of the
+//! guards and no kernel call ([`light`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, RangeBounds};
@@ -881,6 +888,12 @@ fn slow(us: u64) {
     SLOW[2].fetch_max(us, Relaxed);
 }
 
+/// Since the last frame line: ranges of view memory the guards hold that a
+/// submission's askings ahead ([`ask_ahead`], [`ask_once`]) left out. Each
+/// was a kernel asking that failed, or several, before.
+#[cfg(feature = "diagnostics")]
+pub(crate) static AHEAD_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// [`SLOW`], taken.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn slow_asks() -> [u64; 3] {
@@ -1076,7 +1089,13 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
     let mut held_ahead = Ahead::new();
     held_ahead.set(std::mem::take(&mut ahead));
     for &(start, end) in ranges {
-        if start >= end || published(start, end) || refused_as_view(start, end) {
+        if start >= end || published(start, end) {
+            continue;
+        }
+        if refused_as_view(start, end) {
+            // (Counted for the frame line: view memory left out.)
+            #[cfg(feature = "diagnostics")]
+            AHEAD_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -1288,6 +1307,44 @@ fn elsewhere(at: usize, len: usize) -> Vec<(usize, Vec<usize>)> {
         return Vec::new();
     }
     crate::inplace::shown_elsewhere(at / BLOCK * BLOCK, at.saturating_add(len))
+}
+
+/// We wrote the 64 KiB page numbered `page` of title memory through a
+/// view of our own (`crate::inplace::write_own`): no guard was opened and
+/// no kernel write-watch bit set, so the journal is told here. The page,
+/// and the same physical page at its other title addresses (`others`,
+/// page numbers), count as written at a new asking, which every host copy
+/// that holds them takes at its next refresh. Returns the asking that had
+/// last found `page` written (0: never) and the new one, for the copy
+/// that wrote to note itself current.
+pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
+    let mut j = journal_mut();
+    let now = next_asking();
+    // As in [`wrote`]: an asking that stands for a submission, or for a
+    // flush, moves with it, or a copy taking the page at the standing
+    // asking would find it written "later" at every refresh.
+    if j.kept || !j.ahead.ranges.is_empty() {
+        j.ahead_asked = now;
+    }
+    let before = j.notes.note(page, WHOLE, now);
+    for &other in others {
+        if other != page {
+            j.notes.note(other, WHOLE, now);
+        }
+    }
+    (before, now)
+}
+
+/// The asking that last found the 64 KiB page numbered `page` written (0:
+/// never). Read only, for `crate::backreads`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn stamp(page: usize) -> u64 {
+    let mut at = 0;
+    journal().notes.each(page, page + 1, |_, write| {
+        at = write;
+        true
+    });
+    at
 }
 
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
@@ -1979,7 +2036,7 @@ pub(crate) fn put_beside(block: usize, weight: u32, put: impl FnOnce(usize)) -> 
     }
     // No mapping changes until all is told: a view of the page that came
     // after the look at them would not be.
-    let Some(_reading) = title_memory_reading_now() else {
+    let Some(_reading) = title_memory_reading_now(ALL_MEMORY) else {
         return Beside::Cannot;
     };
     let Some((page, shown)) = crate::inplace::beside_page(block * BLOCK) else {
@@ -2763,6 +2820,58 @@ pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
         .all(|b| !g.clean.contains(b) && !g.absent.contains(b) && !g.protected.contains(b))
 }
 
+/// Whether the block `page` is read-only by our hand and unwritten since a
+/// copy took it (diagnostics of `VICTORY_BACK_OWN_CHECK`).
+pub(crate) fn clean(page: usize) -> bool {
+    guards_shared().clean.contains(page)
+}
+
+/// Whether a refresh of `[start, end)` by a copy whose note of taken pages
+/// is `copied` (from page `base` on, as for [`nothing_new`]) would copy
+/// nothing, known before asking and whatever the light refresh says:
+/// every page of the range was taken, the journal notes no write of a page
+/// after the copy took it, and either the range lies in a standing asking
+/// ahead (the journal is then the whole answer, as [`writes`] gives it) or
+/// every 64 KiB block of it is read-only by our hand and clean (no write
+/// opened its guard since a copy took it: the guard fault handler, our own
+/// writes through the kernel ([`writing`]), DirectStorage's writes through
+/// the runtime's views ([`title_memory_written`]) and a remapping
+/// ([`title_memory_remapped`]) all open or forget the block first).
+///
+/// What it cannot see is what the guards cannot see either: a write
+/// through another view of the same physical page where the two were not
+/// guarded together, and a write into private memory that no asking has
+/// reported yet (such a range is answered here only inside a standing
+/// asking, where [`writes`] would answer from the journal too). So where
+/// this says yes, [`writes`] would say the same (fps41 round 8).
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn unchanged_known(start: usize, end: usize, base: usize, copied: &[u64]) -> bool {
+    if start >= end {
+        return false;
+    }
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
+        return false;
+    };
+    if taken.contains(&0) {
+        return false;
+    }
+    let ahead = {
+        let j = journal();
+        if !j.notes.each(first, last, |page, write| write <= taken[page - first]) {
+            return false;
+        }
+        j.ahead.holds(first, last)
+    };
+    if ahead {
+        return true;
+    }
+    // (The journal's lock is let go first; a look only.)
+    let g = guards_shared();
+    let blocks = last - first;
+    g.protected.range(first..last).count() == blocks && g.clean.range(first..last).count() == blocks
+}
+
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
@@ -3501,18 +3610,36 @@ pub fn title_memory_splitting(at: usize, len: usize) {
 /// cannot help; not changing the mapping while such a read is under way
 /// does.
 static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+/// All of title memory, for a change whose extent is unknown.
+const ALL_MEMORY: std::ops::Range<usize> = 0..usize::MAX;
 
 /// What the runtime holds while it changes what title memory shows
-/// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+/// ([`title_memory_remapping`]): the lock, when it was asked for, and the
+/// range it changes with the physical backing that range had before.
+pub struct Remapping {
+    _changing: std::sync::RwLockWriteGuard<'static, ()>,
+    asked: std::time::Instant,
+    range: std::ops::Range<usize>,
+    previous: Vec<crate::inplace::PhysicalSpan>,
+}
 
 impl Drop for Remapping {
     fn drop(&mut self) {
+        // Where the backing is not what it was, what shaders of flights in
+        // the air wrote there no longer lands (`crate::writeback`). Still
+        // under the lock: no merge writes there before this is known.
+        if crate::writeback::TRACKED {
+            let _compared = Spent::new(crate::framelog::T::RemapSpansNs);
+            let current = crate::inplace::physical_spans(&self.range);
+            crate::inplace::physical_changes(&self.previous, &current, crate::writeback::remapped);
+        }
         // The change is done: what is there now may be guarded.
         if CHANGING.replace((false, false)).1 {
             guards().changing.clear();
         }
         CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // From asking for the change until it is let go (the frame log).
+        crate::framelog::add(crate::framelog::T::RemapUs, self.asked.elapsed().as_micros() as u64);
     }
 }
 
@@ -3649,8 +3776,20 @@ pub(crate) fn lost(what: &'static str, at: usize, len: usize) {
 /// The runtime is about to map, unmap or move physical pages of title
 /// memory: until what it returns is dropped, no read of title memory in
 /// place is under way and none begins ([`title_memory_reading`]). Taken
-/// around the whole change, the unmapping and the mapping again.
+/// around the whole change, the unmapping and the mapping again. For a
+/// change whose extent is unknown: every view is compared
+/// ([`title_memory_remapping_range`]).
 pub fn title_memory_remapping() -> Remapping {
+    title_memory_remapping_range(ALL_MEMORY)
+}
+
+/// [`title_memory_remapping`] for a change inside `range`, every address the
+/// change can take away for a moment (whole views): the physical backing
+/// there is compared before and after (`crate::writeback`). Every read of
+/// title memory still waits, wherever it reads: one lock for all of it
+/// (fxc/main's per-range lock, DexNom 5f4c3df, is not in this line).
+pub fn title_memory_remapping_range(range: std::ops::Range<usize>) -> Remapping {
+    let asked = std::time::Instant::now();
     // For the title's own threads ([`came_back`]).
     install();
     let met = MET.load(std::sync::atomic::Ordering::Relaxed);
@@ -3664,7 +3803,30 @@ pub fn title_memory_remapping() -> Remapping {
     let changing = MAPPING.write().unwrap_or_else(|e| e.into_inner());
     CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     CHANGING.set((true, false));
-    Remapping(changing)
+    crate::framelog::add(crate::framelog::T::Remaps, 1);
+    crate::framelog::add(crate::framelog::T::RemapWaitUs, asked.elapsed().as_micros() as u64);
+    let previous = if crate::writeback::TRACKED {
+        let _compared = Spent::new(crate::framelog::T::RemapSpansNs);
+        crate::inplace::physical_spans(&range)
+    } else {
+        Vec::new()
+    };
+    Remapping { _changing: changing, asked, range, previous }
+}
+
+/// Adds the nanoseconds from its making to its drop to a frame-log total.
+pub(crate) struct Spent(crate::framelog::T, std::time::Instant);
+
+impl Spent {
+    pub(crate) fn new(t: crate::framelog::T) -> Self {
+        Spent(t, std::time::Instant::now())
+    }
+}
+
+impl Drop for Spent {
+    fn drop(&mut self) {
+        crate::framelog::add(self.0, self.1.elapsed().as_nanos() as u64);
+    }
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
@@ -3678,16 +3840,30 @@ pub fn title_memory_reading() -> Reading {
     Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
 }
 
-/// [`title_memory_reading`] if it can be had at once: `None` while the
+/// [`title_memory_reading`] for the addresses `range`: the same lock, over
+/// all of title memory (the form of fxc/main's callers; see
+/// [`title_memory_remapping_range`]).
+pub fn title_memory_reading_range(_range: std::ops::Range<usize>) -> Reading {
+    title_memory_reading()
+}
+
+/// [`title_memory_reading_range`] if it can be had at once: `None` while the
 /// runtime changes a mapping (or waits to), for a caller that has another
 /// way to read and would rather not wait.
-pub fn title_memory_reading_now() -> Option<Reading> {
+pub fn title_memory_reading_now(_range: std::ops::Range<usize>) -> Option<Reading> {
     match MAPPING.try_read() {
         Ok(guard) => Some(Reading(guard)),
         Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
         Err(std::sync::TryLockError::WouldBlock) => None,
     }
 }
+
+/// The runtime committed title memory `[at, at + len)` for the title
+/// (`XMemVirtualAlloc` with a commit). Nothing to forget here: a block known
+/// uncommitted is asked about again at every asking ([`guard`]), so the
+/// commit is seen there. (fxc/main's notes of such blocks,
+/// `VICTORY_ABSENT_ONCE`, are not in this line.)
+pub fn title_memory_committed(_at: usize, _len: usize) {}
 
 /// The runtime mapped title memory `[at, at + len)`: what it shows is new,
 /// so it is no longer guarded (nor known unmapped), and read-write.
@@ -3700,6 +3876,11 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// neither guarded nor writable) and a kernel read into it fail, so the
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    let _spent = Spent::new(crate::framelog::T::RemapHooksNs);
+    crate::framelog::add(crate::framelog::T::RemapPages, len.div_ceil(64 << 10) as u64);
+    // Stored pages followed there end (`VICTORY_BACK_READS`): counted only.
+    #[cfg(feature = "diagnostics")]
+    crate::backreads::remapped(at, len);
     crate::texback::remapped(at, len);
     open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
 }
@@ -3909,6 +4090,7 @@ pub(crate) fn install() {
             if opened != 0 {
                 // Renderer port #2's fallback says who wrote a block of the heap.
                 crate::port_descriptors::faulted(at, r.ExceptionAddress as usize);
+                crate::framelog::add(crate::framelog::T::GuardFaults, 1);
                 #[cfg(feature = "diagnostics")]
                 {
                     crate::copystat::add(crate::copystat::C::GuardFaults, 1);
@@ -4973,7 +5155,7 @@ mod tests {
         // a store that meets one opens the block, as before.
         let mut kept = 0;
         let quiet = || {
-            while title_memory_reading_now().is_none() {
+            while title_memory_reading_now(ALL_MEMORY).is_none() {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         };

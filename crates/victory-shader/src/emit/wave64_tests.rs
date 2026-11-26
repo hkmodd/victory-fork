@@ -141,7 +141,10 @@ fn lowered_counted(
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        written_root_uavs: lowered.written_root_uavs,
+        writes_guest_memory: lowered.writes_guest_memory,
         root_indexed_views: res.root_indexed_views,
+        half_views: lowered.half_views,
     })
 }
 
@@ -280,7 +283,10 @@ fn on_64_lanes(native: &NativeProgram, p: &ir::Program) -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        written_root_uavs: Vec::new(),
+        writes_guest_memory: false,
         root_indexed_views: res.root_indexed_views,
+        half_views: lowered.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -1203,7 +1209,10 @@ fn partial_dispatch_with_a_cross_half_wave_op_runs_in_32_lane_waves() {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        written_root_uavs: Vec::new(),
+        writes_guest_memory: false,
         root_indexed_views: res.root_indexed_views.clone(),
+        half_views: lowered.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).unwrap_or_else(|e| panic!("DXIL validation: {e}"));
@@ -1373,4 +1382,28 @@ fn both_host_waves_observe_the_lds_flag_after_the_join() {
         }
     }
     eprintln!("all 14 flag dispatches passed on a 32-lane hardware adapter");
+}
+
+/// The ray-tracing builder's scans refuse on `v_readfirstlane_b32` under a
+/// per-lane branch: the cross-lane retry ([`super::widen`]) has to take the
+/// branch around it wave-wide so the two host waves meet at the exchange
+/// barrier, instead of skipping the other half's value.
+#[test]
+fn a_first_lane_refusal_is_retried_wave_wide() {
+    assert!(super::needs_wave_wide(
+        crate::native::HwStage::Cs,
+        "a first-lane read where not every lane runs"
+    ));
+    assert!(super::needs_wave_wide(
+        crate::native::HwStage::Cs,
+        "a lane read where not every lane runs"
+    ));
+    assert!(!super::needs_wave_wide(
+        crate::native::HwStage::Ps,
+        "a first-lane read where not every lane runs"
+    ));
+    assert!(!super::needs_wave_wide(
+        crate::native::HwStage::Cs,
+        "a descriptor chosen by control flow"
+    ));
 }

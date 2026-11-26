@@ -26,6 +26,13 @@ struct Pix {
 
 static PIX: OnceLock<Option<Pix>> = OnceLock::new();
 
+/// Whether PIX's capturer was loaded into this run ([`load`]): the host
+/// device is then PIX's, and the pipeline library's blob is neither read
+/// nor written by this run.
+pub(crate) fn loaded() -> bool {
+    PIX.get().is_some_and(Option::is_some)
+}
+
 fn number(name: &str, default: u64) -> u64 {
     std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
 }

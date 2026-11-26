@@ -118,11 +118,11 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
+pub use lower::{host_max_wave, host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, SLOT_VIEW_BYTES, SLOT_VIEWS, SLOT_VIEWS_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_SPREAD, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
@@ -132,20 +132,14 @@ pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 /// The iteration count after which a translated loop is left, per lane and
 /// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
 ///
-/// With the `diagnostics` feature, `VICTORY_SHADER_LOOP_LIMIT` (decimal or
-/// `0x` hex, at least 1) sets it instead. A loop that hits the limit in
-/// every lane of a full-screen pass still runs for seconds (2^20 times a
-/// 4K screen is about 10^13 iterations); a much lower limit shows whether
-/// such loops are what makes a frame slow. The value is part of the
-/// translation, so the shader cache must key on it (`victory-gpu`'s does).
+/// `VICTORY_SHADER_LOOP_LIMIT` (decimal or `0x` hex, at least 1) overrides it
+/// in any build. A loop that hits a huge limit in every lane of a full-screen
+/// pass runs for seconds (triggering Windows' 2 s TDR); the value is part of
+/// the translation, so the shader cache keys on it (`victory-gpu`'s does).
 pub fn loop_limit() -> u32 {
     static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
-        if cfg!(feature = "diagnostics") {
-            parse_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref())
-        } else {
-            lower::LOOP_LIMIT
-        }
+        parse_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref())
     })
 }
 
@@ -352,8 +346,27 @@ pub struct HostShader {
     /// Root UAVs (raw buffers) the shader reads or writes: `u<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_uavs: Vec<u8>,
+    /// Subset of root UAV slots through which this shader may write.
+    pub written_root_uavs: Vec<u8>,
+    /// A translated store or atomic can write through the guest page directory.
+    pub writes_guest_memory: bool,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
+    /// Table descriptors (root parameter, dword offset in the table) whose
+    /// buffer the shader reads or writes sixteen bits a channel
+    /// (`buffer_load_format_d16_*`, `buffer_store_format_d16_*`), in
+    /// order. On the console each channel's 16 bits move as they are
+    /// through a 16-bit float view and through a 16-bit integer one alike
+    /// (the title keeps half floats, and indices beside them, in
+    /// `R16G16B16A16_UINT` and `R16_UINT` buffers). The DXIL moves them as
+    /// unsigned integers, which an unsigned 16-bit view carries unchanged;
+    /// the host shows the shader a 16-bit float or signed buffer view at
+    /// these places as the unsigned format of the same layout.
+    /// shortcut: a view in a normalised 16-bit format, whose values the
+    /// console would convert to halves, is read as its integers; a
+    /// descriptor picked at run time keeps the float path (its slot, and so
+    /// its format, is known only then).
+    pub half_views: Vec<(u8, u32)>,
 }
 
 impl HostShader {
@@ -368,6 +381,21 @@ impl HostShader {
             .unwrap_or(0);
         n.next_multiple_of(4)
     }
+}
+
+/// A dispatch of `(x, y, z)` groups as the host runs it: `(row, asked x, gx,
+/// gy, gz)`. Spread across z when `can_spread`, `x` > 65,535 and `z` == 1
+/// ([`USER_DISPATCH_SPREAD`]); else `row` 0 and the counts as asked (upstream
+/// VIctory pull request #2312's `spread_groups`).
+pub fn spread_groups(x: u32, y: u32, z: u32, can_spread: bool) -> (u32, u32, u32, u32, u32) {
+    if can_spread && x > 65_535 && z == 1 {
+        let rows = x.div_ceil(65_535);
+        if rows <= 65_535 {
+            let row = x.div_ceil(rows);
+            return (row, x, row, y, rows);
+        }
+    }
+    (0, x, x, y, z)
 }
 
 /// One dword of user data and the root parameter that fills it.
@@ -588,6 +616,10 @@ pub fn emit(
             && c.part(FourCC::ACCC).is_some()
             && matches!(&original, Err(ShaderError::Unsupported { what, .. })
                 if *what == lower::DIVERGENT_MASK_EXCHANGE);
+        // `VICTORY_WAVE_WIDE=last`: the same form, but only for programs that every other
+        // form below leaves at 64 lanes (on a 32-lane host those are refused outright), so
+        // the programs the approximate forms already take keep their barrier-free form.
+        let wide_last = wide_option.as_ref().is_some_and(|v| v == "last");
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -669,14 +701,43 @@ pub fn emit(
                 }
             }
         }
+        // Nothing else gave 32-lane waves: the host refuses the pipeline (its draws and
+        // dispatches are lost: the water's transmission, the particles' visibility, the
+        // shadow-ray tiling). The wave-wide form as the last resort, by default, for these
+        // programs only: the ones that translate otherwise keep their form (runs 121-124
+        // lost the card with it ahead of the approximate forms, `VICTORY_WAVE_WIDE=1`).
+        // `VICTORY_WAVE_WIDE=0` refuses them as before. Not a program counting lanes of a mask
+        // (`v_mbcnt`, a list compaction): sr_tracing's `CS_Tiling_Generate_Opaque` came out
+        // wrong in this form (runs ww1/ww2: walls and skin blotched, posterized; clean with
+        // that pipeline skipped), so those stay refused.
+        // `VICTORY_WAVE_WIDE=last` (upstream, fork PR #1141) takes those too.
+        let counts_lanes = p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name().starts_with("v_mbcnt"));
+        let by_default = !counts_lanes && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0");
+        if !wide_on && (wide_last || by_default) {
+            let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+            let deep = if deep_on { form("without skips, scalars followed", ir::without_skips(p, true)) } else { None };
+            let bases = [
+                deep.as_ref().map(|f| &f.0),
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            for base in bases.into_iter().flatten() {
+                let again = widen(c, native, base, why, false);
+                report("wave-wide branches (last resort)", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
+                }
+            }
+        }
     }
-    // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
-    // trace programs): right once the wave takes that skip together ([`widen`]; the
-    // lowering has named the skipped blocks).
+    // Cross-lane code that needs every lane of the console wave where it
+    // stands (a mask operation, a lane read, a first-lane read): right once
+    // the wave takes the per-lane branches around it together ([`widen`];
+    // the lowering has named the blocks that could not meet).
     let original = match original {
         Err(ShaderError::Unsupported { what, .. })
-            if native.stage == HwStage::Cs
-                && what == lower::LANE_MASK
+            if needs_wave_wide(native.stage, what)
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
             let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false);
@@ -712,6 +773,13 @@ pub fn emit(
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     emit_program(c, native, &p, &st, &io, &res).and_then(supported)
+}
+
+/// Whether a refusal is of cross-lane code that the wave-wide retry can fix:
+/// a mask read as data, or code that needs every lane of the console wave
+/// where it stands (a lane read, a first-lane read).
+pub(super) fn needs_wave_wide(stage: HwStage, what: &str) -> bool {
+    stage == HwStage::Cs && (what == lower::LANE_MASK || lower::needs_every_lane(what))
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
@@ -921,7 +989,10 @@ fn emit_program(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        written_root_uavs: l.written_root_uavs,
+        writes_guest_memory: l.writes_guest_memory,
         root_indexed_views: res.root_indexed_views.clone(),
+        half_views: l.half_views,
     };
     Ok((shader, wave_size))
 }
@@ -1081,6 +1152,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
@@ -1230,6 +1302,7 @@ mod tests {
         }
     }
     use super::container::SigElement;
+    #[cfg(windows)]
     use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
@@ -1791,7 +1864,10 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            written_root_uavs: Vec::new(),
+            writes_guest_memory: false,
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1803,7 +1879,10 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                written_root_uavs: Vec::new(),
+                writes_guest_memory: false,
                 root_indexed_views: Vec::new(),
+                half_views: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -2412,7 +2491,10 @@ mod tests {
             root_cbvs: l.root_cbvs,
             root_srvs: l.root_srvs,
             root_uavs: l.root_uavs,
+            written_root_uavs: Vec::new(),
+            writes_guest_memory: false,
             root_indexed_views: Vec::new(),
+            half_views: l.half_views,
         };
         let (root, pso) = host.compute_pipeline(&cs).unwrap();
         // Twelve dwords: the loads below run across the view's end.
@@ -2547,7 +2629,10 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
+                written_root_uavs: Vec::new(),
+                writes_guest_memory: false,
                 root_indexed_views: Vec::new(),
+                half_views: l.half_views,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let views: Vec<super::host::View> = if raw {
@@ -2676,6 +2761,8 @@ mod tests {
             mesh_stride: 0,
         })
         .unwrap();
+        // Validated and run only on Windows (dxil.dll and the host GPU).
+        #[cfg_attr(not(windows), allow(unused_mut, unused_variables))]
         let mut dxil = l.dxil;
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
@@ -2694,7 +2781,10 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
+                written_root_uavs: l.written_root_uavs,
+                writes_guest_memory: l.writes_guest_memory,
                 root_indexed_views: Vec::new(),
+                half_views: l.half_views,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
@@ -2974,6 +3064,29 @@ mod barycentric_tests {
         let _ = shader;
     }
 
+    #[test]
+    fn pixel_quad_swizzles_validate_and_dpp8_cannot_cross_quads() {
+        let [e0, e1] = exp_mrt0(3);
+        let swizzle = |instruction: [u32; 2]| {
+            let words = [
+                0xc808_0000, 0xc809_0001, // interpolate attr0.x into v2
+                instruction[0], instruction[1], e0, e1, 0xbf81_0000,
+            ];
+            pixel(&words, PERSP_CENTER)
+        };
+        for permutation in [0x00, 0x55, 0xaa, 0xff, 0xb1, 0x4e, 0x1b, 0xe4, 0x27] {
+            // ds_swizzle_b32 v3,v2 and v_mov_b32 v3,v2 quad_perm.
+            validate(&swizzle([0xd8d4_8000 | permutation, 0x0300_0002]).unwrap());
+            validate(&swizzle([0x7e06_02fa, 0xff00_0002 | permutation << 8]).unwrap());
+        }
+        // DPP8: different permutations in the two quads of an octet.
+        let selections = [3u32, 0, 2, 1, 4, 6, 5, 7];
+        let sel = selections.into_iter().enumerate().fold(0, |s, (i, n)| s | n << (3 * i));
+        let mov_dpp8 = |sel: u32| [0x7e06_02e9, (sel << 8) | 2];
+        validate(&swizzle(mov_dpp8(sel)).unwrap());
+        assert!(swizzle(mov_dpp8(sel ^ 4)).is_err(), "lane 0 now reads lane 7");
+    }
+
     /// Custom interpolation reads I and J (v0, v1 with PERSP_CENTER) as
     /// plain floats: they are channels y and z of `SV_Barycentrics`, the
     /// weights of vertices 1 and 2.
@@ -3110,7 +3223,10 @@ mod barycentric_tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            written_root_uavs: Vec::new(),
+            writes_guest_memory: false,
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
         };
         validate(&vs);
         // One triangle covers an 8x8 target, with attribute values 2, 6, 10.
@@ -3296,5 +3412,435 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+}
+
+#[cfg(test)]
+mod lds_bounds_tests {
+    use super::*;
+    use crate::native::{ComputeIo, RootParam, StageIo};
+    use crate::{ResourceType, UsedResource};
+
+    const S_ENDPGM: u32 = 0xBF81_0000;
+
+    fn ds(op: u16, offset: u16, addr: u8, data0: u8, data1: u8, dst: u8) -> [u32; 2] {
+        [
+            0xD800_0000 | (u32::from(op) << 18) | u32::from(offset),
+            (u32::from(dst) << 24)
+                | (u32::from(data1) << 16)
+                | (u32::from(data0) << 8)
+                | u32::from(addr),
+        ]
+    }
+
+    fn v_mov_imm(dst: u8, lit: u32) -> [u32; 2] {
+        [0x7E00_02FF | (u32::from(dst) << 17), lit]
+    }
+
+    fn buf_load_dword(dst: u8, vaddr: u8, srsrc_base: u8, offset: u16) -> [u32; 2] {
+        [
+            0xE030_1000 | u32::from(offset & 0xFFF),
+            (0x80 << 24)
+                | (u32::from(srsrc_base / 4) << 16)
+                | (u32::from(dst) << 8)
+                | u32::from(vaddr),
+        ]
+    }
+
+    fn buf_store_dword(vdata: u8, vaddr: u8, srsrc_base: u8, offset: u16) -> [u32; 2] {
+        [
+            0xE070_1000 | u32::from(offset & 0xFFF),
+            (0x80 << 24)
+                | (u32::from(srsrc_base / 4) << 16)
+                | (u32::from(vdata) << 8)
+                | u32::from(vaddr),
+        ]
+    }
+
+    fn compile_lds_cs(
+        words: &[u32],
+        wave64: bool,
+        vgprs: u16,
+        lds_blocks: u32,
+        threads: [u32; 3],
+    ) -> Result<HostShader, ShaderError> {
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64,
+            vgprs,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![
+                UsedResource {
+                    kind: ResourceType::Srv,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 4,
+                    dwords: 4,
+                    user_data: 0,
+                    slot: 0,
+                },
+                UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 8,
+                    lower_bound: 0,
+                    stride: 4,
+                    dwords: 4,
+                    user_data: 0,
+                    slot: 0,
+                },
+            ],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: (lds_blocks << 15) | 2,
+                threads,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let bytes = crate::dxbc::build(&[]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+        let res = resource::track(&p, &native.layout, native.stage, None)?;
+        let io = io::raise(&p, &native)?;
+        let st = structure::structure(&p)?;
+        let shader = emit(&c, &native, &p, &st, &io, &res)?;
+        #[cfg(windows)]
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut shader.dxil.clone()).unwrap();
+        }
+        Ok(shader)
+    }
+
+    /// Dynamic out-of-bounds LDS reads, writes, sub-dword accesses, and
+    /// integer/float atomics read 0 and drop writes without clobbering `lds[0]`.
+    #[test]
+    fn lds_out_of_bounds_reads_zero_and_drops_writes_on_gpu() {
+        let mut w = vec![
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF408_0200,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[0:1], 0x0   (SRV)
+            0xF408_0300,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[0:1], 0x20 (UAV)
+        ];
+        // Build the single-lane sequence for lane 0 inside a 64-thread wave32
+        // group (`WaveSize` omitted so both WARP and hardware GPUs execute it).
+        let mut body = Vec::new();
+        body.extend(v_mov_imm(1, 0));
+        // Load dynamic byte offsets from SRV into v2..v8 so no bounds check folds statically:
+        // v2 = 0, v3 = 508 (last valid dword of 512 B LDS), v4 = 512 (1st OOB dword),
+        // v5 = 0xFFFF_FFF0 (wrapping high OOB), v6 = 1 (byte 1 of lds[0]),
+        // v7 = 509 (byte 1 of lds[127]), v8 = 602 (OOB halfword).
+        for (idx, reg) in (2u8..=8).enumerate() {
+            body.extend(buf_load_dword(reg, 1, 8, (idx * 4) as u16));
+        }
+
+        // Seed lds[0] = 0x1122_3344 and lds[127] = 0xAABB_CCDD.
+        body.extend(v_mov_imm(9, 0x1122_3344));
+        body.extend(ds(0x0d, 0, 2, 9, 0, 0)); // ds_write_b32 v2, v9
+        body.extend(v_mov_imm(9, 0xAABB_CCDD));
+        body.extend(ds(0x0d, 0, 3, 9, 0, 0)); // ds_write_b32 v3, v9
+
+        // 1. OOB ds_write_b32 at 512 -> dropped, lds[0] untouched.
+        body.extend(v_mov_imm(9, 0xDEAD_BEEF));
+        body.extend(ds(0x0d, 0, 4, 9, 0, 0));
+
+        // 2. Straddling ds_write2_b32 at base 508 (offset0=0 -> 508 in-bounds, offset1=1 -> 512 OOB):
+        // updates lds[127] to 0xCAFE_BABE and drops the OOB second dword without touching lds[0].
+        body.extend(v_mov_imm(9, 0xCAFE_BABE));
+        body.extend(v_mov_imm(10, 0xBAD0_0000));
+        body.extend(ds(0x0e, 0x0100, 3, 9, 10, 0));
+
+        // 3. OOB sub-dword writes (`ds_write_b8` at 512 and `ds_write_b16_d16_hi` at 0xFFFF_FFF0) -> dropped.
+        body.extend(v_mov_imm(9, 0x0000_00FF));
+        body.extend(ds(0x1e, 0, 4, 9, 0, 0));
+        body.extend(v_mov_imm(9, 0x9999_0000));
+        body.extend(ds(0xa1, 0, 5, 9, 0, 0));
+
+        // 4. OOB integer & float `_rtn` atomics return 0 into pre-filled destination VGPRs and drop writes.
+        body.extend(v_mov_imm(11, 0x7777_7777));
+        body.extend(v_mov_imm(9, 0x100));
+        body.extend(ds(0x20, 4, 4, 9, 0, 11)); // ds_add_rtn_u32 v11, v4, v9 offset:4 (516)
+        body.extend(v_mov_imm(12, 0x8888_8888));
+        body.extend(v_mov_imm(9, 99.0f32.to_bits()));
+        body.extend(ds(0x33, 8, 4, 9, 0, 12)); // ds_max_rtn_f32 v12, v4, v9 offset:8 (520)
+
+        // 5. Straddling ds_read2_b32 at 508 (in-bounds) and 512 (OOB) -> v[13:14].
+        body.extend(ds(0x37, 0x0100, 3, 0, 0, 13));
+
+        // 6. OOB ds_read_b32 at 512 -> v15 = 0; in-bounds ds_read_b32 at 0 -> v16 = 0x1122_3344.
+        body.extend(ds(0x36, 0, 4, 0, 0, 15));
+        body.extend(ds(0x36, 0, 2, 0, 0, 16));
+
+        // 7. Sub-dword reads: in-bounds ds_read_u8 at byte 1 -> 0x33 (v17), OOB ds_read_u8 -> 0 (v18),
+        // in-bounds ds_read_i8 at byte 509 (0xBA = -70) -> 0xFFFF_FFBA (v19),
+        // OOB ds_read_u16_d16_hi into v20 = 0x5555_6666 -> 0x0000_6666 (high half zeroed, low half kept).
+        body.extend(ds(0x3a, 0, 6, 0, 0, 17));
+        body.extend(ds(0x3a, 0, 4, 0, 0, 18));
+        body.extend(ds(0x39, 0, 7, 0, 0, 19));
+        body.extend(v_mov_imm(20, 0x5555_6666));
+        body.extend(ds(0xa7, 0, 8, 0, 0, 20));
+
+        for (slot, reg) in (11u8..=20).enumerate() {
+            body.extend(buf_store_dword(reg, 1, 12, (slot * 4) as u16));
+        }
+
+        w.extend([
+            0x7D84_0080,                       // v_cmp_eq_u32 vcc_lo, 0, v0
+            0xBE82_3C6A,                       // s_and_saveexec_b32 s2, vcc_lo
+            0xBF88_0000 | (body.len() as u32), // s_cbranch_execz -> restore
+        ]);
+        w.extend(body);
+        w.push(0x887E_027E); // s_or_b32 exec_lo, exec_lo, s2
+        w.push(S_ENDPGM);
+
+        let cs = compile_lds_cs(&w, false, 24, 1, [64, 1, 1]).unwrap();
+        #[cfg(windows)]
+        {
+            let _one = super::valu_tests::ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let addrs = [0u32, 508, 512, 0xFFFF_FFF0, 1, 509, 602];
+            for (label, warp) in [("hardware", false), ("warp", true)] {
+                let Ok(host) = super::host::Host::new(warp) else {
+                    continue;
+                };
+                let (root, pso) = host.compute_pipeline(&cs).unwrap();
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &super::host::Dispatch {
+                            roots: vec![(0, super::host::Root::Constants(vec![0]))],
+                            views: &[
+                                super::host::View::Buffer {
+                                    data: &addrs,
+                                    stride: super::host::Stride::Raw,
+                                },
+                                super::host::View::RawUav(64),
+                            ],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    &out[0][..10],
+                    &[
+                        0,             // v11: OOB ds_add_rtn_u32 returns 0
+                        0,             // v12: OOB ds_max_rtn_f32 returns 0
+                        0xCAFE_BABE,   // v13: ds_read2_b32 in-bounds first dword (lds[127])
+                        0,             // v14: ds_read2_b32 OOB second dword (512)
+                        0,             // v15: OOB ds_read_b32 (512)
+                        0x1122_3344,   // v16: lds[0] completely untouched by OOB writes/atomics
+                        0x33,          // v17: in-bounds ds_read_u8 at byte 1
+                        0,             // v18: OOB ds_read_u8 at byte 512
+                        -70i32 as u32, // v19: in-bounds sign-extended ds_read_i8 at byte 509 (0xBA)
+                        0x0000_6666, // v20: OOB ds_read_u16_d16_hi zeroes high half, keeps low half
+                    ],
+                    "backend: {label}"
+                );
+            }
+        }
+    }
+
+    /// Under a divergent `EXEC` mask, an inactive lane keeps its previous
+    /// destination register, an active OOB lane gets `0` without touching
+    /// `lds[0]`, and an active in-bounds lane updates `lds[0]` and receives the
+    /// old value.
+    #[test]
+    fn lds_atomic_under_exec_mask_preserves_inactive_lane_and_zeros_oob_active_lane() {
+        let mut w = vec![
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF408_0200,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[0:1], 0x0   (SRV)
+            0xF408_0300,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[0:1], 0x20 (UAV)
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0 (lane byte offset = v0 * 4)
+        ];
+        // Seed lds[0] = 0x50, then synchronize all 64 lanes.
+        w.extend(v_mov_imm(3, 0));
+        w.extend(v_mov_imm(4, 0x50));
+        w.extend(ds(0x0d, 0, 3, 4, 0, 0)); // ds_write_b32 v3, v4
+        w.push(0xBF8A_0000); // s_barrier
+
+        // Load per-lane LDS target byte address from SRV[v0] into v5, and set
+        // v2 = 0x1234_0000 + v0 before masking off lane 0.
+        w.extend(buf_load_dword(5, 1, 8, 0));
+        w.extend(v_mov_imm(2, 0x1234_0000));
+        w.push(0x6804_0002); // v_add_nc_u32 v2, v2, v0
+        w.extend(v_mov_imm(6, 0x10));
+
+        // Mask off lane 0 (`vcc_lo = (0 == v0)`; `exec_lo = ~vcc_lo & exec_lo`),
+        // run `ds_add_rtn_u32 v2, v5, v6` on lanes 1..63 (lane 2 in-bounds=0,
+        // all others OOB=512).
+        w.extend([
+            0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+            0xBE82_446A, // s_andn1_saveexec_b32 s2, vcc_lo
+            0xBF88_0002, // s_cbranch_execz 2
+        ]);
+        w.extend(ds(0x20, 0, 5, 6, 0, 2)); // ds_add_rtn_u32 v2, v5, v6
+        w.push(0x887E_027E); // s_or_b32 exec_lo, exec_lo, s2
+        w.push(0xBF8A_0000); // s_barrier
+
+        // Store per-lane `v2` at UAV[v0], and `lds[0]` at UAV[64].
+        w.extend(buf_store_dword(2, 1, 12, 0));
+        w.extend(ds(0x36, 0, 3, 0, 0, 7)); // ds_read_b32 v7, v3
+        w.extend(v_mov_imm(8, 64 * 4));
+        w.extend(buf_store_dword(7, 8, 12, 0));
+        w.push(S_ENDPGM);
+
+        let cs = compile_lds_cs(&w, false, 10, 1, [64, 1, 1]).unwrap();
+        #[cfg(windows)]
+        {
+            let _one = super::valu_tests::ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut addrs = [512u32; 64];
+            addrs[0] = 0; // lane 0 is masked off (inactive)
+            addrs[2] = 0; // lane 2 is active and in-bounds
+            for (label, warp) in [("hardware", false), ("warp", true)] {
+                let Ok(host) = super::host::Host::new(warp) else {
+                    continue;
+                };
+                let (root, pso) = host.compute_pipeline(&cs).unwrap();
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &super::host::Dispatch {
+                            roots: vec![(0, super::host::Root::Constants(vec![0]))],
+                            views: &[
+                                super::host::View::Buffer {
+                                    data: &addrs,
+                                    stride: super::host::Stride::Raw,
+                                },
+                                super::host::View::RawUav(260),
+                            ],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    out[0][0], 0x1234_0000,
+                    "{label}: inactive lane must preserve v2"
+                );
+                assert_eq!(
+                    out[0][1], 0,
+                    "{label}: active OOB lane 1 must receive 0 on _rtn"
+                );
+                assert_eq!(
+                    out[0][2], 0x50,
+                    "{label}: active in-bounds lane 2 receives old lds[0]"
+                );
+                for lane in 3..64 {
+                    assert_eq!(
+                        out[0][lane], 0,
+                        "{label}: active OOB lane {lane} must receive 0"
+                    );
+                }
+                assert_eq!(
+                    out[0][64], 0x60,
+                    "{label}: lds[0] incremented once, all 62 OOB atomics dropped"
+                );
+            }
+        }
+    }
+
+    /// Wave64-on-wave32 shaders allocate internal LDS scratch past the
+    /// program's `lds_dwords` (`halves`): unallocated LDS is still refused, and
+    /// an access at `lds_dwords` (the `halves` slot) is treated as OOB.
+    #[test]
+    fn wave64_protects_host_lds_scratch_and_refuses_unallocated_lds() {
+        struct WaveGuard;
+        impl Drop for WaveGuard {
+            fn drop(&mut self) {
+                super::lower::TEST_HOST_WAVE.set(None);
+            }
+        }
+        super::lower::TEST_HOST_WAVE.set(Some(32));
+        let _guard = WaveGuard;
+
+        // `ds_swizzle_b32` sets `console_lanes = true`, causing `Lower::new` to
+        // allocate the `halves` LDS slot (`s.lds_dwords = 1`) even though the
+        // console program itself allocated 0 bytes of LDS (`lds_blocks = 0`).
+        let mut unallocated = vec![0xBE81_0380, 0xF408_0300, 0xFA00_0020];
+        unallocated.extend(ds(0x35, 0, 0, 0, 0, 1)); // ds_swizzle_b32 v1, v0
+        unallocated.extend(ds(0x36, 0, 1, 0, 0, 2)); // ds_read_b32 v2, v1 (unallocated LDS!)
+        unallocated.extend(buf_store_dword(2, 1, 12, 0));
+        unallocated.push(S_ENDPGM);
+        let err = compile_lds_cs(&unallocated, true, 4, 0, [64, 1, 1])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("LDS the program does not allocate"),
+            "unexpected error: {err}"
+        );
+
+        // With 128 dwords (512 B) of program LDS, `halves` sits at dword 128
+        // (byte 512) when lowered to wave32 and holds `64` after `wave_base()`
+        // runs on `v0`; reading or writing byte 512 must neither leak nor
+        // overwrite `halves`.
+        let mut w = vec![
+            0xBE81_0380,
+            0xF408_0200,
+            0xFA00_0000,
+            0xF408_0300,
+            0xFA00_0020,
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0 (reads v0 -> populates `halves` at dword 128)
+        ];
+        w.extend(v_mov_imm(5, 0));
+        w.extend(buf_load_dword(2, 5, 8, 0)); // v2 = 512 (dword 128, `halves` slot)
+        w.extend(ds(0x36, 0, 2, 0, 0, 3)); // ds_read_b32 v3, v2 -> must be 0, not `halves` (64)
+        w.extend(v_mov_imm(4, 0xDEAD_BEEF));
+        w.extend(ds(0x0d, 0, 2, 4, 0, 0)); // ds_write_b32 v2, v4 -> dropped
+        w.extend(buf_store_dword(3, 1, 12, 0)); // store per-lane v3 at UAV[v0]
+        w.push(S_ENDPGM);
+
+        // WaveSize(32) is emitted for wave64-on-wave32 with LDS; WARP refuses
+        // explicit WaveSize(32) PSOs, so execute on hardware GPU when present
+        // (`compile_lds_cs` already validates the container with `dxil.dll`).
+        let cs = compile_lds_cs(&w, true, 6, 1, [64, 1, 1]).unwrap();
+        #[cfg(windows)]
+        {
+            let _one = super::valu_tests::ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Ok(host) = super::host::Host::new(false) {
+                let (root, pso) = host.compute_pipeline(&cs).unwrap();
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &super::host::Dispatch {
+                            roots: vec![(0, super::host::Root::Constants(vec![0]))],
+                            views: &[
+                                super::host::View::Buffer {
+                                    data: &[512u32],
+                                    stride: super::host::Stride::Raw,
+                                },
+                                super::host::View::RawUav(256),
+                            ],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    &out[0][..64],
+                    &[0u32; 64],
+                    "dword past program LDS must not leak halves counter"
+                );
+            }
+        }
     }
 }

@@ -23,7 +23,9 @@
 
 Shaders are translated when the title creates a pipeline, from the bytes it
 passes, wherever it loaded them from (executable, archive, memory).
-Converting them ahead of time from files is only a warm-up.
+Converting them ahead of time from files is only a warm-up: `victory warm`
+translates every container it finds into the same cache entries a run
+looks up (docs/precompilacao-shaders.md).
 
 ## Crates
 

@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Md, Module, Ty, V};
+use super::bitcode::{Attr, Bin, Md, Module, Tag, Ty, V};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -48,6 +48,19 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 pub const VIEW_ADDRESSES: u32 = SLOT_STRIDES_COUNT * 4;
 /// Bytes of the whole [`SLOT_STRIDES`] buffer.
 pub const SLOT_STRIDES_BYTES: u32 = VIEW_ADDRESSES + SLOT_STRIDES_COUNT * 8;
+
+/// Title addresses of the buffer views of the view heap by slot, for
+/// console code that reads a descriptor's address out of a table at an
+/// index it computes (ray-tracing structures and the programs that walk
+/// them) and finds no root view to ask the host about. Two dwords per
+/// slot: the title address of the view's first byte. Slots without a
+/// buffer view read zero. Like [`SLOT_STRIDES`], the host readies the
+/// buffer views of the whole heap when a shader has this root SRV.
+pub const SLOT_VIEWS: u8 = 252;
+/// Slots of the [`SLOT_VIEWS`] buffer (heap indices are clamped to it).
+pub const SLOT_VIEWS_COUNT: u32 = SLOT_STRIDES_COUNT;
+/// Byte stride of a view entry: address low and high, byte length, and stride.
+pub const SLOT_VIEW_BYTES: u32 = 4 * size_of::<u32>() as u32;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
@@ -108,6 +121,17 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// the group's width. Asked for by the structure builder's programs
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+/// `RootType::Other` code of a user-data dword the host computes, for a
+/// compute program that reads its group id x: dword 0 the groups per row of
+/// a dispatch spread across z (0: not spread), dword 1 the x group count
+/// the title asked for. A dispatch of more than 65,535 groups in x (the
+/// most Direct3D 12 runs) runs as `(row, y, rows)`; the program takes group
+/// `(x + z * row, y, 0)` and leaves at once past the asked count. (After
+/// upstream VIctory pull request #2312, Xvania7; run 319 measured indirect
+/// compute records asking 115,200 groups, clamped to 65,535 before.)
+/// (0x107 in this tree: 0x104 and 0x105 are [`USER_ROOT_ADDRESS`]'s two
+/// words and 0x106 is [`USER_DISPATCH_THREADS_X`]; upstream has it at 0x104.)
+pub const USER_DISPATCH_SPREAD: u32 = 0x107;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -252,6 +276,10 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    /// Root UAV slots through which an emitted operation may write.
+    pub written_root_uavs: Vec<u8>,
+    /// A translated store or atomic can write through the guest page directory.
+    pub writes_guest_memory: bool,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -309,6 +337,8 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            written_root_uavs: Vec::new(),
+            writes_guest_memory: false,
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -342,6 +372,16 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
+        // Raw root UAVs are also legal inputs. Only a read through a handle
+        // is known to leave it unchanged; any other use, including atomics,
+        // is treated conservatively.
+        if !matches!(opcode, 68 | 72 | 139) // BufferLoad, GetDimensions, RawBufferLoad
+            && let Some(first) = args.first()
+            && let Some(&(slot, _)) = self.root_uavs.iter().find(|(_, h)| h == first)
+            && !self.written_root_uavs.contains(&slot)
+        {
+            self.written_root_uavs.push(slot);
+        }
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
@@ -425,6 +465,27 @@ impl Shader {
         h
     }
 
+    /// Loads the four dwords of one entry in the host view-address table.
+    pub fn read_view_slot(&mut self, block: usize, slot: V) -> V {
+        let last = self.m.i32(SLOT_VIEWS_COUNT - 1);
+        let slot = self.op(block, "binary.i32", Attr::ReadNone, self.t.i32, 40, &[slot, last]);
+        self.m.tag(slot, Tag::Clamp);
+        let stride = self.m.i32(SLOT_VIEW_BYTES);
+        let byte = self.m.bin(block, Bin::Mul, slot, stride);
+        let handle = self.root_srv_handle(SLOT_VIEWS);
+        let unused = self.m.undef(self.t.i32);
+        let mask = self.m.i8(0xf);
+        let alignment = self.m.i32(4);
+        self.op(
+            block,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.t.res_ret,
+            139,
+            &[handle, byte, unused, mask, alignment],
+        )
+    }
+
     /// The handle of the root UAV (a raw buffer) of root parameter `slot`:
     /// `u<slot>` in [`ROOT_CBV_SPACE`].
     pub fn root_uav_handle(&mut self, slot: u8) -> V {
@@ -452,6 +513,7 @@ impl Shader {
 
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
+    /// A handle to the static sampler at `n`.
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
         let bind = [
             self.m.i32(n),
@@ -474,6 +536,36 @@ impl Shader {
         } else {
             0
         };
+        self.annotate(block, h, 14 | cmp, 0)
+    }
+
+    /// A handle to the static sampler at `lo..=hi` picked by `index`: the
+    /// console compiler chooses between two immediate samplers on a branch,
+    /// and D3D12's static sampler registers can be indexed within one range.
+    pub fn sampler_range_handle(&mut self, block: usize, lo: u32, hi: u32, index: V) -> V {
+        let bind = [
+            self.m.i32(lo),
+            self.m.i32(hi),
+            self.m.i32(SAMPLER_SPACE),
+            self.m.i8(3), // sampler
+        ];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        // The index comes from a per-lane branch condition.
+        let f = self.m.bool(true);
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, index, f],
+        );
+        let mut cmp = 0;
+        for n in lo..=hi {
+            if self.cmp_samplers >> n & 1 != 0 {
+                cmp = 0x8000;
+            }
+        }
         self.annotate(block, h, 14 | cmp, 0)
     }
 
@@ -783,6 +875,15 @@ impl Shader {
         }
 
         let graphics = self.threads.is_none() || self.mesh.is_some();
+        // DXIL requires every signature element packed into the same row to
+        // share one interpolation mode. Integer / SV_IsFrontFace elements must
+        // stay constant (1); otherwise a read element's mode wins over unread
+        // siblings in the same row.
+        if self.pixel {
+            reconcile_row_interp(&mut self.inputs);
+        } else if graphics {
+            reconcile_row_interp(&mut self.outputs);
+        }
         if graphics {
             // shortcut: every output is declared to depend on every input; the
             // exact sets need a dependence pass. Drivers read this state.
@@ -1039,5 +1140,194 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+/// Ensures elements sharing a signature row declare one DXIL interpolation
+/// mode. Any integer or `SV_IsFrontFace` element forces the row to `constant`
+/// (`1`); otherwise, a used element's mode overrides unread siblings.
+fn reconcile_row_interp(elems: &mut [SigElement]) {
+    let mut row_mode: std::collections::HashMap<u32, (bool, Option<u8>)> =
+        std::collections::HashMap::new();
+    for e in elems.iter() {
+        let Some(row) = e.row else { continue };
+        if e.interp == 0 {
+            continue;
+        }
+        let entry = row_mode.entry(row).or_insert((false, None));
+        if e.kind == 13 || e.comp != 9 {
+            entry.0 = true;
+        } else if e.usage != 0 && entry.1.is_none() {
+            entry.1 = Some(e.interp);
+        }
+    }
+    for e in elems.iter_mut() {
+        let Some(row) = e.row else { continue };
+        if e.interp == 0 {
+            continue;
+        }
+        if let Some(&(force_const, used_mode)) = row_mode.get(&row) {
+            if force_const {
+                e.interp = 1;
+            } else if e.usage == 0
+                && let Some(m) = used_mode
+            {
+                e.interp = m;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn the_view_table_loads_each_slot_at_its_own_address() {
+        use crate::emit::bitcode::Term;
+        use crate::emit::host::{Dispatch, Host, Root, View};
+        use crate::emit::{HostShader, HwStage};
+
+        let _guard = crate::emit::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Ok(host) = Host::new(true) else {
+            eprintln!("no SM 6.6 WARP adapter; skipped");
+            return;
+        };
+        let mut s = Shader::new(false);
+        s.threads = Some([2, 1, 1]);
+        let block = s.entry;
+        let thread = s.op(
+            block,
+            "flattenedThreadIdInGroup.i32",
+            Attr::ReadNone,
+            s.t.i32,
+            96,
+            &[],
+        );
+        let entry = s.read_view_slot(block, thread);
+        let [address_low, address_high, length, stride] =
+            [0, 1, 2, 3].map(|word| s.m.extract(block, entry, word));
+        let zero = s.m.i32(0);
+        let output = s.heap_handle(block, zero, false, false, (11 | 0x1000, 0));
+        let output_stride = s.m.i32(16);
+        let offset = s.m.bin(block, Bin::Mul, thread, output_stride);
+        let unused = s.m.undef(s.t.i32);
+        let mask = s.m.i8(0xf);
+        let alignment = s.m.i32(4);
+        s.op(
+            block,
+            "rawBufferStore.f32",
+            Attr::NoUnwind,
+            s.t.void,
+            140,
+            &[output, offset, unused, address_low, address_high, length, stride, mask, alignment],
+        );
+        s.m.terminate(block, Term::Ret);
+        let shader = HostShader {
+            stage: HwStage::Cs,
+            root_srvs: vec![SLOT_VIEWS],
+            dxil: s.finish(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_uavs: Vec::new(),
+            written_root_uavs: Vec::new(),
+            writes_guest_memory: false,
+            root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
+        };
+        let data = [0x1020_3040, 0x100, 320, 20, 0x5060_7080, 0x200, 768, 24];
+        let (root, pipeline) = host.compute_pipeline(&shader).expect("view table pipeline");
+        let read = host
+            .dispatch(
+                &root,
+                &pipeline,
+                &Dispatch {
+                    roots: vec![(1, Root::View { srv: true, data: data.to_vec() })],
+                    views: &[View::RawUav(8)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("view table dispatch");
+        assert_eq!(read[0], data);
+    }
+
+    fn elem(name: &str, kind: u8, comp: u8, interp: u8, row: u32, col: u8, usage: u8) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp,
+            interp,
+            row: Some(row),
+            col,
+            cols: 1,
+            usage,
+            half: false,
+        }
+    }
+    #[test]
+    fn only_the_written_root_uavs_need_a_guest_writeback() {
+        let mut s = Shader::new(false);
+        let input = s.root_uav_handle(1);
+        let output = s.root_uav_handle(2);
+        let counter = s.root_uav_handle(3);
+        let (zero, one, mask, align) = (s.m.i32(0), s.m.i32(1), s.m.i8(1), s.m.i32(4));
+        let undef = s.m.undef(s.t.i32);
+        for handle in [input, output] {
+            s.op(
+                s.entry,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                s.t.res_ret,
+                139,
+                &[handle, zero, undef, mask, align],
+            );
+        }
+        s.op(
+            s.entry,
+            "rawBufferStore.i32",
+            Attr::NoUnwind,
+            s.t.void,
+            140,
+            &[output, zero, undef, one, undef, undef, undef, mask, align],
+        );
+        s.op(
+            s.entry,
+            "atomicBinOp.i32",
+            Attr::NoUnwind,
+            s.t.i32,
+            78,
+            &[counter, zero, zero, undef, undef, one],
+        );
+        s.op(
+            s.entry,
+            "atomicCompareExchange.i32",
+            Attr::NoUnwind,
+            s.t.i32,
+            79,
+            &[counter, zero, undef, undef, zero, one],
+        );
+        assert_eq!(s.written_root_uavs, [2, 3]);
+    }
+
+    #[test]
+    fn reconcile_row_interp_matches_constant_and_used_siblings() {
+        let mut elems = vec![
+            elem("TEXCOORD", 0, 9, 2, 7, 0, 0),
+            elem("SV_IsFrontFace", 13, 5, 1, 7, 1, 1),
+            elem("TEXCOORD", 0, 9, 2, 8, 0, 0),
+            elem("TEXCOORD", 0, 9, 3, 8, 1, 1),
+        ];
+        reconcile_row_interp(&mut elems);
+        assert_eq!(elems[0].interp, 1);
+        assert_eq!(elems[1].interp, 1);
+        assert_eq!(elems[2].interp, 3);
+        assert_eq!(elems[3].interp, 3);
     }
 }

@@ -59,6 +59,34 @@ the frame now is the one thread that submits the title's work to the card
 | `VICTORY_AMBIENT_SETTLE` | How fast light settles after walking indoors (on by default, `250,3`; `0` turns it off) |
 | `VICTORY_TEXTURE_STORE=1` | Converted textures kept between runs (about 8 ms a frame for now: off) |
 
+### Switches merged from fxceless/victory-fork (2026-11-26)
+
+Off by default unless noted. The numbers are their author's, on their machine (an RTX 4070 and the
+first boat mission); their README is the source of each.
+
+| Switch | What it does |
+|---|---|
+| `VICTORY_PARALLEL_REFRESH=1` | A submission's texture checks run side by side on the helper threads: 8.7 and 9.4 ms less of the preparing thread's work a frame |
+| `VICTORY_SETTLE_ROOM=1` | Flights get more room before they are settled: the preparing thread waits 4.6 ms a frame for the card instead of 17.7 |
+| `VICTORY_HEAP_WORKER=1` | The texture pass on a thread of its own (pull request #1007): 6.2-6.7 to 8.65-9.53 world fps |
+| `VICTORY_LOOKUP_CACHE=1` | Asks for a buffer's host copy answered without the lock (pull request #1237): about 14 ms a frame |
+| `VICTORY_FILLS_PLAIN=1` | With `VICTORY_COPY_PLAIN=1`: a list's fills under 256 bytes copied in place (estimated 3 ms a frame, not measured) |
+| `VICTORY_STEP_INDEX=1` | A step's copy found by an index instead of a lock and a search (estimated 1.5-4 ms a frame, not measured) |
+| `VICTORY_LIGHT_REFRESH=1` | With `VICTORY_ABSENT_ONCE=1 VICTORY_ABSENT_MS=told`: a refresh of blocks known unwritten answered with no lock and no kernel call (not measured) |
+| `VICTORY_QUEUE2=1` | Fetches of what shaders wrote go to a copy queue (copy-back wait about 125 to 7 ms a frame) |
+| `VICTORY_INDIRECT_GATHER=1` | An indirect record that misses its window gets a scratch slot, clamped in one pass per list |
+| `VICTORY_TEXTURE_BACK=1` | Textures of the ocean's kinds that shaders write go back to title memory (pull request #999): boats float |
+| `VICTORY_BVH_NO_HIT=1` | Ray-traced passes with nothing built answer "no hit" at the first node test (translator change: cache rebuilt once) |
+| `VICTORY_DISPATCH_SPREAD` | Compute dispatches of more than 65,535 groups spread across z (after upstream pull request #2312; on there, costs nothing measurable) |
+| `VICTORY_TARGET_VARIANTS=0` | Turns off the pipeline made for the bound render-target format when a pipeline declares another (on by default) |
+| `VICTORY_REASK_BLANK=1` | Texture slots that read zeros for good are asked again (diagnostics builds) |
+| `VICTORY_REAPER`, `VICTORY_BAKE_SOURCES`, `VICTORY_RETIRE_LEAN` | Host objects let go on a thread of their own; skin-bake textures uploaded before the draw (pull request #1264); slot rewrites let go at once (measured slower) |
+| `VICTORY_WIDE_REFRESH`, `VICTORY_VIEW_KNOWN`, `VICTORY_CARD_HASH_WIDE`, `VICTORY_NEAR_WRITES`, `VICTORY_SYNC_BESIDE`, `VICTORY_HEAP_SYNC_CUT` | Measured at no gain there, left off |
+| `VICTORY_DENY_PIPELINES`, `VICTORY_CARD_METER`, `VICTORY_CARD_METER_PIPELINES`, `VICTORY_FPS_COUNTER=0`, `VICTORY_VIDEO_LOOK=0`, `VICTORY_RENDERDOC=<dll>` | Instruments: a pipeline never built; the card's time by pipeline; no fps in the caption; no video-memory line a second; RenderDoc hook |
+| `VICTORY_REMAP_METER=0` | The page-mapping meter of the frame log (counts and lengths always) stops reading thread cycles around each map and unmap call (on by default) |
+| `VICTORY_CLZERO_LOOP15=0` | The title's 15-byte `clzero` loop is no longer emulated whole in one fault (on by default) |
+| `VICTORY_DISK_CORES=slow` | DirectStorage workers asked to keep to the slow cores (not measured) |
+
 What is known to be wrong:
 
 - Trees, signs and far objects flicker in the distance in some places.

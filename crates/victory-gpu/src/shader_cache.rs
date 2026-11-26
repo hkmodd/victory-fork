@@ -24,7 +24,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// The encoding of entries ([`encode`]), part of the key.
-const FORMAT: u32 = 2;
+const FORMAT: u32 = 3;
 
 use victory_pipeline::{Cache, Converter};
 use victory_shader::emit::{HostShader, StaticSampler, UserData};
@@ -124,6 +124,7 @@ fn build() -> [u8; 32] {
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
             "VICTORY_BVH_MISS",
+            "VICTORY_BVH_NO_HIT",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -174,11 +175,14 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate, refresh_in_runs()),
         None => translate(container),
     }
+}
+
+fn translate(container: &[u8]) -> Result<HostShader, String> {
+    victory_shader::emit::translate(container).map_err(|e| e.to_string())
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -276,7 +280,7 @@ fn cached_by(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH2";
+const MAGIC: &[u8; 4] = b"VSH4";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -354,10 +358,11 @@ fn encode(s: &HostShader, source: &str) -> Vec<u8> {
             word(&mut out, v);
         }
     }
-    for slots in [&s.root_cbvs, &s.root_srvs, &s.root_uavs] {
+    for slots in [&s.root_cbvs, &s.root_srvs, &s.root_uavs, &s.written_root_uavs] {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    word(&mut out, u32::from(s.writes_guest_memory));
     word(&mut out, s.root_indexed_views.len() as u32);
     for view in &s.root_indexed_views {
         for value in [
@@ -369,6 +374,11 @@ fn encode(s: &HostShader, source: &str) -> Vec<u8> {
         ] {
             word(&mut out, value);
         }
+    }
+    word(&mut out, s.half_views.len() as u32);
+    for &(slot, dword) in &s.half_views {
+        word(&mut out, u32::from(slot));
+        word(&mut out, dword);
     }
     out
 }
@@ -429,6 +439,12 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
+    let written_root_uavs = r.list()?;
+    let writes_guest_memory = match r.word()? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
     let n = r.word()? as usize;
     let mut root_indexed_views = Vec::with_capacity(n.min(256));
     for _ in 0..n {
@@ -440,6 +456,11 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
+    let n = r.word()? as usize;
+    let mut half_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
     r.0.is_empty().then_some((
         HostShader {
         stage,
@@ -450,7 +471,10 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        written_root_uavs,
+        writes_guest_memory,
         root_indexed_views,
+        half_views,
         },
         made_by,
     ))
@@ -479,7 +503,9 @@ mod tests {
             ])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
-            root_uavs: vec![1],
+            root_uavs: vec![1, 2],
+            written_root_uavs: vec![2],
+            writes_guest_memory: true,
             root_indexed_views: vec![RootIndexedView {
                 table_slot: 1,
                 constant_slot: 2,
@@ -487,6 +513,7 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
+            half_views: vec![(0, 8), (4, 0)],
         }
     }
 
@@ -511,7 +538,7 @@ mod tests {
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH2 broken").unwrap();
+            std::fs::write(e, b"VSH4 broken").unwrap();
         }
         assert_eq!(cached(&cache, &build, container, translate, false), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
@@ -539,6 +566,9 @@ mod tests {
     fn entries_round_trip_and_reject_damage() {
         let bytes = encode(&shader(), "made by");
         assert_eq!(decode(&bytes), Some((shader(), b"made by".to_vec())));
+        let mut read_only = shader();
+        read_only.writes_guest_memory = false;
+        assert_eq!(decode(&encode(&read_only, "made by")), Some((read_only, b"made by".to_vec())));
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);

@@ -39,7 +39,13 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       # Includes xtask's repository_passes_policy, the asset-policy check.
-      - run: cargo test --workspace --locked
+      - name: Tests
+        run: cargo test --workspace --locked --exclude victory-gpu
+      # The runner has no card, so these tests make their devices on Microsoft's software
+      # renderer, whose shader compiler has crashed the test program (access violation in
+      # d3d10warp) when several tests used it at once. One test at a time has not shown it.
+      - name: Tests, victory-gpu (one at a time)
+        run: cargo test -p victory-gpu --locked -- --test-threads=1
 
   test-diagnostics:
     name: Diagnostics tests
@@ -50,6 +56,27 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-features --locked -- --test-threads=1
+
+  # The crates that do not need Windows (the shader translator, formats,
+  # PE reader, cache, config, title formats and the asset-policy check),
+  # on Linux: fast feedback for translator work, and a way to run these
+  # tests without a Windows machine. GPU and validator tests stay on the
+  # Windows job (they are compiled out here).
+  portable:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PORTABLE: >-
+        -p victory-core -p victory-pe -p victory-pipeline -p victory-shader
+        -p victory-formats -p victory-game -p xtask
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy $PORTABLE --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test $PORTABLE --locked
 
   check:
     needs: [clippy, test-default, test-diagnostics]

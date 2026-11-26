@@ -217,6 +217,8 @@ pub(crate) struct Ready {
     pub(crate) faults: u64,
     /// The view heap slot of the null view; copy `n`'s view is `n` further.
     pub(crate) base: u32,
+    /// Last numbered copy this draw prepared.
+    pub(crate) count: u32,
 }
 
 impl Memory {
@@ -1067,6 +1069,7 @@ pub(crate) fn ready(
         directory: directory.gpu(directory.span().0),
         faults: m.faults.2,
         base,
+        count: m.copies.len() as u32,
     })
 }
 
