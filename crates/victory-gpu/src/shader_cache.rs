@@ -139,7 +139,9 @@ fn build() -> [u8; 32] {
         // infinity). Only when on, so the translations cached without it
         // keep their key.
         if std::env::var_os("VICTORY_NAN_SCRUB").is_some_and(|v| v == "1") {
-            bytes.extend_from_slice(b"VICTORY_NAN_SCRUB=1");
+            // "floats": the form that leaves integer bits alone (the first
+            // form's translations, cached by run avmns1, drew black).
+            bytes.extend_from_slice(b"VICTORY_NAN_SCRUB=1 floats");
         }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
