@@ -655,6 +655,15 @@ pub fn emit(
                     | [0xd3, 0x2c, 0xbc, 0xbf, 0xff, 0x6a, 0x0c, 0x04, 0x80, 0xb5, 0x06, 0xd8, 0xf7, 0xd6, 0x58, 0xf9]
             );
         let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1") || WAVE_WIDE_HERE.get();
+        // CS_DefragHeap_ComputeRelocations: a group of two console waves. Its
+        // divergent LDS is read and written in one region, so it only lowers
+        // once that region is taken by both halves of a wave. The other wave
+        // of the group does not wait (`with_half_meets`). Not the global switch.
+        let defrag = c.digest
+            == [
+                0x50, 0xcf, 0x28, 0x32, 0x8b, 0x58, 0x05, 0x3d, 0xa8, 0x9a, 0x8d, 0xa0, 0x1a, 0xa1,
+                0x23, 0xc6,
+            ];
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
@@ -688,7 +697,7 @@ pub fn emit(
                 // Still stopped where not every lane runs: the per-lane branches around
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.
-                if wide_on || driver_loop {
+                if wide_on || driver_loop || defrag {
                     let bases = [
                         deep.as_ref().map(|f| &f.0),
                         forms[1].1.as_ref().map(|f| &f.0),
@@ -696,7 +705,11 @@ pub fn emit(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why, driver_loop);
+                        let again = if defrag {
+                            lower::with_half_meets(|| widen(c, native, base, why, driver_loop))
+                        } else {
+                            widen(c, native, base, why, driver_loop)
+                        };
                         report("wave-wide branches", &again);
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
@@ -851,6 +864,9 @@ fn widen(
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        // One program only: two console waves, and a meet per wave instead of a group barrier.
+        crate::native::StageIo::Cs(cs)
+            if lower::half_meets() && cs.threads.iter().product::<u32>() == 128 => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
