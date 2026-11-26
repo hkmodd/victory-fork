@@ -186,11 +186,11 @@ fn version_number(file: &str) -> Option<u64> {
     (n > 0 && format!("v{n}") == file).then_some(n)
 }
 
-/// The names in version folder `dir`: container, display, blobs; `None` if
-/// its manifest is missing or does not parse, or a blob it lists is missing.
-/// Any other error is the disk's (a file held by another process, say), not
-/// the save's, and is returned.
-fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
+/// The names in version folder `dir`: container, display, blobs, and
+/// whether every blob it lists is there; `None` if its manifest is missing
+/// or does not parse. Any other error is the disk's (a file held by another
+/// process, say), not the save's, and is returned.
+fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>, bool)>> {
     let bytes = match std::fs::read(dir.join(MANIFEST)) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -202,16 +202,17 @@ fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
     let blobs = names.split_off(2);
     let [name, display] = <[String; 2]>::try_from(names).expect("two names, checked by the parser");
     // A missing blob is damage too: taking this version would remove the
-    // older intact ones, and the blob would read as empty.
+    // older intact ones, and the blob would read as empty ([`current`]).
+    let mut intact = true;
     for i in 0..blobs.len() {
         match std::fs::metadata(dir.join(i.to_string())) {
             Ok(meta) if meta.is_file() => {}
-            Ok(_) => return Ok(None),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Ok(_) => intact = false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => intact = false,
             Err(e) => return Err(e),
         }
     }
-    Ok(Some((name, display, blobs)))
+    Ok(Some((name, display, blobs, intact)))
 }
 
 /// The container's newest readable committed version, if any. Removes what
@@ -242,11 +243,25 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     if committed.is_empty() {
         return Ok(None);
     }
+    // The newest version with a blob gone: the save only if no older one is
+    // intact (that blob then reads as missing; refusing the version would
+    // lose every other blob). Never removed for that.
+    let mut damaged = None;
     for (at, &number) in committed.iter().enumerate() {
         let version = dir.join(format!("v{number}"));
-        let Some((name, display, blobs)) = load(&version)? else {
+        let Some((name, display, blobs, intact)) = load(&version)? else {
             continue;
         };
+        if !intact {
+            damaged.get_or_insert(Version {
+                dir: version,
+                highest,
+                name,
+                display,
+                blobs,
+            });
+            continue;
+        }
         // Older versions are removed as far as that goes. The readable
         // version is the container whatever is left below it, and a file
         // another program holds without letting it be deleted (a virus
@@ -266,6 +281,9 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
             display,
             blobs,
         }));
+    }
+    if damaged.is_some() {
+        return Ok(damaged);
     }
     // Versions exist but none reads: keep them all, and refuse.
     Err(std::io::Error::new(
@@ -573,15 +591,24 @@ fn read(c: &Container, names: Option<Vec<String>>) -> Result<Vec<(String, Vec<u8
     let version = current_named(&c.dir, &c.name)
         .map_err(|e| io_error(&c.dir, &e))?
         .ok_or(BLOB_NOT_FOUND)?;
+    let all = names.is_none();
     let names = names.unwrap_or_else(|| version.blobs.clone());
-    names
+    // A blob whose file is gone (a version taken with it missing,
+    // [`current`]) is not there: left out of a read of all blobs, not found
+    // when asked for by name.
+    let read: Result<Vec<_>, HRESULT> = names
         .into_iter()
         .map(|name| {
             let i = version.blobs.iter().position(|b| *b == name).ok_or(BLOB_NOT_FOUND)?;
-            let data = std::fs::read(version.blob(i)).map_err(|e| io_error(&c.dir, &e))?;
-            Ok((name, data))
+            match std::fs::read(version.blob(i)) {
+                Ok(data) => Ok(Some((name, data))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && all => Ok(None),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(BLOB_NOT_FOUND),
+                Err(e) => Err(io_error(&c.dir, &e)),
+            }
         })
-        .collect()
+        .collect();
+    Ok(read?.into_iter().flatten().collect())
 }
 
 /// One blob as the public API lays it out: name, size, data.
@@ -1570,5 +1597,24 @@ mod tests {
         assert_eq!(chosen.dir, v1);
         assert_eq!(state(root), old_state());
         assert!(v1.is_dir() && v2.is_dir());
+    }
+
+    /// The only version, its manifest readable but a blob gone (an antivirus
+    /// or a sync client took the file): with no older intact version to go
+    /// back to, it is still the save. Refusing it would lose every blob for
+    /// the one that is gone.
+    #[test]
+    fn a_lone_version_with_a_blob_gone_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+        let slot = container_dir(root, "Slot");
+        std::fs::remove_file(slot.join("v1").join("1")).unwrap();
+
+        let c = Provider { root: root.into() }.container("Slot");
+        assert!(read(&c, None).is_ok(), "the save reads");
+        assert_eq!(update(root, "two", &[("b", Some("new b"))]), S_OK, "the save updates");
+        let blobs = vec![("a".into(), "old a".into()), ("b".into(), "new b".into())];
+        assert_eq!(state(root), Some(("two".into(), blobs)));
     }
 }
