@@ -3368,72 +3368,8 @@ fn note_beside(noted: &mut std::collections::HashMap<(usize, u32), u64>, fetched
 }
 
 #[cfg(test)]
-mod relay_tests {
-    use super::{fetched_beside, flagged_pieces, landable, note_beside};
-
-    /// A piece fetched on the copy queue while a later flight was in the
-    /// air is fetched again by that flight, and by no flight sent after
-    /// the fetch had run; the note goes when its flights have landed.
-    #[test]
-    fn a_piece_fetched_beside_a_later_flight_is_fetched_again_by_it() {
-        let mut noted = std::collections::HashMap::new();
-        let (a, p) = (0x1000usize, 7u32);
-        // Flight 5 lands; its fetch ran while 6 and 7 had started.
-        assert_eq!(note_beside(&mut noted, &[(a, p)], 5, 7), 1);
-        assert!(fetched_beside(noted.get(&(a, p)).copied(), 6));
-        assert!(fetched_beside(noted.get(&(a, p)).copied(), 7));
-        // Flight 8 was sent after the fetch had run: its compare decides.
-        assert!(!fetched_beside(noted.get(&(a, p)).copied(), 8));
-        // Another piece was never noted.
-        assert!(!fetched_beside(noted.get(&(a, p + 1)).copied(), 6));
-        // Flight 6 lands and fetches it again, with 7 still in the air and
-        // nothing newer: the note stays for 7.
-        assert_eq!(note_beside(&mut noted, &[(a, p)], 6, 7), 1);
-        assert!(fetched_beside(noted.get(&(a, p)).copied(), 7));
-        // Flight 7 lands with nothing behind it: nothing is noted any more.
-        assert_eq!(note_beside(&mut noted, &[(a, p)], 7, 7), 0);
-        assert!(noted.is_empty());
-        // A fetch with nothing later in the air notes nothing.
-        assert_eq!(note_beside(&mut noted, &[(a, p)], 9, 9), 0);
-        assert!(noted.is_empty());
-    }
-
-    /// Two flights and what follows each: nothing of the second lands
-    /// before the card has run it, and nothing behind a flight lands
-    /// before the flight.
-    #[test]
-    fn flights_land_in_the_order_they_were_sent() {
-        // Flight (fence 5), its write, a signal, flight (fence 6), its write.
-        let line = [Some(5), None, None, Some(6), None];
-        assert_eq!(landable(&line, 4), 0);
-        assert_eq!(landable(&line, 5), 3);
-        assert_eq!(landable(&line, 6), 5);
-        assert_eq!(landable(&line, u64::MAX), 5);
-        // Signals with no flight ahead land at once; behind one they wait.
-        assert_eq!(landable(&[None, None], 0), 2);
-        assert_eq!(landable(&[None, Some(9), None], 8), 1);
-        assert_eq!(landable(&[], 3), 0);
-        // After the first three landed, the rest when its turn comes.
-        assert_eq!(landable(&line[3..], 5), 0);
-        assert_eq!(landable(&line[3..], 6), 2);
-    }
-
-    /// A piece flagged under one range of a plan is fetched under every
-    /// range that holds a part of it; pieces of other copies are not.
-    #[test]
-    fn a_piece_flagged_under_one_range_is_fetched_under_all() {
-        let (a, b) = (0x1000usize, 0x2000usize);
-        // Copy a: piece 3 under two ranges, flagged under the first only;
-        // piece 4 not flagged; copy b: piece 3 not flagged, piece 9 flagged.
-        let flags = [(a, 3, true), (a, 4, false), (a, 3, false), (b, 3, false), (b, 9, true)];
-        let fetch = flagged_pieces(&flags);
-        assert!(fetch.contains(&(a, 3)));
-        assert!(!fetch.contains(&(a, 4)));
-        assert!(!fetch.contains(&(b, 3)));
-        assert!(fetch.contains(&(b, 9)));
-        assert_eq!(fetch.len(), 2);
-    }
-}
+#[path = "host_relay_tests.rs"]
+mod relay_tests;
 
 /// The most host lists in the air before the flights are settled
 /// (`VICTORY_LATE_WAIT_LISTS`, 256; `=128` is the value before: with the
@@ -9221,7 +9157,14 @@ impl HostList {
                                 .texture_spans
                                 .insert(std::sync::Arc::as_ptr(staging) as *const () as usize, staging.memory());
                         }
-                        staging.refresh();
+                        if parallel_refresh() {
+                            // Checked with the others of the batch, several
+                            // at a time, before the next step that writes
+                            // title memory ([`Batch::check_textures`]).
+                            batch.due_textures.push(staging.clone());
+                        } else {
+                            staging.refresh();
+                        }
                     }
                     continue;
                 }
@@ -9383,6 +9326,10 @@ struct Batch {
     /// The title buffer copies the card does ahead of the submission's
     /// lists: destination's copy, source's copy, destination, source, bytes.
     card_copies: Vec<CardOp>,
+    /// With [`parallel_refresh`]: textures due a check, not checked yet
+    /// ([`Batch::check_textures`], before any write of ours and at every
+    /// flush).
+    due_textures: Vec<std::sync::Arc<crate::texture::Staging>>,
     /// With [`near_writes`]: the title memory (address, bytes) of the
     /// staging buffers in `textures`, by the same key. A texture without
     /// an entry is checked again after any write of ours.
@@ -9475,6 +9422,7 @@ impl Batch {
     /// Before a step that writes title memory: pending refreshes are done
     /// first, and textures are checked again after it.
     fn title_written(&mut self) {
+        self.check_textures();
         self.flush();
         self.textures.clear();
         self.texture_spans.clear();
@@ -9487,6 +9435,7 @@ impl Batch {
     /// in this submission that holds some of those bytes, the larger part
     /// beside them stays so.
     fn title_wrote(&mut self, at: usize, len: usize) {
+        self.check_textures();
         self.flush();
         self.textures.clear();
         self.texture_spans.clear();
@@ -9518,6 +9467,8 @@ impl Batch {
     /// pending, is done as before ([`Batch::title_wrote`]). Returns the
     /// written ranges (the place, and the other addresses of its pages).
     fn title_wrote_near(&mut self, at: usize, len: usize, run: bool) -> Vec<(usize, usize)> {
+        // Textures due a check read title memory as it is before the write.
+        self.check_textures();
         use std::sync::atomic::Ordering::Relaxed;
         const K64: usize = 1 << 16;
         let end = at.saturating_add(len);
@@ -9589,7 +9540,52 @@ impl Batch {
         written
     }
 
+    /// With [`parallel_refresh`]: checks the textures due ([`Batch::due_textures`])
+    /// on the helper threads (`crate::shadow::wide_run`, the submitting
+    /// thread among them), all done before it returns. Each check takes
+    /// its texture's own lock, the journal's for its asking, the runtime's
+    /// mapping lock for reading (shared), and a buffer of its thread's own;
+    /// the hashing and detiling run side by side. "textures N ms" counts
+    /// the time it took, not the threads' sum.
+    fn check_textures(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.due_textures.is_empty() {
+            return;
+        }
+        let due = std::mem::take(&mut self.due_textures);
+        PARALLEL_CHECKS[0].fetch_add(1, Relaxed);
+        PARALLEL_CHECKS[1].fetch_add(due.len() as u64, Relaxed);
+        if due.len() < 2 {
+            for staging in due {
+                staging.refresh();
+            }
+            return;
+        }
+        let started = std::time::Instant::now();
+        let before = PREPARING[2].load(Relaxed);
+        let jobs: Vec<Box<dyn FnOnce() + Send>> = due
+            .into_iter()
+            .map(|staging| Box::new(move || staging.refresh()) as Box<dyn FnOnce() + Send>)
+            .collect();
+        crate::shadow::wide_run(jobs);
+        let summed = PREPARING[2].load(Relaxed).saturating_sub(before);
+        let wall = started.elapsed().as_micros() as u64;
+        PREPARING[2].fetch_sub(summed.saturating_sub(wall), Relaxed);
+        PARALLEL_CHECKS[2].fetch_add(summed, Relaxed);
+        PARALLEL_CHECKS[3].fetch_add(wall, Relaxed);
+        let batches = PARALLEL_CHECKS[0].load(Relaxed);
+        if batches.is_multiple_of(1 << 14) {
+            let [b, n, sum, w] = [0, 1, 2, 3].map(|i| PARALLEL_CHECKS[i].load(Relaxed));
+            tracing::info!(
+                "texture checks side by side (VICTORY_PARALLEL_REFRESH) so far: {b} batches, {n} textures; the threads' sum {} ms, the time taken {} ms",
+                sum / 1000,
+                w / 1000
+            );
+        }
+    }
+
     fn flush(&mut self) {
+        self.check_textures();
         self.index.clear();
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
@@ -9783,6 +9779,52 @@ fn near_line() {
          refreshes done for them {done}, left pending {left}; textures left checked {kept}, checked again {again}"
     );
 }
+
+/// Whether a submission's texture checks (`crate::texture::Staging::refresh`:
+/// the write watch or guards asked, then the memory hashed and detiled if
+/// it may have changed) are gathered between writes of ours and run on the
+/// helper threads side by side (`VICTORY_PARALLEL_REFRESH=1`; off by
+/// default: one after the other where each texture's step stands; `alt`:
+/// twenty seconds with, twenty without, in turn, each change said in the
+/// log). Pair with `VICTORY_WIDE_REFRESH` for the host copies of buffers.
+///
+/// Why: "textures N ms" is 11-12 ms of a boat frame's preparing (runs
+/// 319-321, 28-30 MB hashed a frame), all on the submitting thread. The
+/// checks touch different textures; what they share is the journal's lock
+/// for the asking (short for write-watched memory, a guard walk for view
+/// memory), so the hashing and detiling are what goes side by side.
+///
+/// What changes: a texture's check moves from its step to the next write
+/// of ours or flush, so it reads title memory a little later in the
+/// preparing, and never after a write of ours that its lists come before.
+fn parallel_refresh() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_PARALLEL_REFRESH").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a submission's texture checks run side by side from now (VICTORY_PARALLEL_REFRESH=alt): {}",
+                    if on { "ON" } else { "off, one after the other as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Since the start, of [`Batch::check_textures`]: batches, textures, the
+/// threads' summed microseconds, the microseconds taken.
+static PARALLEL_CHECKS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// A fill's copy ([`Step::Fill`]): title memory at `src` into upload memory
 /// at `dst`. In place if it is short and [`fills_plain`] says so, else (and
