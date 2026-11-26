@@ -338,6 +338,7 @@ impl<W: Work> Lane<W> {
                 at.and_then(|at| Some((at, state.items.remove(at)?)))
             };
             let Some((at, next)) = next else {
+                STATS[BREAK_EMPTY].fetch_add(1, Relaxed);
                 break;
             };
             // (Back where it was: parts of one submission share a number.)
@@ -349,6 +350,7 @@ impl<W: Work> Lane<W> {
                     continue;
                 }
                 state.items.insert(at, next);
+                STATS[BREAK_FOLDED].fetch_add(1, Relaxed);
                 break;
             }
             let Entry { number, queue, what } = next;
@@ -480,22 +482,39 @@ impl Work for Job {
                     || crate::host::late_met_known(wait) == Some(true)
                     || hosts().any(|list| crate::host::will_meet(list, wait));
                 if !met {
+                    STATS[BREAK_VALUE].fetch_add(1, Relaxed);
                     return Err(next);
                 }
             }
             &Job::Wait(fence, value) => {
                 if crate::fence::completed(fence as This) < value && !signals.iter().any(|&(f, v)| f == fence && v >= value) {
+                    STATS[BREAK_WAIT].fetch_add(1, Relaxed);
                     return Err(next);
                 }
             }
             Job::Signal(..) => {}
             Job::Run(_, more, order) => {
                 let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| more[i].host()).collect();
-                if count >= most || lists.1.len() + runs.len() > most_lists || !crate::host::joinable(hosts(), &runs) {
+                let why = if count >= most {
+                    Some(BREAK_MOST)
+                } else if lists.1.len() + runs.len() > most_lists {
+                    Some(BREAK_LISTS)
+                } else if crate::host::steps_of_ours(&runs) {
+                    Some(BREAK_STEPS)
+                } else if !crate::host::joinable(hosts(), &runs) {
+                    Some(BREAK_BLOCKED)
+                } else {
+                    None
+                };
+                if let Some(why) = why {
+                    STATS[why].fetch_add(1, Relaxed);
                     return Err(next);
                 }
             }
-            Job::Joined(..) | Job::Present(..) | Job::Lists(..) => return Err(next),
+            Job::Joined(..) | Job::Present(..) | Job::Lists(..) => {
+                STATS[BREAK_OTHER].fetch_add(1, Relaxed);
+                return Err(next);
+            }
         }
         let taken = std::mem::replace(self, Job::Wait(0, 0));
         let (queue, mut lists, mut order, mut parts, mut signals) = match taken {
@@ -602,7 +621,7 @@ static QUEUED: AtomicU64 = AtomicU64::new(0);
 /// threads of the title waited, in microseconds, for room in the line, at a
 /// present, and for a drain, and the drains; what our thread worked; waits
 /// not met at a present.
-static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+static STATS: [AtomicU64; 20] = [const { AtomicU64::new(0) }; 20];
 const RUNS: usize = 0;
 const PRESENTS: usize = 1;
 const DEPTH: usize = 2;
@@ -615,6 +634,19 @@ const BUSY: usize = 8;
 const FORCED: usize = 9;
 /// Parts prepared together with the one before them.
 const JOINED: usize = 10;
+/// Why a join stopped (diag): nothing behind it yet in its queue, parts not
+/// known yet, a value wait not met, a fence wait not met, the most parts, the
+/// most lists, copies or runs of the CPU in the next, written bytes read by
+/// the next, another kind of job.
+const BREAK_EMPTY: usize = 11;
+const BREAK_FOLDED: usize = 12;
+const BREAK_VALUE: usize = 13;
+const BREAK_WAIT: usize = 14;
+const BREAK_MOST: usize = 15;
+const BREAK_LISTS: usize = 16;
+const BREAK_STEPS: usize = 17;
+const BREAK_BLOCKED: usize = 18;
+const BREAK_OTHER: usize = 19;
 
 /// How many submissions may be in the line when a submit call returns
 /// (`VICTORY_SUBMIT_DEPTH`; 64: about two frames of the title's).
@@ -856,6 +888,18 @@ pub(super) fn line(frames: f64) {
         s[DRAINS] / frames,
         s[FORCED] / frames,
         s[JOINED] / frames
+    );
+    tracing::info!(
+        "joins of submissions stopped, per frame: nothing behind yet {:.2}, parts not known {:.2}, a value wait {:.2}, a fence wait {:.2},          the most parts {:.2}, the most lists {:.2}, copies or runs of ours {:.2}, written bytes read {:.2}, another job {:.2}",
+        s[BREAK_EMPTY] / frames,
+        s[BREAK_FOLDED] / frames,
+        s[BREAK_VALUE] / frames,
+        s[BREAK_WAIT] / frames,
+        s[BREAK_MOST] / frames,
+        s[BREAK_LISTS] / frames,
+        s[BREAK_STEPS] / frames,
+        s[BREAK_BLOCKED] / frames,
+        s[BREAK_OTHER] / frames
     );
 }
 

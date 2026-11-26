@@ -3297,8 +3297,13 @@ fn joins_asked() -> (usize, usize) {
 /// before it and has not been sent: nothing done on the CPU for it reads what
 /// those give their shaders, write back or write when they are done, and it
 /// changes no title memory that they read ([`Step::Copy`], [`Step::Run`]).
+/// Whether one of `next` has copies or runs of ours on the CPU.
+pub(crate) fn steps_of_ours(next: &[&HostList]) -> bool {
+    next.iter().any(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Copy(..) | Step::Run(_))))
+}
+
 pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&HostList]) -> bool {
-    if next.iter().any(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Copy(..) | Step::Run(_)))) {
+    if steps_of_ours(next) {
         return false;
     }
     let ahead: Vec<&HostList> = ahead.collect();
