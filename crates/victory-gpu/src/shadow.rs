@@ -5649,32 +5649,84 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
+    // Buffers come in powers of two, so one let go serves the next view of
+    // its class (ring positions change every frame: hundreds of new
+    // addresses a frame, run avmup5).
+    let class = len.next_power_of_two().max(256);
+    let reused = {
+        let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        let (tick, map) = &mut *guard;
+        *tick += 1;
+        let now = *tick;
+        if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+            *used = now;
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            return Some(shadow.clone());
+        }
+        // The idle ones are looked for once the map has doubled since the
+        // last look, not at every asking: most are held by lists in the air,
+        // and a look at each of thousands at every new view, under this
+        // lock, stalled every recording thread (run avmup5: 2,642 askings and
+        // 385 new copies a frame, 3,822 kept, 4.8 fps against 21.7).
+        let mut sweep = EXACT_SWEEP.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() >= sweep.0.max(MANY) {
+            // Held by the map alone (no list), its buffer by the copy alone
+            // (no slot shows it), and not asked for lately.
+            map.retain(|_, (shadow, used)| {
+                let keep = Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now;
+                if !keep && sweep.2 < FREE_MOST {
+                    let class = shadow.len.next_power_of_two().max(256);
+                    sweep.2 += class;
+                    sweep.1.entry(class).or_default().push((shadow.buffer.clone(), shadow.data as usize, shadow.gpu));
+                }
+                keep
+            });
+            sweep.0 = map.len() * 2;
+        }
+        let got = sweep.1.get_mut(&class).and_then(Vec::pop);
+        if got.is_some() {
+            sweep.2 -= class;
+        }
+        got
+    };
+    let (buffer, data, gpu) = match reused {
+        Some((buffer, data, gpu)) => (buffer, data as *mut u8, gpu),
+        None => {
+            // Made outside the lock: making and mapping a buffer waits for the card.
+            let (buffer, data) = host()?.shared_buffer(class)?;
+            crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
+            OWN_MADE.fetch_add(1, Ordering::Relaxed);
+            (buffer, data, gpu)
+        }
+    };
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
     let (tick, map) = &mut *guard;
-    *tick += 1;
     let now = *tick;
     if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+        // Another thread made it meanwhile: ours goes back to be used again.
         *used = now;
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+        let mut sweep = EXACT_SWEEP.lock().unwrap_or_else(|e| e.into_inner());
+        sweep.2 += class;
+        sweep.1.entry(class).or_default().push((buffer, data as usize, gpu));
         return Some(shadow.clone());
     }
-    if map.len() >= MANY {
-        // Held by the map alone (no list), its buffer by the copy alone (no
-        // slot shows it), and not asked for lately.
-        map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
-        });
-    }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
-    crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
     map.insert((address, len), (shadow.clone(), now));
-    EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
-    OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)
 }
+
+/// Bytes of let-go buffers [`exact`] keeps for its next copies.
+const FREE_MOST: u64 = 256 << 20;
+
+/// For [`exact`]: the map size at which its idle copies are looked for next;
+/// buffers of copies let go, by class (power of two), with their mapping
+/// and address; and their bytes. Taken under [`EXACT`]'s lock.
+#[allow(clippy::type_complexity)]
+static EXACT_SWEEP: Mutex<(usize, BTreeMap<u64, Vec<(ID3D12Resource, usize, u64)>>, u64)> =
+    Mutex::new((0, BTreeMap::new(), 0));
 
 /// Copies of single views' bytes made since the start.
 pub(crate) static OWN_MADE: AtomicU64 = AtomicU64::new(0);
