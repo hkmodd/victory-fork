@@ -125,6 +125,8 @@ fn build() -> [u8; 32] {
             "VICTORY_BVH_BOUNDS",
             "VICTORY_BVH_MISS",
             "VICTORY_BVH_NO_HIT",
+            // The list this file reads for the translator ([`translate`]).
+            "VICTORY_WAVE_WIDE_ONLY",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -163,7 +165,6 @@ pub(crate) fn translation() -> [u8; 32] {
 pub fn precompile(container: &[u8]) -> Result<bool, String> {
     let _ = crate::host::host();
     let misses = MISSES.load(Ordering::Relaxed);
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate, true)?,
         None => translate(container)?,
@@ -181,8 +182,29 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     }
 }
 
+/// A container translated with the wave-wide form allowed when its hash is
+/// on `VICTORY_WAVE_WIDE_ONLY` (16-hex-digit hashes as the log names
+/// shaders, comma separated; unset or empty: none). Off by default: two
+/// programs that moved to that form were in a submission that lost the card
+/// (runs 121-124, not proven the cause). After commit a416e392 of pull
+/// request #823 (Felix2180), whose list is the four refused programs
+/// 5dc3b25986622949 and 6f225b641c5b0708 (the water's transmission
+/// volumetrics), 369cbe906ea72764 (particle visibility) and
+/// 2cc4c197ee29e291 (the reflection pass's tiling). For runs and the offline
+/// warm-up alike, which share the cache.
 fn translate(container: &[u8]) -> Result<HostShader, String> {
-    victory_shader::emit::translate(container).map_err(|e| e.to_string())
+    static LIST: OnceLock<Vec<String>> = OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_WIDE_ONLY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty() && h != "none")
+            .collect()
+    });
+    let hash = blake3::hash(container).to_hex();
+    let wide = list.iter().any(|h| hash.starts_with(h.as_str()));
+    victory_shader::emit::with_wave_wide(wide, || victory_shader::emit::translate(container)).map_err(|e| e.to_string())
 }
 
 /// The cache entry's converter: the build and the container in, the

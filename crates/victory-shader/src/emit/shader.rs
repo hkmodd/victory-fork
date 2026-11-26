@@ -132,6 +132,16 @@ pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 /// (0x107 in this tree: 0x104 and 0x105 are [`USER_ROOT_ADDRESS`]'s two
 /// words and 0x106 is [`USER_DISPATCH_THREADS_X`]; upstream has it at 0x104.)
 pub const USER_DISPATCH_SPREAD: u32 = 0x107;
+/// `RootType::Other` code of a user-data dword the host computes, for a
+/// compute program with a spilled user-data table (the ray-tracing
+/// structure builder's stages): dword `n` the thread count along axis `n`
+/// of a `DispatchX` with `USE_THREAD_DIMENSIONS` (flags bit 5, 0x20) when
+/// it is not a whole number of groups, else 0 (every thread runs). The
+/// threads at or past the count do nothing, as the console leaves them out
+/// of EXEC. (After fork pull request #646, mynzjerko, which numbers it
+/// 0x104.) The same code as [`USER_DISPATCH_THREADS_X`]: the host tells the
+/// two forms by the dword, 0-2 an axis here, the group's width (>2) there.
+pub const USER_DISPATCH_THREADS: u32 = USER_DISPATCH_THREADS_X;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

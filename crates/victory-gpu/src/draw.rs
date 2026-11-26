@@ -713,6 +713,10 @@ pub(crate) struct State {
     /// bind: `[row, asked x]` (`[0, 0]`: not spread; an indirect one gets
     /// its words from the clamp through its command signature).
     dispatch_spread: [u32; 2],
+    /// A `DispatchX` that counts threads, for [`State::host_word`] at its
+    /// bind: the count per axis where it is not a whole number of groups,
+    /// else 0 (`USER_DISPATCH_THREADS`; fork pull request #646).
+    dispatch_threads: [u32; 3],
     /// Diagnostics: the argument buffer and the offset of the indirect
     /// command before this one on the list.
     #[cfg(feature = "diagnostics")]
@@ -726,9 +730,10 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list has run, is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    /// The dynamic slots the list holds: title heap, that heap's identity
+    /// (`HostHeap::id`), first, count; given back when the list has run, is
+    /// reset or released.
+    dynamic: Vec<(usize, u64, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -746,8 +751,8 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
+        for &(heap, id, first, n) in &self.dynamic {
+            crate::descriptor::release_dynamic(heap, id, first, n);
         }
     }
 }
@@ -768,8 +773,8 @@ impl State {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
         }
-        for (heap, first, n) in self.dynamic.drain(..) {
-            crate::descriptor::release_dynamic(heap, first, n);
+        for (heap, id, first, n) in self.dynamic.drain(..) {
+            crate::descriptor::release_dynamic(heap, id, first, n);
         }
         self.fresh_tables.clear();
         self.recording = 0;
@@ -1306,6 +1311,24 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
+
+/// Frames between looks at an uploaded texture picked by index once
+/// [`RECHECK_FRAMES`] is through (`VICTORY_HEAP_RECHECK_EVERY=<frames>`; unset
+/// or 0: it is not looked at again, as before). The title streams a
+/// texture's memory in and rewrites it long after its view was written:
+/// runs 338-339 logged changes found at the schedule's last look, and what
+/// changes later stays as it was on the card for the rest of the run (skin
+/// that turns black or red). After RyanCase94's 920423a9.
+fn recheck_every() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        let every = std::env::var("VICTORY_HEAP_RECHECK_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        if every > 0 {
+            tracing::info!("uploaded textures picked by index are looked at again every {every} frames (VICTORY_HEAP_RECHECK_EVERY)");
+        }
+        every
+    })
+}
 
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
@@ -1979,9 +2002,12 @@ impl State {
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| if dword == 0 { m.base } else { m.count });
         }
-        // All of every group, unless the dispatch says otherwise.
+        // A `DispatchX` counting threads (0x106, both forms): `dword` an axis,
+        // the count there where it cuts the last group (fork pull request
+        // #646); `dword` the group's width (this tree's form), 0 here and the
+        // count set after the bind (`dispatch`). 0: all of every group.
         if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
-            return 0;
+            return self.dispatch_threads.get(dword as usize).copied().unwrap_or(0);
         }
         if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
             return match self.roots_ref(compute).get(usize::from(slot)) {
@@ -2584,7 +2610,7 @@ impl State {
                     crate::pipeline::note_why("no free dynamic slot for the one-view table of a root view".to_owned());
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
+                self.dynamic.push((key.0, host.id(), index, 1));
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
@@ -2657,7 +2683,7 @@ impl State {
                     crate::pipeline::note_why("no free dynamic slot for the one-view table of a root view".to_owned());
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
+                self.dynamic.push((key.0, host.id(), index, 1));
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
@@ -3591,7 +3617,13 @@ impl State {
                         Some(wait) => {
                             host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
                         }
-                        None => host.texture_slot_done(index, write, None),
+                        // The schedule is over: looked at again every so many
+                        // frames for as long as the slot shows it
+                        // (`recheck_every`), or never again.
+                        None => match recheck_every() {
+                            0 => host.texture_slot_done(index, write, None),
+                            every => host.texture_slot_recheck(index, write, frame + every, (at, len), print, looks, uploaded),
+                        },
                     }
                     continue;
                 }
@@ -4023,6 +4055,29 @@ impl State {
             .flatten();
         let threads = [x, y, z];
         let [x, y, z] = size.map_or(threads, |size| dispatch_groups(threads, size));
+        // Per axis, the count where it cuts the last group, else 0: what
+        // `host_word` gives a program that takes the count by axis at its bind
+        // (fork pull request #646's form; this tree's form, by the group's
+        // width, is set after the bind below).
+        let partial = size
+            .and_then(|size| dispatch_dimensions(threads, size, DISPATCH_THREAD_COUNTS))
+            .map_or([0; 3], |(_, partial)| partial);
+        if partial != [0; 3]
+            && !p.stages[0]
+                .translated()
+                .host
+                .user_data
+                .iter()
+                .any(|u| u.root == RootType::Other(victory_shader::emit::USER_DISPATCH_THREADS_X))
+        {
+            once!(
+                pipeline = %p.name,
+                threads = ?partial,
+                group = ?size,
+                "a DispatchX counting threads cuts its last group, and its program does not take the count: \
+                 the threads past it run"
+            );
+        }
         // More than 65,535 groups in x: spread across z for a program that
         // takes the spread words (`USER_DISPATCH_SPREAD`).
         let (row, asked, gx, gy, gz) = victory_shader::emit::spread_groups(x, y, z, spreads(p).is_some());
@@ -4032,8 +4087,10 @@ impl State {
             once!(gx, gy, gz, "a dispatch asks for more than 65,535 groups in a dimension and is not spread");
         }
         self.dispatch_spread = [row, asked];
+        self.dispatch_threads = partial;
         let bound = self.bind(list, p, true);
         self.dispatch_spread = [0, 0];
+        self.dispatch_threads = [0; 3];
         if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -4056,7 +4113,13 @@ impl State {
             if !crate::pipeline::is_builder(self.pipeline as This) {
                 once!(pipeline = p.name, "a dispatch counted in threads that is not the structure builder's");
             }
-            if let Some((param, word)) = compute_word(p, victory_shader::emit::USER_DISPATCH_THREADS_X) {
+            // This tree's form only (the metadata's `dword` the group's width,
+            // more than an axis); the form by axis took `partial` at the bind.
+            if let Some((param, word)) = compute_word(p, victory_shader::emit::USER_DISPATCH_THREADS_X)
+                && p.stages[0].translated().host.user_data.iter().any(|u| {
+                    u.index == word && u.dword > 2 && u.root == RootType::Other(victory_shader::emit::USER_DISPATCH_THREADS_X)
+                })
+            {
                 // SAFETY: an open list; the root signature has the word.
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
@@ -4864,7 +4927,7 @@ impl State {
                 staged.push((table, n));
             }
             self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+                .push((std::ptr::from_ref(heap) as usize, host.id(), first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
@@ -5728,6 +5791,32 @@ mod thread_tests {
 /// indirect ([`victory_shader::emit::USER_DISPATCH_SPREAD`]).
 pub(crate) static SPREAD: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// `COMPUTE_DISPATCH_INITIATOR` bit 5, `USE_THREAD_DIMENSIONS`: a
+/// `DispatchX` whose `x`, `y`, `z` count threads, not groups; in the last
+/// group of an axis the threads at or past the count are not in EXEC.
+const DISPATCH_THREAD_COUNTS: u32 = 0x20;
+
+/// A console dispatch `(x, y, z)` with `DispatchX` flags `flags`, as host
+/// groups and the thread counts the program is to keep to: per axis the
+/// count where it is not a whole number of `group`-thread groups, else 0
+/// (`USER_DISPATCH_THREADS`). Without [`DISPATCH_THREAD_COUNTS`] the counts
+/// are groups and go as they are. `None`: no thread along some axis, so
+/// nothing to run. (Fork pull request #646, mynzjerko.)
+fn dispatch_dimensions(dims: [u32; 3], group: [u32; 3], flags: u32) -> Option<([u32; 3], [u32; 3])> {
+    if flags & DISPATCH_THREAD_COUNTS == 0 {
+        return Some((dims, [0; 3]));
+    }
+    if dims.contains(&0) {
+        return None;
+    }
+    let groups = std::array::from_fn(|c| dims[c].div_ceil(group[c].max(1)));
+    let partial = std::array::from_fn(|c| {
+        let g = group[c].max(1);
+        if g > 1 && !dims[c].is_multiple_of(g) { dims[c] } else { 0 }
+    });
+    Some((groups, partial))
+}
+
 /// The user-data root parameter of compute pipeline `p` whose program takes
 /// the spread words, and the index of the first in it (the second follows:
 /// one root-constant argument sets both); `None` for any other pipeline.
@@ -6431,5 +6520,24 @@ mod window_tests {
         // No records at all: the constants' own.
         put(&mut constants, 0x7c, 2);
         assert_eq!(bake_named(&constants, 0, record), ((100..105).collect(), (0, 0)));
+    }
+
+    /// Fork pull request #646: a `DispatchX` with bit 5 counts threads.
+    #[test]
+    fn a_dispatch_counting_threads_runs_the_groups_that_hold_them() {
+        // Without bit 5 (plain Dispatch, or only the 32-lane bit 0x8000): groups.
+        assert_eq!(dispatch_dimensions([48, 1, 1], [64, 1, 1], 0), Some(([48, 1, 1], [0; 3])));
+        assert_eq!(dispatch_dimensions([48, 1, 1], [64, 1, 1], 0x8000), Some(([48, 1, 1], [0; 3])));
+        // Threads: the groups that hold them, and the count where the last is cut.
+        assert_eq!(dispatch_dimensions([48, 1, 1], [64, 1, 1], 0x20), Some(([1, 1, 1], [48, 0, 0])));
+        assert_eq!(dispatch_dimensions([1, 1, 1], [64, 1, 1], 0x8020), Some(([1, 1, 1], [1, 0, 0])));
+        assert_eq!(dispatch_dimensions([65, 1, 1], [64, 1, 1], 0x20), Some(([2, 1, 1], [65, 0, 0])));
+        // The builder's box stage: 5,348 nodes of one thread each in groups of 64.
+        assert_eq!(dispatch_dimensions([5348, 1, 1], [64, 1, 1], 0x20), Some(([84, 1, 1], [5348, 0, 0])));
+        // A whole number of groups needs no count.
+        assert_eq!(dispatch_dimensions([128, 1, 1], [64, 1, 1], 0x20), Some(([2, 1, 1], [0; 3])));
+        assert_eq!(dispatch_dimensions([10, 16, 5], [8, 8, 4], 0x20), Some(([2, 2, 2], [10, 0, 5])));
+        // No thread along an axis: nothing runs.
+        assert_eq!(dispatch_dimensions([0, 1, 1], [64, 1, 1], 0x20), None);
     }
 }

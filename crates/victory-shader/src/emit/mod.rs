@@ -122,7 +122,7 @@ pub use lower::{host_max_wave, host_settings, set_host_max_wave, set_host_rdna, 
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, SLOT_VIEW_BYTES, SLOT_VIEWS, SLOT_VIEWS_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_SPREAD, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, SLOT_VIEW_BYTES, SLOT_VIEWS, SLOT_VIEWS_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_SPREAD, USER_DISPATCH_THREADS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
@@ -488,6 +488,25 @@ pub fn emit_with_retries(
     }
 }
 
+thread_local! {
+    /// [`with_wave_wide`]'s choice, for this thread's translations.
+    static WAVE_WIDE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation) with the wave-wide form of a wave64 compute
+/// program on a host of 32-lane waves allowed, as `VICTORY_WAVE_WIDE=1`
+/// allows it for all, for one program chosen by its hash
+/// (`victory-gpu`'s `VICTORY_WAVE_WIDE_ONLY`). The form is still tried only
+/// after the exact ones. (After commit a416e392 of pull request #823 by
+/// Felix2180: the water's transmission volumetrics, particle visibility and
+/// the reflection pass's tiling come out of it with 32-lane waves.)
+pub fn with_wave_wide<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let before = WAVE_WIDE_HERE.replace(on);
+    let out = f();
+    WAVE_WIDE_HERE.set(before);
+    out
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -607,7 +626,7 @@ pub fn emit(
                 [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
                     | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
             );
-        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
+        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1") || WAVE_WIDE_HERE.get();
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().

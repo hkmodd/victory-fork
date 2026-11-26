@@ -35,6 +35,11 @@ pub(super) mod intersect;
 #[path = "halves.rs"]
 mod halves;
 
+/// Threads past a `DispatchX` thread count (`USER_DISPATCH_THREADS`), a
+/// child module so it shares the emitter's state (fork pull request #646).
+#[path = "dispatch_threads.rs"]
+mod dispatch_threads;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -116,7 +121,9 @@ fn counted_in_threads(parts: &Parts) -> bool {
     let crate::native::StageIo::Cs(cs) = &parts.native.io else {
         return false;
     };
-    cs.threads[0] > 1
+    // (> 2: the word's dword is the width, and dwords 0-2 are #646's axes of
+    // the same code; a group of 2 has #646's count of x alone)
+    cs.threads[0] > 2
         && cs.threads[1..] == [1, 1]
         && crate::spill::is_spilled(parts.native)
         && !parts.p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "s_barrier")
@@ -284,6 +291,18 @@ struct Lower<'a> {
     /// DXIL block per IR block (unreachable: none).
     block: Vec<Option<usize>>,
     cur: usize,
+    /// The DXIL block the program's body begins in: `s.entry`, or after
+    /// the threads past a `DispatchX` thread count have left
+    /// ([`Self::dispatch_threads_prologue`]). EXEC on entry is read there.
+    body_entry: usize,
+    /// Whether this thread is within a `DispatchX` thread count, where its
+    /// threads past the count stay for the group's barriers or the halves'
+    /// exchange: memory accesses, ballots and wave reductions leave the
+    /// others out ([`Self::dispatch_threads_prologue`]). Also a partial final group
+    /// (`USER_DISPATCH_THREADS_X`, `run(counted)`) whose console waves are two host waves:
+    /// the threads past the count stay for the exchange's group barriers. Both counts
+    /// together: the threads within each.
+    partial_active: Option<V>,
     bools: HashMap<(usize, Bool), V>,
     lane_bits: HashMap<Value, V>,
     /// IR phi location by value.
@@ -380,11 +399,6 @@ struct Lower<'a> {
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
     wave_base: Option<V>,
-    /// A partial final group (`USER_DISPATCH_THREADS_X`) whose console waves are two host
-    /// waves: the threads past the count stay for the exchange's group barriers, so they
-    /// cannot leave at entry; this says which threads the console launched, and memory,
-    /// EXEC's ballots and the wave's reductions leave the others out.
-    partial_active: Option<V>,
     /// Thread-group shared memory dwords allocated by the console program
     /// itself (excluding host wave-exchange and `wave_base` scratch slots).
     lds_dwords: u32,
@@ -2115,6 +2129,7 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let entry = s.entry;
         Lower {
             s,
             x,
@@ -2124,6 +2139,8 @@ impl<'a> Lower<'a> {
             floats: HashMap::new(),
             block: vec![None; p.blocks.len()],
             cur: 0,
+            body_entry: entry,
+            partial_active: None,
             bools: HashMap::new(),
             lane_bits: HashMap::new(),
             phi_at,
@@ -2201,7 +2218,6 @@ impl<'a> Lower<'a> {
             clane: None,
             pair: None,
             halves,
-            partial_active: None,
             wave_base: None,
             lds_dwords,
             flat: None,
@@ -2325,7 +2341,7 @@ impl<'a> Lower<'a> {
             .scalar
             .get(&(b, i))
             .ok_or("an untracked global address")?;
-        let guard = self.memory_guard(b, i)?;
+        let guard = self.effect_guard(b, i)?;
         let Some(Operand::Vector { reg, .. }) = *dst else {
             return Err("a global load result");
         };
@@ -2859,6 +2875,8 @@ impl<'a> Lower<'a> {
                 self.s.m.terminate(original, Term::CondBr(runs, body, done));
                 self.s.m.terminate(done, Term::Ret);
                 self.s.entry = body;
+                // (EXEC on entry is read after the lanes past the count left)
+                self.body_entry = body;
             }
         }
         self.find_coherent();
@@ -2904,6 +2922,20 @@ impl<'a> Lower<'a> {
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
+        } else if self.x.native.stage == HwStage::Cs && crate::spill::is_spilled(self.x.native) {
+            // The structure builder's stages: a DispatchX may name threads,
+            // not groups (`USER_DISPATCH_THREADS`; fork pull request #646).
+            // They never take the spread prologue above (`user_first`).
+            // With `counted` (above) a program has both counts: the threads
+            // it keeps are within each.
+            let counted_here = self.partial_active.take();
+            self.dispatch_threads_prologue(&order);
+            if let Some(a) = counted_here {
+                self.partial_active = Some(match self.partial_active {
+                    Some(b) => self.s.m.bin(self.s.entry, Bin::And, a, b),
+                    None => a,
+                });
+            }
         }
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
@@ -3884,7 +3916,7 @@ impl<'a> Lower<'a> {
         };
         let (lo, hi) = (word(self, 0)?, word(self, 1)?);
         let (lo, hi) = self.address_plus(lo, hi, i32::from(*offset));
-        let guard = self.memory_guard(b, i)?;
+        let guard = self.effect_guard(b, i)?;
         let (i32t, res, void) = (self.s.t.i32, self.s.t.res_ret, self.s.t.void);
         let iu = self.s.m.undef(i32t);
         let align = self.s.m.i32(4);
@@ -4228,7 +4260,7 @@ impl<'a> Lower<'a> {
             None => {
                 let at = match self.def_block.get(&lo) {
                     // Program inputs (EXEC on entry).
-                    None => self.s.entry,
+                    None => self.body_entry,
                     Some(&b) if b == self.cur_ir => self.cur,
                     Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
                 };
@@ -4980,7 +5012,7 @@ impl<'a> Lower<'a> {
         }
         let made = self.def_block.get(&scc).copied();
         let at = match made {
-            None => self.s.entry,
+            None => self.body_entry,
             Some(b) if b == self.cur_ir => self.cur,
             Some(b) => self.tail[b].ok_or("a lane mask written after its use")?,
         };
@@ -5014,7 +5046,17 @@ impl<'a> Lower<'a> {
             // elsewhere have no bit set, as on the console, so "some lane" needs no one but
             // the lanes here, and "every lane's bit is clear" is true of the others anyway.
             let c = self.cur;
-            let mine = self.boolean(when, c)?;
+            let mut mine = self.boolean(when, c)?;
+            // Threads past a DispatchX count speak neither for nor against.
+            if let Some(active) = self.partial_active {
+                mine = if any {
+                    self.s.m.bin(c, Bin::And, mine, active)
+                } else {
+                    let t = self.s.m.bool(true);
+                    let off = self.s.m.bin(c, Bin::Xor, active, t);
+                    self.s.m.bin(c, Bin::Or, mine, off)
+                };
+            }
             let i1t = self.s.t.i1;
             self.s.flags |= flags::WAVE_OPS;
             let (name, code) = if any { ("waveAnyTrue", 113) } else { ("waveAllTrue", 114) };
@@ -5122,16 +5164,6 @@ impl<'a> Lower<'a> {
             None => Ok(None),
             Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
         }
-    }
-
-    /// [`Self::guard`] of a memory access: not by the threads a partial final group only
-    /// keeps for its barriers ([`Self::partial_active`]).
-    fn memory_guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
-        let g = self.guard(b, i)?;
-        Ok(match (g, self.partial_active) {
-            (Some(g), Some(a)) => Some(self.s.m.bin(self.cur, Bin::And, g, a)),
-            (g, a) => g.or(a),
-        })
     }
 
     /// `on` (the lanes of a mask, at `at`) without the threads a partial final group keeps
@@ -5702,11 +5734,12 @@ impl<'a> Lower<'a> {
             return Err("GDS");
         }
         let name = inst.name();
-        // (a shuffle reads other lanes: it is not memory)
+        // Lanes past a DispatchX count neither read nor write LDS; a
+        // swizzle or permute moves registers only, under its own guard.
         let guard = if name == "ds_swizzle_b32" || name.contains("permute") {
             self.guard(b, i)?
         } else {
-            self.memory_guard(b, i)?
+            self.effect_guard(b, i)?
         };
         let c = self.cur;
         let offset = u32::from(*offset0) | u32::from(*offset1) << 8;
@@ -11684,6 +11717,51 @@ impl<'a> Lower<'a> {
     }
 
     fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        let sampler = self.descriptors.get(&((b, i), true)).copied();
+        if let Some(Source::Phi { block, args }) = sampler
+            && let [first @ Source::Constant(_), second @ Source::Constant(_)] = args.as_slice()
+            && let [left, right] = self.x.p.blocks[*block].preds.as_slice()
+        {
+            // Immediate samplers are separate static bindings. Sample both with
+            // the original derivatives, then select the texel on the same edge
+            // that supplied the console's sampler.
+            if self.block[*left].is_none() {
+                return self.image_with_sampler(inst, b, i, Some(second));
+            }
+            if self.block[*right].is_none() {
+                return self.image_with_sampler(inst, b, i, Some(first));
+            }
+            let edge = |pred: usize| {
+                self.edges.get(&(pred, *block)).copied().or(self.tail[pred])
+                    .ok_or("a sampler choice with an unfinished predecessor")
+            };
+            let (left, right) = (edge(*left)?, edge(*right)?);
+            let join = self.block[*block].ok_or("a sampler choice without a host block")?;
+            let chosen = self.s.m.phi(join, self.s.t.i1);
+            let (yes, no) = (self.s.m.bool(true), self.s.m.bool(false));
+            self.s.m.set_phi(chosen, vec![(yes, left), (no, right)]);
+            self.image_with_sampler(inst, b, i, Some(first))?;
+            let left = inst.writes.iter()
+                .map(|&(_, v)| self.i32_of(v))
+                .collect::<Result<Vec<_>, _>>()?;
+            self.image_with_sampler(inst, b, i, Some(second))?;
+            for (&(_, v), a) in inst.writes.iter().zip(left) {
+                let b = self.i32_of(v)?;
+                let result = self.s.m.select(self.cur, chosen, a, b);
+                self.vals.insert(v, Val::I32(result));
+            }
+            return Ok(());
+        }
+        self.image_with_sampler(inst, b, i, sampler)
+    }
+
+    fn image_with_sampler(
+        &mut self,
+        inst: &Inst,
+        b: usize,
+        i: usize,
+        sampler: Option<&Source>,
+    ) -> Result<(), Why> {
         let Fields::Image {
             data,
             addr,
@@ -11706,7 +11784,7 @@ impl<'a> Lower<'a> {
         // A load or sample with no channel enabled returns the first.
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);
-        let guard = self.memory_guard(b, i)?;
+        let guard = self.effect_guard(b, i)?;
         let c = self.cur;
         let (kind, coords) = match dim {
             0 => (1, 1),
@@ -12024,11 +12102,7 @@ impl<'a> Lower<'a> {
         // A gather at a named level, done as four texel reads (below).
         let mut gathered: Option<[V; 4]> = None;
         let r = if sample {
-            let ss = self
-                .descriptors
-                .get(&(site, true))
-                .copied()
-                .ok_or("an untracked sampler")?;
+            let ss = sampler.ok_or("an untracked sampler")?;
             // Comparison: the reference value is the first address after
             // the bias, and the sampler is a comparison sampler.
             let cmp = matches!(op, 64 | 65);
@@ -12574,7 +12648,7 @@ impl<'a> Lower<'a> {
             return Err(name);
         }
         let site = (b, i);
-        let guard = self.memory_guard(b, i)?;
+        let guard = self.effect_guard(b, i)?;
         let c = self.cur;
         let store = name.starts_with("buffer_store_");
         // DXIL atomic operations: add, and, or, xor, signed and unsigned
@@ -13421,9 +13495,12 @@ impl<'a> Lower<'a> {
                 .min(self.s.threads.map_or(u32::MAX, |t| t[0]))
         });
         let mut indices = [z; 3];
+        // Each corner is a 9-bit vertex index with its edge flag above it
+        // (bits 9, 19, 29), which only the console's edge-flag rasterising
+        // reads: with the flag in the index it named a vertex past the
+        // written ones, and the triangle was culled. (Port of Marvisak
+        // c0228d9, GPL-3.0, here before upstream's #1112.)
         for (k, slot) in indices.iter_mut().enumerate() {
-            // Nine index bits per vertex; bits 9, 19, 29 are edge flags (port of
-            // Marvisak c0228d9, GPL-3.0).
             let (shift, mask) = (self.s.m.i32(10 * k as u32), self.s.m.i32(0x1FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
@@ -14322,6 +14399,30 @@ mod tests {
                 range(ResourceType::Sampler, 1, 1),
             ],
         )
+    }
+
+    #[test]
+    fn a_uniform_branch_can_choose_between_immediate_samplers() {
+        // A root constant selects wrap or clamp. Keep the sample live with an LDS store.
+        let words = [
+            0xBE84_0300, 0xBE85_0380,       // s[4:5] = texture table
+            0xF40C_0302, 0xFA00_0000,       // s_load_dwordx8 s[12:19], s[4:5], 0
+            0xBE89_0380, 0xBE8A_0380, 0xBE8B_0380, // sampler words 1-3
+            0xBF06_8001,                    // s_cmp_eq_u32 s1, 0
+            0xBF85_0002,                    // branch to clamp
+            0xBE88_0380, 0xBF82_0002,       // wrap, skip clamp
+            0xBE88_03FF, 0x0000_0092,       // clamp all axes
+            0xF09C_0F08, 0x0043_0C02,       // image_sample_lz v[12:15], ..., s[8:11]
+            0xD834_0000, 0x0000_0C00,       // ds_write_b32 v0, v12
+            S_ENDPGM,
+        ];
+        let (mut layout, mut used) = texture_tables();
+        layout[1] = root(RootType::Constants, 1, 1);
+        used.truncate(1);
+        let shader = lower_with(&words, layout, used).unwrap();
+        assert_eq!(shader.samplers.len(), 2);
+        assert!(shader.samplers.contains(&[0, 0, 0, 0]));
+        assert!(shader.samplers.contains(&[0x92, 0, 0, 0]));
     }
 
     #[test]
