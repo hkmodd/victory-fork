@@ -8768,7 +8768,16 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
-const BUFFERS: u32 = 2;
+/// The swap chain's back buffers: 2, or `VICTORY_SWAP_BUFFERS` (2 to 4).
+/// With two, the host's Present on the submit lane waits in the driver for
+/// the one the window still shows (avmpf4: 17% of the lane's samples asleep
+/// under Present, ~9 ms a frame).
+fn buffers() -> u32 {
+    static N: OnceLock<u32> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_SWAP_BUFFERS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2).clamp(2, 4)
+    })
+}
 
 struct Presenter {
     swap_chain: IDXGISwapChain3,
@@ -9189,7 +9198,7 @@ impl Host {
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                    .ResizeBuffers(buffers(), width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
             };
             match resized {
                 Ok(()) => {
@@ -9330,7 +9339,7 @@ impl Host {
                     Quality: 0,
                 },
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                BufferCount: BUFFERS,
+                BufferCount: buffers(),
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
@@ -9339,7 +9348,7 @@ impl Host {
                 .cast::<IDXGISwapChain3>()?;
             let copy = self.new_list()?;
             copy.close();
-            tracing::info!(width, height, format = format.0, "presenting to a window");
+            tracing::info!(width, height, format = format.0, buffers = buffers(), "presenting to a window");
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
