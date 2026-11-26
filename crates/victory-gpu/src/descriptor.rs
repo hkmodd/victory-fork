@@ -202,7 +202,14 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
-        for (range_from, range_end) in written.take(start as usize, end as usize) {
+        // With `VICTORY_HEAP_SYNC_CUT`: only the pages that hold slots the
+        // host heap has title slots for are taken and read ([`sync_cut`]).
+        let looked_end = if sync_cut() {
+            (start as usize).saturating_add(mirrored_count as usize * step as usize).min(end as usize)
+        } else {
+            end as usize
+        };
+        for (range_from, range_end) in written.take(start as usize, looked_end) {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
                 let from = page.max(range_from);
@@ -250,6 +257,49 @@ pub(crate) fn sync_heaps() {
     drop(heaps);
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
         count.fetch_add(n, Relaxed);
+    }
+}
+
+/// Whether [`sync_heaps`] leaves alone the part of a title view heap the
+/// host heap has no title slots for (`VICTORY_HEAP_SYNC_CUT=1`; off by
+/// default; `alt`: twenty seconds with, twenty without, in turn, each
+/// change said in the log).
+///
+/// On a host that caps view heaps at 1,000,000 the host heap holds the
+/// title's slots below 737,855 and the title's heap has 1,245,184. The
+/// records past the host's title slots were never mirrored
+/// ([`changed_slots`] cuts them off), but their pages were asked about and
+/// read all the same, and they are the busiest of the heap: the title
+/// keeps its own per-draw tables there and rewrites them every frame
+/// (measured in run 285 with an instrument since removed: about 100,000
+/// records a frame that are not zeros, a third of them live view objects,
+/// a fifth constant views; about half of the changed pages a frame). The
+/// layer serves those tables from slots of its own when a draw names
+/// them. With the switch the pass asks the write watch about, and reads,
+/// the mirrored part only: the same records are mirrored.
+#[cfg(windows)]
+fn sync_cut() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_HEAP_SYNC_CUT").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "the pass over the title's view heap leaves the part the host has no title slots for alone from now                      (VICTORY_HEAP_SYNC_CUT=alt): {}",
+                    if on { "ON" } else { "off, every changed page is read as usual" }
+                );
+            }
+            on
+        }
     }
 }
 
