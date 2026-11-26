@@ -214,6 +214,12 @@ pub(crate) struct Replay {
     view_limit: u32,
     #[arg(long, default_value_t = 0)]
     raw_views: u32,
+    /// With --retranslate: the host's widest wave (32 on NVIDIA; RDNA forms only at 64).
+    #[arg(long, default_value_t = 64)]
+    host_wave: u32,
+    /// With --retranslate: the RDNA float forms (VICTORY_RDNA_FLOAT) on any host.
+    #[arg(long)]
+    rdna: bool,
     /// Use the D3D12 debug layer (slow).
     #[arg(long)]
     debug_layer: bool,
@@ -249,7 +255,7 @@ pub(crate) fn run(r: Replay) -> Result<()> {
         return play::look::flow(&r.folder, lists, r.flow_draws, r.flow_slots, &mut |line| println!("{line}"));
     }
     if let Some(into) = &r.retranslate {
-        return retranslate(&r.folder, into, r.view_limit, r.raw_views);
+        return retranslate(&r.folder, into, r.view_limit, r.raw_views, r.host_wave, r.rdna);
     }
     let until = match &r.until {
         Some(text) => Some(
@@ -434,7 +440,7 @@ pub(crate) fn run(r: Replay) -> Result<()> {
 }
 
 /// Translates the capture's shaders into `into`.
-fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32, raw_views: u32) -> Result<()> {
+fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32, raw_views: u32, host_wave: u32, rdna: bool) -> Result<()> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let wanted = play::title_shaders(folder)?;
     let kept = play::find(folder)?.with_file_name("containers");
@@ -465,8 +471,8 @@ fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32
         }
     }
     println!("{} containers not found", missing.len());
-    victory_shader::emit::set_host_max_wave(64);
-    victory_shader::emit::set_host_rdna(true);
+    victory_shader::emit::set_host_max_wave(host_wave);
+    victory_shader::emit::set_host_rdna(rdna || host_wave == 64);
     victory_shader::emit::set_view_heap_limit(view_limit);
     victory_shader::emit::set_raw_views(raw_views);
     let all: Vec<_> = wanted.iter().collect();
