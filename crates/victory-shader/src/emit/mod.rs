@@ -439,6 +439,10 @@ pub fn emit(
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
         let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // `VICTORY_WAVE_WIDE=last`: the same form, but only for programs that every other
+        // form below leaves at 64 lanes (on a 32-lane host those are refused outright), so
+        // the programs the approximate forms already take keep their barrier-free form.
+        let wide_last = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "last");
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -529,9 +533,12 @@ pub fn emit(
         // (`v_mbcnt`, a list compaction): sr_tracing's `CS_Tiling_Generate_Opaque` came out
         // wrong in this form (runs ww1/ww2: walls and skin blotched, posterized; clean with
         // that pipeline skipped), so those stay refused.
+        // `VICTORY_WAVE_WIDE=last` (upstream, fork PR #1141) takes those too.
         let counts_lanes = p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name().starts_with("v_mbcnt"));
-        if !wide_on && !counts_lanes && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") {
-            let deep = form(ir::without_skips(p, true));
+        let by_default = !counts_lanes && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0");
+        if !wide_on && (wide_last || by_default) {
+            let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+            let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
             let bases = [
                 deep.as_ref().map(|f| &f.0),
                 forms[1].1.as_ref().map(|f| &f.0),
