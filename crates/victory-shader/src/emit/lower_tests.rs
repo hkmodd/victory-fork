@@ -9,6 +9,58 @@ use crate::{io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 
+ 
+/// A minimum and then an add on one LDS word are not interchangeable
+/// between the two host halves. Two adds of the same word are.
+#[test]
+fn divergent_lds_atomics_need_instruction_order_between_halves() {
+    let mut words: [u32; 15] = [
+        0x7E12_0280, // v_mov_b32 v9, 0
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0006, // s_cbranch_execz past both atomics
+        0x36 << 26 | 0x07 << 18, // ds_min_u32
+        9 << 8 | 9,
+        0xBF07_8001, // s_cmp_lg_u32 s1, 0
+        0xBF85_0002, // s_cbranch_scc1 past the increment
+        0x36 << 26, // ds_add_u32
+        2 << 8 | 9,
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x36 << 26 | 0x36 << 18, // ds_read_b32
+        5 << 24 | 9,
+        S_ENDPGM,
+    ];
+    for (first, second, ordered) in [(0x07u32, 0, true), (0, 0, false)] {
+        words[5] = 0x36 << 26 | first << 18;
+        words[9] = 0x36 << 26 | second << 18;
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 16,
+            layout: vec![RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15 | 2 << 1,
+                threads: [64, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let all = super::all_lane_blocks(&st).unwrap();
+        assert_eq!(super::lds_meetings(&p, &st, &all).is_none(), ordered);
+    }
+}
+
 /// A 128-thread group whose divergent region both reads and writes LDS. With that branch
 /// taken by both halves of a wave, the program lowers to wave 32 and the LDS sites meet
 /// per wave. Without the branch marked, no meet is emitted in the divergent block.
