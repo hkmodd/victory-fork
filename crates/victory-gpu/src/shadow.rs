@@ -241,6 +241,7 @@ fn card_limits() -> (u64, u64) {
             vram_budget_mb = vram_budget.map(|b| b >> 20),
             card_buffers_min_kb = min_bytes >> 10,
             card_buffers_max_mb = max_bytes >> 20,
+            mimalloc = crate::is_mimalloc(),
             "card buffer limits"
         );
         (min_bytes, max_bytes)

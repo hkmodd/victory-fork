@@ -24,6 +24,13 @@ mod pix;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(windows)]
+mod heap;
+#[cfg(all(windows, not(feature = "diagnostics")))]
+#[global_allocator]
+static HEAP: heap::Chosen = heap::Chosen;
+#[cfg(windows)]
+pub use heap::is_mimalloc;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod faultbook;
 #[cfg(windows)]
