@@ -4601,10 +4601,18 @@ impl Host {
         }
         let code = code.ok_or_else(windows::core::Error::empty)?;
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
-        // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
-        // in one submission.
-        const RESULTS: u64 = 1 << 20;
-        let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
+        // A megabyte of results by default: 262,144 pieces, 16 GB of
+        // declared ranges in one submission. With the relay the area starts
+        // again only when no plan is out, and past half of it the
+        // submitting thread lands the flights first (card_results_low):
+        // VICTORY_CARD_RESULTS_MB (1 to 64) makes that rarer.
+        let results: u64 = std::env::var("VICTORY_CARD_RESULTS_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(1, |mb| mb.clamp(1, 64))
+            << 20;
+        tracing::info!("the card compare's results: {} MB (VICTORY_CARD_RESULTS_MB)", results >> 20);
+        let (differs, data) = self.shared_buffer(results).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
         // SAFETY: the blob's own bytes; the root signature is inside the
         // shader.
@@ -4627,7 +4635,7 @@ impl Host {
                 fetch: list()?,
                 root,
                 pso,
-                differs: (differs, data as usize, RESULTS),
+                differs: (differs, data as usize, results),
                 fetched: None,
                 taken: 0,
                 out: 0,
@@ -4653,6 +4661,7 @@ impl Host {
             return None;
         }
         // The ranges this submission's shaders may write, per copy.
+        let mut cut = std::time::Instant::now();
         let declared: Vec<Declared> = declared.iter().filter(|(shadow, _)| shadow.carded()).cloned().collect();
         let declared = if crate::picked::lands() { crate::picked::with(declared, &picked.written) } else { declared };
         // (Of a copy with a declared range here, that says it.)
@@ -4668,9 +4677,11 @@ impl Host {
             }
             None => 0,
         };
+        card_cut(&mut cut, 5);
         let gathering = crate::timeline::span("copies in the card's memory: what changed");
         let mut dirty = crate::shadow::card_dirty(sent_as);
         gathering.end();
+        card_cut(&mut cut, 6);
         if declared.is_empty() && dirty.is_empty() && looked.is_empty() {
             return None;
         }
@@ -4695,9 +4706,11 @@ impl Host {
         let mut looks = None;
         let mut up = None;
         // The bytes as they are now, whatever later submissions put there.
+        card_cut(&mut cut, 7);
         let taking = crate::timeline::span("copies in the card's memory: taken");
         let own = if send::own() { send::take(self, &dirty) } else { None };
         taking.end();
+        card_cut(&mut cut, 8);
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
@@ -4826,6 +4839,7 @@ impl Host {
             used.push((false, sync));
         }
         drop(order);
+        card_cut(&mut cut, 9);
         let mut plan = CardPlan {
             ranges: Vec::new(),
             check: None,
@@ -4933,6 +4947,7 @@ impl Host {
             plan.lists.push((true, check));
         }
         work.out += 1;
+        card_cut(&mut cut, 10);
         Some(plan)
     }
 
@@ -6105,24 +6120,30 @@ impl Host {
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
         let flown = late && relay();
+        let mut cut = std::time::Instant::now();
         if flown && self.card_results_low() {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
+        card_cut(&mut cut, 0);
         // What shaders may write through views they pick: last, so that no
         // refresh of this submission leaves it alone.
         let picked = crate::picked::declare(runs);
         for (shadow, at, len) in &picked.written {
             shadow.writing(*at, *len);
         }
+        card_cut(&mut cut, 1);
         let declared = declared_writes(runs);
+        card_cut(&mut cut, 2);
         let card = self.card_before(&declared, &picked, flown);
+        card_cut(&mut cut, 3);
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
         for (shadow, at, bytes) in batch.placed.drain(..) {
             shadow.placed_copy(at, &bytes);
         }
+        card_cut(&mut cut, 4);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             #[cfg(feature = "diagnostics")]
             marks.push((lists.len(), crate::copystat::Timed::Compare));
@@ -7948,6 +7969,27 @@ static SPLIT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::A
 #[cfg(feature = "diagnostics")]
 static FLUSHES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// The part of the submitting thread spent on copies in the card's memory,
+/// split: the settle for the compare's results, the picked views declared,
+/// the declared writes, `card_before` whole, the placed copies; inside
+/// `card_before`: before what changed, what changed, the work lock and the
+/// copies made whole, the taking, the list recorded and sent, the plan.
+#[cfg(feature = "diagnostics")]
+static CARD_SPLIT: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+
+/// What came since `at` was part `i` of [`CARD_SPLIT`].
+#[inline]
+fn card_cut(at: &mut std::time::Instant, i: usize) {
+    #[cfg(feature = "diagnostics")]
+    {
+        let now = std::time::Instant::now();
+        CARD_SPLIT[i].fetch_add((now - *at).as_nanos() as u64, Ordering::Relaxed);
+        *at = now;
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (at, i);
+}
+
 /// Counts into [`SPLIT`].
 #[cfg(feature = "diagnostics")]
 struct Split(std::cell::Cell<std::time::Instant>);
@@ -7973,6 +8015,13 @@ impl Split {
 /// The split of the preparing, per frame, for the frame-rate line.
 #[cfg(feature = "diagnostics")]
 fn split_line(frames: f64) {
+    let c: Vec<f64> = CARD_SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
+    tracing::info!(
+        "copies in the card's memory per frame, the submitting thread: {:.2} ms settling for the compare's results, {:.2} declaring picked views, \
+         {:.2} the declared writes, {:.2} card_before ({:.2} before what changed, {:.2} what changed, {:.2} the work lock and copies made whole, \
+         {:.2} taking, {:.2} the list recorded and sent, {:.2} the plan), {:.2} the placed copies",
+        c[0], c[1], c[2], c[3], c[5], c[6], c[7], c[8], c[9], c[10], c[4]
+    );
     let ms: Vec<f64> = SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
     let f: Vec<f64> = FLUSHES.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     let e: Vec<f64> = crate::watch::early_asks().iter().map(|&n| n as f64 / frames).collect();
