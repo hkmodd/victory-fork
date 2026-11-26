@@ -187,7 +187,9 @@ fn version_number(file: &str) -> Option<u64> {
 }
 
 /// The names in version folder `dir`: container, display, blobs; `None` if
-/// its manifest is missing or does not parse.
+/// its manifest is missing or does not parse, or a blob it lists is missing.
+/// Any other error is the disk's (a file held by another process, say), not
+/// the save's, and is returned.
 fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
     let bytes = match std::fs::read(dir.join(MANIFEST)) {
         Ok(bytes) => bytes,
@@ -199,14 +201,24 @@ fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
     };
     let blobs = names.split_off(2);
     let [name, display] = <[String; 2]>::try_from(names).expect("two names, checked by the parser");
+    // A missing blob is damage too: taking this version would remove the
+    // older intact ones, and the blob would read as empty.
+    for i in 0..blobs.len() {
+        match std::fs::metadata(dir.join(i.to_string())) {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        }
+    }
     Ok(Some((name, display, blobs)))
 }
 
 /// The container's newest readable committed version, if any. Removes what
-/// a crash left: unfinished versions, and versions older than that one
-/// (what cannot be removed now is left for a later call). An unreadable
-/// newer folder (a stray, or a broken manifest) is neither taken nor
-/// removed, and never costs the version below it.
+/// a crash left: unfinished versions, and versions older than that one.
+/// An unreadable newer folder (a stray, a broken manifest, or a blob gone
+/// missing) is neither taken nor removed, and never costs the version below
+/// it.
 fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     let mut committed = Vec::new();
     let mut highest = 0;
@@ -1533,5 +1545,30 @@ mod tests {
         assert_eq!(update(root, "two", &[("a", Some("new a"))]), NO_ACCESS);
         assert!(slot.join("v1").join("0").is_file());
         assert!(!slot.join("v2").exists());
+    }
+
+    /// A newer version whose manifest reads but lists a blob that is gone
+    /// is damaged: the older intact version is the save and is kept, and
+    /// the damaged one is not removed.
+    #[test]
+    fn only_damaged_versions_are_refused_not_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+        let slot = container_dir(root, "Slot");
+        // v2 as a crash could leave it: a newer blob a, and blob b deleted.
+        let (v1, v2) = (slot.join("v1"), slot.join("v2"));
+        std::fs::create_dir(&v2).unwrap();
+        for entry in std::fs::read_dir(&v1).unwrap().flatten() {
+            std::fs::copy(entry.path(), v2.join(entry.file_name())).unwrap();
+        }
+        std::fs::write(v2.join("0"), b"new a").unwrap();
+        std::fs::remove_file(v2.join("1")).unwrap();
+
+        let c = Provider { root: root.into() }.container("Slot");
+        let chosen = current_named(&c.dir, "Slot").unwrap().expect("the older version");
+        assert_eq!(chosen.dir, v1);
+        assert_eq!(state(root), old_state());
+        assert!(v1.is_dir() && v2.is_dir());
     }
 }

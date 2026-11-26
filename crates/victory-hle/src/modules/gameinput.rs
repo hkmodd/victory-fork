@@ -109,7 +109,8 @@ const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28
 trait Source: Send {
     /// The pad in host slot `slot`, `None` when the slot is empty.
     fn pad(&mut self, slot: usize) -> Option<PadState>;
-    /// Keys held down; none while the title's window lacks focus.
+    /// Keys held down: the keyboard's only while the title's window has
+    /// focus, scripted ones (`VICTORY_KEYS_FILE`, `VICTORY_KEYS`) always.
     fn keys(&mut self) -> Vec<KeyState>;
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
@@ -1191,22 +1192,24 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
-            #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
-            // The scripted keys (`VICTORY_KEYS`, `VICTORY_PATH`) also drive
-            // the first pad, by the stand-in pad's table (buttons, sticks,
-            // triggers): with a real pad connected the stand-in is not
-            // there, and a title that listens to the pad (the title's start
-            // screen, walking in the world) saw nothing. A scripted stick or
-            // trigger wins over the pad's own; with `VICTORY_KEYS_ONLY=1`
-            // the real pad is not read at all.
-            #[cfg(feature = "diagnostics")]
+            // The scripted keys (`VICTORY_KEYS_FILE`, `VICTORY_KEYS`,
+            // `VICTORY_PATH`) also drive the first pad, by the stand-in pad's
+            // table (buttons, sticks, triggers): with a real pad connected the
+            // stand-in is not there, and a title that listens to the pad (the
+            // title's start screen, walking in the world) saw nothing. A
+            // scripted stick or trigger wins over the pad's own; with
+            // `VICTORY_KEYS_ONLY=1` the real pad is not read at all.
             if slot == 0 {
                 if scripted_only() {
                     pad = PadState::default();
                 }
+                #[cfg_attr(not(feature = "diagnostics"), allow(unused_mut))]
+                let mut asked = asked_keys();
+                #[cfg(feature = "diagnostics")]
+                asked.extend(scripted());
                 let keys: Vec<KeyState> =
-                    scripted().into_iter().map(|virtual_key| KeyState { virtual_key, ..Default::default() }).collect();
+                    asked.into_iter().map(|virtual_key| KeyState { virtual_key, ..Default::default() }).collect();
                 let by_script = fallback(&keys);
                 pad.buttons |= by_script.buttons;
                 for (own, script) in [
@@ -1226,10 +1229,10 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
+            #[cfg_attr(not(feature = "diagnostics"), allow(unused_mut))]
+            let mut down = asked_keys();
             #[cfg(feature = "diagnostics")]
-            let mut down = scripted();
-            #[cfg(not(feature = "diagnostics"))]
-            let mut down = Vec::new();
+            down.extend(scripted());
             if focused() && !scripted_only() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1262,6 +1265,69 @@ mod host {
         }
     }
 
+    /// A key's virtual-key code: a letter, a digit, or `Enter`, `Esc`,
+    /// `Tab`, `Back`, `Up`, `Down`, `Left`, `Right` (the stand-in pad's
+    /// table maps them to buttons).
+    fn key_code(key: &str) -> Option<u8> {
+        Some(match key {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                k.as_bytes()[0].to_ascii_uppercase()
+            }
+            _ => return None,
+        })
+    }
+
+    /// Test aid: `VICTORY_KEYS_FILE=<file>`. A script writes lines
+    /// `<key> <seconds>` into the file (keys as [`key_code`] names them);
+    /// the next look, at most 50 ms later, holds each key that long, focus
+    /// or not, and removes the file. A measuring script can then answer
+    /// what is on screen (the account screen's prompt, a turn of the
+    /// camera) while someone else uses the desktop. Unset: nothing is read.
+    fn asked_keys() -> Vec<u8> {
+        static FILE: LazyLock<Option<std::path::PathBuf>> =
+            LazyLock::new(|| std::env::var_os("VICTORY_KEYS_FILE").map(Into::into));
+        /// Keys held, until when; when the file was last looked at.
+        type Held = (Vec<(Instant, u8)>, Option<Instant>);
+        static HELD: Mutex<Held> = Mutex::new((Vec::new(), None));
+        let Some(file) = &*FILE else {
+            return Vec::new();
+        };
+        let now = Instant::now();
+        let mut held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
+        let due = held.1.is_none_or(|last| now.duration_since(last) >= Duration::from_millis(50));
+        if due {
+            held.1 = Some(now);
+            if let Ok(text) = std::fs::read_to_string(file) {
+                let _ = std::fs::remove_file(file);
+                held.0.extend(asked(&text, now));
+            }
+        }
+        held.0.retain(|&(until, _)| until > now);
+        held.0.iter().map(|&(_, vk)| vk).collect()
+    }
+
+    /// The keys of a [`asked_keys`] file read at `now`: each with the time
+    /// it is held until. Lines that do not read as `<key> <seconds>` are
+    /// left out.
+    fn asked(text: &str, now: Instant) -> Vec<(Instant, u8)> {
+        text.lines()
+            .filter_map(|line| {
+                let mut words = line.split_whitespace();
+                let vk = key_code(words.next()?)?;
+                let long = Duration::try_from_secs_f64(words.next()?.parse().ok()?).ok()?;
+                Some((now + long, vk))
+            })
+            .collect()
+    }
+
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
     /// 0.2 s that long after input starts (`<from>-<to>:<key>`: all that
     /// time), with or without focus. A key is a
@@ -1273,20 +1339,7 @@ mod host {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
+                let vk = key_code(key.trim())?;
                 let time = |t: &str| Duration::try_from_secs_f64(t.trim().parse().ok()?).ok();
                 let (from, to) = match at.split_once('-') {
                     Some((from, to)) => (time(from)?, time(to)?),
@@ -1401,6 +1454,16 @@ mod host {
             GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
             process == GetCurrentProcessId()
         }
+    }
+
+    #[test]
+    fn a_keys_file_holds_each_key_for_its_seconds() {
+        let now = Instant::now();
+        let asked = asked("Enter 0.2\nJ 1.5\nnot a key 3\nW -1\nX\n", now);
+        assert_eq!(
+            asked,
+            [(now + Duration::from_millis(200), 0x0D), (now + Duration::from_millis(1500), b'J')]
+        );
     }
 
     #[test]

@@ -351,13 +351,19 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
 /// The system allocator behind [`XMemAlloc`].
 pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
     if attributes & ALLOC_32BIT != 0 {
-        return XMemVirtualAlloc(
+        let at = XMemVirtualAlloc(
             std::ptr::null_mut(),
             size,
             MEM_RESERVE | MEM_COMMIT,
             GRAPHICS | ADDRESS_32BIT,
             PAGE_READWRITE,
         );
+        // The address may be one a freed allocation had: what the GPU side
+        // tracked there (placed textures, views, guards) is not this memory.
+        if !at.is_null() {
+            victory_gpu::title_memory_remapped(at as usize, size);
+        }
+        return at;
     }
     let Some(layout) = layout(size, attributes) else {
         return std::ptr::null_mut();
@@ -392,6 +398,12 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            // The GPU side forgets the allocation first and gives its guarded
+            // pages write access back, as for the title's own `VirtualFree`:
+            // after the release another allocation may take the address, and
+            // a guard left over (or a protection change made later) would hit
+            // memory not ours.
+            victory_gpu::title_memory_freed(address as usize, 0);
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
@@ -2301,6 +2313,31 @@ mod tests {
         let p = XMemAlloc(4096, ALLOC_32BIT);
         assert!(!p.is_null() && (p as usize) < 1 << 32);
         XMemFree(p, ALLOC_32BIT);
+    }
+
+    #[test]
+    fn a_32bit_block_freed_and_taken_again_is_plain_writable_memory() {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        const P: usize = 4096;
+        // A block whose middle page is read-only, as a guard leaves it: the
+        // free must get past the split regions, and the next block at any
+        // address must take writes on every page.
+        let p = XMemAlloc(3 * P, ALLOC_32BIT);
+        assert!(!p.is_null() && (p as usize) < 1 << 32);
+        let mut old = 0;
+        // SAFETY: the block's own middle page.
+        assert_ne!(
+            unsafe { VirtualProtect(p.cast::<u8>().add(P).cast(), P, PAGE_READONLY, &mut old) },
+            0
+        );
+        // Through the GPU side's forgetting (`title_memory_freed`) and then
+        // the release.
+        XMemFree(p, ALLOC_32BIT);
+        let q = XMemAlloc(3 * P, ALLOC_32BIT);
+        assert!(!q.is_null());
+        // SAFETY: 3 pages were allocated.
+        unsafe { q.cast::<u8>().write_bytes(0xcd, 3 * P) };
+        XMemFree(q, ALLOC_32BIT);
     }
 
     #[test]

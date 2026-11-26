@@ -249,6 +249,19 @@ extern "system" fn window_proc(
     // A user close (close button, Alt+F4, window or taskbar menu); a
     // console title never sees one, nor a WM_CLOSE from it.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
+        note_close("SC_CLOSE");
+        end_title("window closed", Box::new(|| {}));
+        return 0;
+    }
+    // Automation and other applications can send WM_CLOSE directly. Owned
+    // dialogs and hidden helper windows still handle their own close messages.
+    // SAFETY: both queries borrow the window being dispatched.
+    if message == wm::WM_CLOSE
+        && unsafe {
+            wm::IsWindowVisible(hwnd) != 0 && wm::GetAncestor(hwnd, wm::GA_ROOTOWNER) == hwnd
+        }
+    {
+        note_close("WM_CLOSE to the title's window");
         end_title("window closed", Box::new(|| {}));
         return 0;
     }
@@ -270,6 +283,40 @@ extern "system" fn window_proc(
         let title = std::mem::transmute::<*mut c_void, wm::WNDPROC>(title);
         wm::CallWindowProcW(title, hwnd, message, wparam, lparam)
     }
+}
+
+/// Says how a close arrived: sent from another thread (and whether that
+/// thread waits for the answer) or posted, and which process owns the
+/// window in front. Test sessions were closed minutes in by a close no one
+/// meant to send; this names the likely sender next time.
+fn note_close(how: &str) {
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    // SAFETY: plain queries about this thread's message and the desktop.
+    let (flags, front, owner) = unsafe {
+        let flags = wm::InSendMessageEx(std::ptr::null());
+        let front = wm::GetForegroundWindow();
+        let mut owner = 0u32;
+        if !front.is_null() {
+            wm::GetWindowThreadProcessId(front, &mut owner);
+        }
+        (flags, front, owner)
+    };
+    let sent = match flags & (wm::ISMEX_SEND | wm::ISMEX_NOTIFY | wm::ISMEX_CALLBACK) {
+        0 => "posted, or sent by this thread",
+        f if f & wm::ISMEX_NOTIFY != 0 => "sent by another thread, which does not wait",
+        f if f & wm::ISMEX_CALLBACK != 0 => "sent by another thread, with a callback",
+        _ => "sent by another thread, which waits",
+    };
+    // SAFETY: a plain query.
+    let ours = unsafe { GetCurrentProcessId() };
+    tracing::info!(
+        how,
+        sent,
+        front = format_args!("{:#x}", front as usize),
+        front_process = owner,
+        this_process = ours,
+        "close received"
+    );
 }
 
 /// Suspends the title as the console does when it ends it, runs `then`
@@ -559,6 +606,68 @@ mod tests {
             assert!(!wm::GetPropW(hwnd, TITLE_PROC).is_null());
             wm::DestroyWindow(hwnd);
         }
+    }
+
+    #[test]
+    fn direct_close_suspends_and_exits() {
+        const CHILD: &str = "VICTORY_TEST_DIRECT_CLOSE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "modules::lifecycle::tests::direct_close_suspends_and_exits",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "close test child failed: {stderr}");
+            assert!(stderr.contains("suspend routine ran"), "{stderr}");
+            return;
+        }
+
+        extern "system" fn record_suspend(_: u8, _: *mut c_void) {
+            eprintln!("suspend routine ran");
+        }
+
+        let null = std::ptr::null_mut();
+        let create = |owner| {
+            CreateWindowExW(
+                wm::WS_EX_NOACTIVATE | wm::WS_EX_TOOLWINDOW,
+                w!("STATIC"),
+                w!("VIctory close test"),
+                wm::WS_VISIBLE | wm::WS_POPUP,
+                -10_000,
+                -10_000,
+                10,
+                10,
+                owner,
+                null,
+                null,
+                std::ptr::null(),
+            )
+        };
+        let title = create(null);
+        assert!(!title.is_null());
+        let dialog = create(title);
+        assert!(!dialog.is_null());
+        // SAFETY: both windows belong to this test thread. Closing the dialog
+        // goes to its original procedure and leaves the title window alive.
+        unsafe {
+            wm::SendMessageW(dialog, wm::WM_CLOSE, 0, 0);
+            assert_eq!(wm::IsWindow(dialog), 0);
+            assert_ne!(wm::IsWindow(title), 0);
+        }
+        let mut registration = 0;
+        assert_eq!(
+            RegisterAppStateChangeNotification(Some(record_suspend), null, &mut registration),
+            0
+        );
+        // SAFETY: this thread owns the title window.
+        unsafe { wm::SendMessageW(title, wm::WM_CLOSE, 0, 0) };
+        std::thread::sleep(SUSPEND_DEADLINE + Duration::from_secs(1));
+        panic!("direct close did not exit the title process");
     }
 
     thread_local! {
