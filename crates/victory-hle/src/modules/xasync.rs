@@ -685,6 +685,8 @@ fn complete_call(call: &Call, block: *mut AsyncBlock, result: HRESULT, required_
     let (status, size) = words(block);
     if result < 0 || required_size == 0 {
         release(block);
+        #[cfg(test)]
+        tests::released(block);
     }
     // The status shows and the call is over under one hold of `done`: a title
     // that sees the result may begin another call on the block at once, and
@@ -711,9 +713,22 @@ pub fn XAsyncGetStatus(block: *mut AsyncBlock, wait: bool) -> HRESULT {
     if block.is_null() {
         return E_INVALIDARG;
     }
-    if wait && let Some(call) = call(block) {
-        let done = lock(&call.done);
-        drop(call.finished.wait_while(done, |d| !*d));
+    if wait {
+        loop {
+            if let Some(call) = call(block) {
+                let done = lock(&call.done);
+                drop(call.finished.wait_while(done, |d| !*d));
+                break;
+            }
+            // No call in flight while the status still reads pending: a call
+            // that failed has left the table (its cleanup ran first, while the
+            // block was still the title's) and shows its status next, or a call
+            // is being begun. Both end in a moment.
+            if status(block) != E_PENDING {
+                break;
+            }
+            std::thread::yield_now();
+        }
     }
     status(block)
 }
@@ -1246,6 +1261,48 @@ mod tests {
         if SLOW_PUBLISH.load(Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
+    }
+
+    /// Set by the test below to a block: its completion then stops after the
+    /// call left the table and before the status shows, and says so here.
+    static SLOW_RELEASE: AtomicUsize = AtomicUsize::new(0);
+    static RELEASED: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn released(block: *mut AsyncBlock) {
+        if SLOW_RELEASE.load(Ordering::SeqCst) == block as usize {
+            RELEASED.store(true, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// A wait that starts while a failed call is between leaving the table
+    /// and showing its status waits for the status (it read E_PENDING).
+    #[test]
+    fn a_wait_between_a_failed_calls_cleanup_and_its_status_waits() {
+        extern "system" fn work(_: *mut AsyncBlock) -> HRESULT {
+            E_ABORT
+        }
+        let mut block = AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        SLOW_RELEASE.store(std::ptr::addr_of_mut!(block) as usize, Ordering::SeqCst);
+        assert_eq!(
+            slot::<extern "system" fn(This, *mut AsyncBlock, Option<Work>) -> HRESULT>(0x30)(
+                &OBJECT,
+                &mut block,
+                Some(work)
+            ),
+            S_OK
+        );
+        while !RELEASED.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        assert!(call(&mut block).is_none(), "the call left the table first");
+        assert_eq!(XAsyncGetStatus(&mut block, true), E_ABORT);
+        SLOW_RELEASE.store(0, Ordering::SeqCst);
     }
 
     #[test]
