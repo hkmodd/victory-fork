@@ -170,12 +170,24 @@ fn spare_most() -> u64 {
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
 /// (memory not watched), or the write-watch asking it was detiled after.
+/// Whether a guarded texture that the guard saw no write to is hashed at
+/// this check: on its turn (every eighth frame, the textures taking turns),
+/// or at every check while its hashes keep finding it changed.
+fn hash_due(unwritten: bool, turn: bool, changing: bool) -> bool {
+    !unwritten || turn || changing
+}
+
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// The last hash found the texture changed although the guard saw no
+    /// write (writes through another view: a video's planes). It is hashed
+    /// at every check while that goes on, not every eighth frame: the
+    /// opening video showed its three frames in turn, each eight frames.
+    changing: bool,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -1066,7 +1078,7 @@ impl Staging {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            if !hash_due(unwritten, turn, last.changing) {
                 return 0;
             }
         }
@@ -1127,7 +1139,8 @@ impl Staging {
                 let hash = blake3::hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-                if last.hash == Some(hash) {
+                last.changing = last.hash != Some(hash);
+                if !last.changing {
                     return size;
                 }
                 last.hash = Some(hash);
@@ -1143,7 +1156,8 @@ impl Staging {
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
+        last.changing = last.hash != Some(hash);
+        if !last.changing {
             return size;
         }
         last.hash = Some(hash);
@@ -1166,7 +1180,8 @@ impl Staging {
                 return false;
             }
             let hash = blake3::hash(read);
-            if last.hash != Some(hash) {
+            last.changing = last.hash != Some(hash);
+            if last.changing {
                 last.hash = Some(hash);
                 self.detile(read);
             }
@@ -1542,6 +1557,23 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod hash_due_tests {
+    use super::hash_due;
+
+    #[test]
+    fn a_changing_texture_is_hashed_at_every_check() {
+        // A write the guard saw: hashed whatever the turn.
+        assert!(hash_due(false, false, false));
+        // Unwritten as far as the guard knows: on its turn only ...
+        assert!(hash_due(true, true, false));
+        assert!(!hash_due(true, false, false));
+        // ... unless its hashes keep finding it changed (a video's planes,
+        // written through another view): then at every check.
+        assert!(hash_due(true, false, true));
+    }
 }
 
 #[cfg(test)]
