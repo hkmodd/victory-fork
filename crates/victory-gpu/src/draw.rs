@@ -5471,8 +5471,12 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
-        // One record without a count: clamped in a batch (`batches`).
-        let batch = if batches() > 0 && max == 1 && count.is_none() {
+        // One record without a count: clamped in a batch (`batches`). Not a
+        // spread dispatch: its signature reads [row, asked x, x, y, z]
+        // records, and a batch writes [x, y, z] (read as spread words, its
+        // groups were wrong: the culling's mesh records asked for 102,272
+        // groups, the world drew nothing).
+        let batch = if batches() > 0 && max == 1 && count.is_none() && !is_spread {
             args.refresh(list, arguments, len);
             self.batched(list, &args, arguments, kind)
         } else {
