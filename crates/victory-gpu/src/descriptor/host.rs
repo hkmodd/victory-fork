@@ -1693,6 +1693,11 @@ impl HostHeap {
             {
                 use crate::copystat::{C, add};
                 add(C::DynamicRefused, 1);
+                add(C::DynamicFreeAtRefuse, u64::from(self.free.load(std::sync::atomic::Ordering::Relaxed)));
+                add(C::DynamicLenAtRefuse, n as u64);
+                if !enough {
+                    add(C::DynamicTooLong, 1);
+                }
                 add(C::DynamicNs, started.elapsed().as_nanos() as u64);
             }
             return None;

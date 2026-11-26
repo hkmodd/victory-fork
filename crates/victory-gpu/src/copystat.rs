@@ -52,6 +52,11 @@ pub(crate) enum C {
     DynamicAsked,
     DynamicRefused,
     DynamicNs,
+    /// At each refusal: the free slots then, the table's length, and
+    /// refusals cut short by a shorter table refused before (`too_long`).
+    DynamicFreeAtRefuse,
+    DynamicLenAtRefuse,
+    DynamicTooLong,
     /// Marker texts for device-removed data (`HostList::note`).
     NoteNs,
     /// Ranges given to shaders (steps), their snapshots, and the bytes
@@ -1180,7 +1185,7 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
          threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \
-         refused, {:.1} ms searching; notes {:.1} ms; shader-written ranges: {:.0} steps in \
+         refused (free then {:.0}, length {:.1}, by too_long {:.0}), {:.1} ms searching; notes {:.1} ms; shader-written ranges: {:.0} steps in \
          {:.1} submissions, snapshots {:.1} ms, {:.1} MB compared back; sparse reads {:.1} ms; \
          guards {:.1} ms; {:.1} MB copied whole (memory not watched); {:.1} frame waits \
          sleeping {:.1} ms (all threads); ranges of shaders that cannot store to buffers: \
@@ -1190,6 +1195,9 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::PipelineWaitUs as usize]),
         c[C::DynamicAsked as usize],
         c[C::DynamicRefused as usize],
+        c[C::DynamicFreeAtRefuse as usize] / c[C::DynamicRefused as usize].max(1.0),
+        c[C::DynamicLenAtRefuse as usize] / c[C::DynamicRefused as usize].max(1.0),
+        c[C::DynamicTooLong as usize],
         c[C::DynamicNs as usize] / 1e6,
         c[C::NoteNs as usize] / 1e6,
         c[C::GpuWrites as usize],
