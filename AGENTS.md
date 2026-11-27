@@ -92,6 +92,10 @@ non si può è una domanda a cui si risponde per iscritto **prima** dell'azione.
   (4) nodo d'archivio pertinente.
 - **E10 ERRORE = GUARDIA NUOVA NELLO STESSO TURNO.** Se un errore passa comunque, nello stesso turno si aggiunge la
   guardia che lo avrebbe fermato (script, test o riga qui, con la run che l'ha mostrato). Mai solo "errore mio".
+- **E11 IL GIOCO NON SI LANCIA SOTTO UN PROFILER** (avmgx1, 2026-11-27: sotto nsys la guardia non trovava victory.exe e
+  il gioco girava senza guardia; con `-t dx12` +4 GB di privata, chiuso a 34 GB; il log resta vuoto). Contatori GPU solo
+  device-wide accanto a una run normale (`run.ps1 -GpuMetricsAt <s>`). **Meccanico:** guard.ps1 cerca l'exe fra i
+  discendenti e, se non lo trova, chiude l'albero del cmd; il VERDICT richiede report delle pipeline e ≥4 finestre di mondo.
 
 ## 3. Protocollo di run (standard)
 
@@ -126,6 +130,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\Tools\victory\run.ps1 -Na
 | Precompilazione | `warm.ps1 -Set "<set>"`: `victory shaders <gioco>` (cache DXIL) + `victory warm --used` (le ~2400 pipeline usate, nella cache del driver, chiave = traduzione + driver) + timbro. La libreria `host-pipelines-<chiave>.bin` la riempie la run `-WarmUp` |
 | Switch documentati | README del repository, sezione "Status of this fork": ogni `VICTORY_*` con la misura dell'autore |
 | Disassembly / decompilazione dell'exe | Ghidra headless via MCP (`pyghidra-mcp`, porta 8000, `D:\Tools\start-ghidra-mcp.cmd`), exe già importato |
+| Contatori GPU | `run.ps1 ... -GpuMetricsAt 240` (gpumetrics.ps1: nsys `--gpu-metrics-devices=0`, 10 s, 10 kHz, device-wide, accanto al gioco) → `D:\Temp\victory\<nome>_gm.sqlite`; letture con `D:\Temp\victory\gm2.py`/`gm3.py`/`gm4.py` (medie, fasce per SM attivi, tempo su 1-2 SM) |
+| Costo per pipeline | `victory replay <cattura> --no-restore --timing detailed --awake --top 60`: ms, comandi e gruppi per dispatch diretta di ogni pipeline (cattura: `VICTORY_RECORD=D:\Temp\victory\rec,VICTORY_RECORD_AT=240`, ~8-11 GB, si cancella dopo) |
 | Timeline CPU+GPU | Nsight Systems 2025.5.2 (`C:\Program Files\NVIDIA Corporation\Nsight Systems 2025.5.2`): thread di submit, code, fence |
 | Shader | `dxc` (`C:\VulkanSDK\1.4.363.0\Bin\dxc`) per disassemblare o validare il DXIL tradotto |
 | Driver | `drvwatch` registra nel log gli errori del driver (nvlddmkm 153); il primo spegne le draw window |
@@ -168,7 +174,9 @@ I fork AMD vanno verificati su NVIDIA: un pezzo che dipende da wave64 o da compo
 - Oggi (2026-11-27, v7 caldo avmv7b): **18,4 fps** nel mondo col set standard, frame 51-60 ms. Muro doppio:
   **scheda ~55 ms** (liste del titolo 41, nostre 5, buchi 9) e lane ~35 ms. 30 fps = 33 ms di entrambi.
 - La scheda è lavoro degli shader tradotti diffuso su ~1270 pipeline (nessuna voce ≥5 ms); l'emulazione wave64 NON
-  è il muro (nodo 234); le leve a switch del traduttore sono esaurite. Senza contatori GPU (BLOCCO, impostazione
-  dell'Host) si lavora a pacchetti di leve misurate (E5).
+  è il muro (nodo 234); le leve a switch del traduttore sono esaurite.
+- Contatori GPU (avmgm2, mondo, 19,5 fps): scheda occupata 97%, ferma solo 1,7%; SM attivi 49%, issue 16%, DRAM 10%.
+  **~9 ms/frame su 1-2 SM di 76** (dispatch piccole o seriali) e, a SM pieni, issue 36% con 60% di slot di warp liberi
+  (registri). Non è banda né istruzioni pure: le leve sono le dispatch seriali e l'occupazione.
 - Storico: main 0b0074e 4,5-5,4 fps con muro = thread di submit 135-190 ms (risolto dalla linea avatarmanz).
 - Ombre nere = builder RT spento (`BVH_BUILDER=0`, guardia di memoria).
