@@ -270,6 +270,18 @@ static BAKE_SERVED: AtomicU64 = AtomicU64::new(0);
 const BAKE_PIXEL_SHADERS: [&str; 4] =
     ["c0a7fe77b1862e10", "0d1575a396dfe513", "b7cfd8dda91ebb6b", "280967ad158cee0b"];
 
+/// Whether `shader` is a program of the title's decoration bake.
+fn bake_shader(shader: &crate::pipeline::Shader) -> bool {
+    BAKE_PIXEL_SHADERS.contains(&shader.hash.as_str())
+}
+
+/// Whether a draw with the title pipeline `pipeline` bound gets the pass of
+/// its own ahead of a bake ([`State::early_textures`]): written-down lists
+/// (`crate::list::thin`) translate such draws at the title's call.
+pub(crate) fn bake_pipeline(pipeline: crate::object::This) -> bool {
+    early_budgets().1 > 0 && crate::pipeline::shaders_any(pipeline, bake_shader)
+}
+
 /// Where a pixel shader of the title's skin bake finds what it samples
 /// (fork pull request #1264, head 4c14ca41): the root parameter of its one
 /// table, and in that table the dwords of its buffer of decoration records
@@ -3072,8 +3084,7 @@ impl State {
         if early_ms == 0 && bake_ms == 0 {
             return;
         }
-        let bake = bake_ms > 0
-            && p.stages.iter().any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
+        let bake = bake_ms > 0 && p.stages.iter().any(|s| bake_shader(&s.shader));
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         // The milliseconds this frame's bake draws have taken so far: a
         // frame has several, and together they get `bake_ms`.
