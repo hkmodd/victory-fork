@@ -26,6 +26,23 @@ fn folder() -> Result<PathBuf> {
     Ok(cfg.cache_subdir("shaders")?.with_file_name("pipelines"))
 }
 
+fn bad_keys<'a>(text: &'a str, fingerprint: &str) -> HashSet<&'a str> {
+    let hex = |word: &str, len| word.len() == len && word.bytes().all(|b| b.is_ascii_hexdigit());
+    text.lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            let first = words.next()?;
+            let second = words.next();
+            let (key, recorded) = match second {
+                // Accept journals written by builds that put the fingerprint first.
+                Some(key) if hex(first, 16) && hex(key, 32) => (key, Some(first)),
+                _ => (first, second.and_then(|word| word.strip_prefix("fp=")).filter(|fp| hex(fp, 16))),
+            };
+            (hex(key, 32) && recorded.is_none_or(|fp| fp.eq_ignore_ascii_case(fingerprint))).then_some(key)
+        })
+        .collect()
+}
+
 pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, these: Option<String>) -> Result<()> {
     let dir = folder()?;
     if let Some(these) = these {
@@ -50,8 +67,12 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
             done.insert(key);
         }
     }
-    let bad = std::fs::read_to_string(&bad_file).unwrap_or_default();
-    let bad: HashSet<&str> = bad.lines().filter_map(|l| l.split(' ').next()).collect();
+    let listed_bad = if again || std::env::var_os("VICTORY_WARM_BAD").is_some_and(|v| v == "0") {
+        String::new()
+    } else {
+        std::fs::read_to_string(&bad_file).unwrap_or_default()
+    };
+    let bad = bad_keys(&listed_bad, &fingerprint);
     let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
     let early: HashSet<&str> = early.lines().collect();
     // Those earlier runs drew with first, the others in no order (by key).
@@ -99,7 +120,8 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         },
         |n, why| {
             println!("pipeline {n} {}: {why}", entries[n].key);
-            writeln!(lock(&bad_out), "{} {why}", entries[n].key).context("writing warm-bad.txt")?;
+            // Keep the key in column one for older readers of this journal.
+            writeln!(lock(&bad_out), "{} fp={fingerprint} {why}", entries[n].key).context("writing warm-bad.txt")?;
             lock(&state).2 += 1;
             Ok(())
         },
@@ -348,6 +370,18 @@ fn make(dir: &Path, these: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::windows::process::CommandExt;
+
+    #[test]
+    fn quarantine_expires_with_the_fingerprint_and_keeps_legacy_keys() {
+        let [current, stale, legacy, imported] = ['1', '2', '3', '4'].map(|c| c.to_string().repeat(32));
+        let fp = "1234567890abcdef";
+        let other = "ffffffffffffffff";
+        let listed = format!(
+            "# ignored\n\n{current} fp={fp} timed out\n{stale} fp={other}\n{legacy} manual entry\n{fp}\t{imported}\n"
+        );
+        assert_eq!(bad_keys(&listed, fp), HashSet::from([current.as_str(), legacy.as_str(), imported.as_str()]));
+        assert_eq!(bad_keys(&listed, other), HashSet::from([stale.as_str(), legacy.as_str()]));
+    }
 
     fn fake_child(script: &str, stdout: Stdio) -> Result<Child> {
         let cmd = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join(r"System32\cmd.exe");

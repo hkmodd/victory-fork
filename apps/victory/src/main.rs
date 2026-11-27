@@ -122,6 +122,7 @@ enum Command {
     /// (runs with `VICTORY_PIPELINE_BOOK=1` write them down), so that the
     /// driver's cache on disk has them before a run needs one: once per change
     /// of the translator or the driver. Goes on where it was stopped.
+    /// `VICTORY_WARM_BAD=0` ignores the quarantine in `warm-bad.txt`.
     #[cfg(windows)]
     Warm {
         /// Processes at once (default: two thirds of the logical cores).
@@ -130,7 +131,7 @@ enum Command {
         /// At most this many pipelines.
         #[arg(long)]
         limit: Option<usize>,
-        /// Those made before too.
+        /// Retry completed and quarantined pipelines too.
         #[arg(long)]
         again: bool,
         /// Only the pipelines earlier runs drew with.
