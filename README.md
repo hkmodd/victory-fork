@@ -131,7 +131,8 @@ Upstream's notes of commits 3221ac42, 0e006f00 and 1f5d17a6 (their numbers, on t
 - **Indirect mesh draws are launched by an amplification stage (`VICTORY_MESH_LAUNCH`, now on by
   default, `0` off; after pull request #1381):** no clamp pass before each record; the card 5 ms less a
   frame in an on/off split. The translated mesh shaders follow the same switch (shader caches must be
-  rebuilt).
+  rebuilt). **In this fork it is off by default** (`=1` turns it on): on the RTX 4080 with this
+  fork's set the world ran at 14.35 fps with it and 17.96 without (warm pipeline library, 195-300 s).
 
 Here the patch is made where this fork merges a page under shader writes (the pages are merged on
 several threads): a page whose copies of their own would pass `VICTORY_MERGE_RUNS` goes as a patch of

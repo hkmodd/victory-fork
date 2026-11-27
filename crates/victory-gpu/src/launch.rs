@@ -1,6 +1,6 @@
 //! Mesh draws launched by the card: an amplification shader of ours
 //! (`launch.hlsl`, embedded as `launch.dxil`) in front of every translated
-//! mesh shader (`VICTORY_MESH_LAUNCH`, on by default since run 362, `0` off; before: the clamp of
+//! mesh shader (`VICTORY_MESH_LAUNCH=1`; upstream's default since its run 362, off in this fork, see `mode`; off: the clamp of
 //! `crate::indirect` before each record, as before).
 //!
 //! The title draws its meshes one indirect record a call, each from the
@@ -65,14 +65,17 @@ pub(crate) fn on() -> bool {
     mode() != 0
 }
 
-/// `VICTORY_MESH_LAUNCH`: 0 off, 1 on (the default; run 361: card -5 ms), 2 in turn (`alt`, [`now`]).
+/// `VICTORY_MESH_LAUNCH`: 0 off (this fork's default), 1 on (upstream's
+/// default; its run 361: card -5 ms), 2 in turn (`alt`, [`now`]). Off here:
+/// on the RTX 4080 with this fork's set the world ran at 14.35 fps with it
+/// and 17.96 without (runs avmmesh2 / avmmesh3, warm pipeline library,
+/// 195-300 s; reference before the merge 18.49).
 fn mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_MESH_LAUNCH").as_deref() {
         Ok("1") => 1,
         Ok("alt") => 2,
-        Ok("0") => 0,
-        _ => 1,
+        _ => 0,
     })
 }
 
