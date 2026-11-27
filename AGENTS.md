@@ -99,6 +99,9 @@ non si può è una domanda a cui si risponde per iscritto **prima** dell'azione.
 - **E12 DECISIONE DATA = SCRITTA SUBITO** (2026-11-27: download a consenso dei binari Streamline già deciso dall'Host,
   richiesto di nuovo dopo una compattazione). Ogni decisione dell'Host entra in STATE.md DECISIONI nello stesso turno.
   Prima di ogni domanda all'Host: `grep -n <tema> STATE.md`; se la risposta c'è, si esegue, non si chiede.
+- **E13 SESSIONE BLOCCATA = NIENTE MISURA** (w2, 2026-11-27: PC bloccato e schermo in verticale, il lane aspetta il Present
+  4,5 ms invece di 1,3, 19,1 fps contro 20,8 di t1). **Meccanico:** `lockwatch.ps1` (LogonUI attivo o schermo cambiato)
+  annota `<nome>.locked.txt` e il VERDICT rifiuta la run. Si rifà a sessione sbloccata, schermo come nel riferimento.
 
 ## 3. Protocollo di run (standard)
 
