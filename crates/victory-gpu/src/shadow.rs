@@ -569,6 +569,21 @@ fn window_card_most() -> u64 {
     })
 }
 
+/// How much of the card's budget may be in use with a new window's copy on
+/// it, in hundredths (`VICTORY_CARD_WINDOWS_ROOM`, 50 to 98; 80, the
+/// default, leaves a fifth free as title buffers' copies do). Run avmed2:
+/// the card at 12,645 of 14,764 MB once the world was in, 311 windows on it
+/// and 1,024 turned down for the card's room, read over the bus.
+fn window_card_room_percent() -> u64 {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_CARD_WINDOWS_ROOM")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(80, |p| p.clamp(50, 98))
+    })
+}
+
 /// Bytes alive of windows' card sides ([`window_card_most`]).
 static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 
@@ -775,7 +790,7 @@ fn window_card_room(size: u64, how: &str) -> bool {
         }
     };
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * window_card_room_percent()
     {
         say(1, "no room on the card for");
         return false;
