@@ -5173,6 +5173,25 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.cmp(at, pred::NE, both, z))
     }
 
+    fn is_wave_scc_branch(&self, b: usize) -> bool {
+        let Some(last) = self.x.p.blocks[b].insts.last() else {
+            return false;
+        };
+        if !matches!(last.name(), "s_cbranch_scc0" | "s_cbranch_scc1") {
+            return false;
+        }
+        let Some(scc) = last.read(Reg::Scc) else {
+            return false;
+        };
+        if !self.x.st.scc_some.contains_key(&scc) {
+            return false;
+        }
+        let def_block = self.def_block.get(&scc).copied().unwrap_or(b);
+        !self.x.p.blocks[def_block].insts.iter().any(|i| {
+            i.write(Reg::Scc) == Some(scc) && i.write(Reg::S(crate::ir::EXEC)).is_some()
+        })
+    }
+
     fn wave_wide(&mut self, b: usize, when: Bool) -> Result<V, Why> {
         const WHY: Why = "a wave-wide branch where not every lane runs";
         let any = self.x.st.wave_any.get(b).copied().flatten().ok_or("a wave-wide branch on a scalar condition")?;
@@ -13936,7 +13955,7 @@ impl<'a> Lower<'a> {
             } => {
                 // A negated condition branches the other way round.
                 let (cond, taken, not_taken) = match self.x.st.bools.node(when) {
-                    _ if self.x.st.wide.contains(&b) || self.x.st.wave_scc.contains(&b) => {
+                    _ if self.x.st.wide.contains(&b) || self.is_wave_scc_branch(b) => {
                         let c = self.wave_wide(b, when).map_err(|w| unsupported(offset, w))?;
                         (c, taken, not_taken)
                     }

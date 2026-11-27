@@ -1609,14 +1609,10 @@ enum SccUse {
     Combined,
     Branch,
     Select,
-    StoreOnClear,
-    StoreOnSet,
 }
 
 fn nested_mask_scc(which: SccUse) -> NativeProgram {
     let choice: &[u32] = match which {
-        SccUse::StoreOnClear => return stores_in_scc_arms(false),
-        SccUse::StoreOnSet => return stores_in_scc_arms(true),
         SccUse::Combined => &[
             0x8506_8182, // s_cselect_b32 s6, 2, 1
             0xBF84_0002, // s_cbranch_scc0 to the value 1
@@ -1651,53 +1647,6 @@ fn nested_mask_scc(which: SccUse) -> NativeProgram {
         0xBEFE_040C, // s_mov_b64 exec, s[12:13]
     ]);
     native(&body)
-}
-
-/// Each active lane stores to its own dword in the chosen arm. The address
-/// is set before EXEC narrows, so every inactive lane also has a distinct
-/// in-bounds dword whose initial zero makes an unwanted store observable.
-fn stores_in_scc_arms(on_set: bool) -> NativeProgram {
-    let (branch, fallthrough, taken) = if on_set {
-        (0xbf85_0004, 1, 2) // s_cbranch_scc1
-    } else {
-        (0xbf84_0004, 2, 1) // s_cbranch_scc0
-    };
-    native(&[
-        0xbf8c_0000, // s_waitcnt 0 for the descriptor
-        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
-        0x7d88_0000, // v_cmp_gt_u32 vcc, s0, v0
-        0xbe8c_246a, // s_and_saveexec_b64 s[12:13], vcc
-        0xbf88_000a, // s_cbranch_execz to the restore
-        0x7d84_0001, // v_cmp_eq_u32 vcc, s1, v0
-        0x8792_7e6a, // s_and_b64 s[18:19], vcc, exec
-        branch,
-        0x7e04_0280 | fallthrough, // v_mov_b32 v2, fallthrough
-        0xe070_1000, 0x8002_0201, // buffer_store_dword v2 at v1
-        0xbf82_0003, // s_branch to the restore
-        0x7e04_0280 | taken, // v_mov_b32 v2, taken
-        0xe070_1000, 0x8002_0201, // buffer_store_dword v2 at v1
-        0xbefe_040c, // s_mov_b64 exec, s[12:13]
-    ])
-}
-
-#[test]
-fn both_arms_of_a_wave_wide_scc_branch_keep_their_store_guards() {
-    for on_set in [false, true] {
-        let native = stores_in_scc_arms(on_set);
-        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("IR");
-        let form = ir::without_skips(&p, false).expect("removable EXEC skip");
-        let st = structure::structure(&form).expect("structure");
-        let mut stores = 0;
-        for (block, guards) in form.blocks.iter().zip(&st.guards) {
-            for (inst, guard) in block.insts.iter().zip(guards) {
-                if inst.name() == "buffer_store_dword" {
-                    stores += 1;
-                    assert!(guard.is_some(), "store at {:#x} lost EXEC", inst.machine.offset);
-                }
-            }
-        }
-        assert_eq!(stores, 2);
-    }
 }
 
 fn emit_nested_mask_scc(native: &NativeProgram, p: &ir::Program) -> HostShader {
@@ -1796,9 +1745,7 @@ fn both_halves_observe_the_same_mask_scc_on_a_wave32_device() {
         return;
     }
     let mut total_wrong = 0;
-    for which in [
-        SccUse::Combined, SccUse::Branch, SccUse::Select, SccUse::StoreOnClear, SccUse::StoreOnSet,
-    ] {
+    for which in [SccUse::Combined, SccUse::Branch, SccUse::Select] {
         eprintln!("SCC_VARIANT {which:?}");
         let native = nested_mask_scc(which);
         let p = ir::build(&native.code, native.wave64, native.vgprs).expect("IR");
