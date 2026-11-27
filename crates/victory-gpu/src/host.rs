@@ -4870,7 +4870,7 @@ mod late_tests {
 /// only the copy that held it did.
 fn join_copies() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line: title buffer copies recorded, and those
@@ -8984,12 +8984,13 @@ impl HostList {
                 _ => None,
             })
             .collect();
-        // Over 4 threads when there are several (each holds a read buffer of
-        // its own, so not more); a texture's own lock orders two reads of it.
+        // Over up to 8 threads when there are several (7 kept ones and this
+        // one; each holds a read buffer of its own); a texture's own lock
+        // orders two reads of it.
         if textures.len() <= 1 {
             return textures.iter().filter(|staging| !staging.refresh_ahead()).count() as u64;
         }
-        let per = textures.len().div_ceil(4);
+        let per = textures.len().div_ceil(8);
         if crate::shadow::kept_threads_now() {
             // On kept threads of their own (`crate::shadow::ahead_workers`):
             // their read buffers stay grown from one flush to the next.

@@ -39,14 +39,24 @@ use super::host::{GraphicsState, HostPipeline, TargetFormats};
 /// two-layer vehicle wheel material, 57a3fad03cac36af and d5b9c94a30d7cf28;
 /// gfx41). Unlike `VICTORY_SKIP_PIPELINES`, in release builds too.
 fn denied(shaders: &[Arc<Shader>]) -> Option<&str> {
-    static LIST: OnceLock<Vec<String>> = OnceLock::new();
+    static LIST: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
     let list = LIST.get_or_init(|| {
-        std::env::var("VICTORY_DENY_PIPELINES")
+        // `VICTORY_DENY_PIPELINES_FILE=<path>`: more hashes, any 16 hex
+        // digits in the file (one a line, say), with the list's own.
+        let file = std::env::var_os("VICTORY_DENY_PIPELINES_FILE")
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_default();
+        let list: std::collections::HashSet<String> = std::env::var("VICTORY_DENY_PIPELINES")
             .unwrap_or_default()
-            .split(',')
+            .split(|c: char| !c.is_ascii_hexdigit())
+            .chain(file.split(|c: char| !c.is_ascii_hexdigit()))
             .map(|h| h.trim().to_ascii_lowercase())
-            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
-            .collect()
+            .filter(|h| h.len() == 16)
+            .collect();
+        if !list.is_empty() {
+            tracing::info!(pipelines = list.len(), "shaders whose pipelines are not built (VICTORY_DENY_PIPELINES / _FILE)");
+        }
+        list
     });
     if list.is_empty() {
         return None;
@@ -548,12 +558,13 @@ fn next(screens_only: bool) -> Arc<Pending> {
 }
 
 /// How many workers make pipelines: `asked` (`VICTORY_PIPELINE_WORKERS`, 1 to
-/// 64), else two thirds of the logical processors, 2 to 16. They run below the
+/// 64), else the logical processors less 4, 4 to 14 (upstream: 6 drained a
+/// cold library 35 % slower than 8 in its run 353). They run below the
 /// title's own threads, and a cold cache queues hundreds at once.
 fn worker_count(asked: Option<usize>, processors: usize) -> usize {
     match asked {
         Some(n) => n.clamp(1, 64),
-        None => (processors * 2 / 3).clamp(2, 16),
+        None => processors.saturating_sub(4).clamp(4, 14),
     }
 }
 
@@ -639,9 +650,9 @@ mod tests {
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
-        assert_eq!(worker_count(None, 1), 2);
-        assert_eq!(worker_count(None, 24), 16);
-        assert_eq!(worker_count(None, 64), 16);
+        assert_eq!(worker_count(None, 1), 4);
+        assert_eq!(worker_count(None, 16), 12);
+        assert_eq!(worker_count(None, 64), 14);
         assert_eq!(worker_count(Some(0), 24), 1);
         assert_eq!(worker_count(Some(20), 24), 20);
     }
