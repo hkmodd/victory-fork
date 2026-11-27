@@ -48,11 +48,14 @@ pub(crate) fn on() -> bool {
 }
 
 /// How many threads land, the relay's own counted (`VICTORY_LAND_THREADS`).
+/// Scales up to 6 threads on 24+ thread CPUs without oversubscribing title threads.
 fn threads() -> usize {
     static THREADS: OnceLock<usize> = OnceLock::new();
     *THREADS.get_or_init(|| {
         let asked = std::env::var("VICTORY_LAND_THREADS").ok().and_then(|v| v.trim().parse().ok());
-        asked.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get() / 4).clamp(1, 4)).clamp(1, 16)
+        asked
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get() / 4).clamp(1, 6))
+            .clamp(1, 16)
     })
 }
 

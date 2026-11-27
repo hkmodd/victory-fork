@@ -632,6 +632,76 @@ pub(crate) fn window_line(frames: f64) {
     );
 }
 
+/// Whether indirect executions whose arguments or count lie in title memory
+/// the card reads in place (renderer port 1, `VICTORY_PORT_CONSTANTS=1`) are
+/// clamped alone, right before they run (`VICTORY_PORT_CONSTANTS_ORDER`; `=0`:
+/// in batches and windows as any other).
+///
+/// A batch or a window clamps records ahead: in the pass recorded where it
+/// was opened, before the commands between it and the execution that reads
+/// the record. For a host copy that is fine, its bytes are the title's of
+/// the submission. Where the card reads the title's memory in place, the
+/// records the title's culling passes write between the two are read before
+/// they are written: the execution draws the records of an earlier frame,
+/// or none. With port 1 on, palms and trees in the boat mission's cutscene
+/// were missing for runs of frames while the camera moved (runs pop-5,
+/// pop-11 to pop-13), and with ports 1 and 5 off they were not (pop-10;
+/// POPIN.md).
+fn in_place_order() -> bool {
+    crate::toggled!("VICTORY_PORT_CONSTANTS_ORDER")
+}
+
+/// With [`in_place_order`]: such executions never in a batch (unset or
+/// `VICTORY_PORT_CONSTANTS_ORDER_ALONE=1`: the palms stayed in every frame,
+/// run pop-14). `=0`: in a batch opened after the last shader that may
+/// write buffers; not enough, the palms still came and went (run pop-15).
+fn in_place_alone() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PORT_CONSTANTS_ORDER_ALONE").is_none_or(|v| v != "0"))
+}
+
+/// Since the last line: indirect executions with arguments in place, those
+/// clamped alone for it, and the 1 MiB ranges they came from (diagnostics).
+static IN_PLACE_INDIRECT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static IN_PLACE_RANGES: std::sync::Mutex<std::collections::BTreeMap<u64, [u64; 3]>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// An indirect execution of `kind` with its arguments at `arguments` in place.
+fn in_place_indirect(arguments: u64, kind: u32) {
+    IN_PLACE_INDIRECT[0].fetch_add(1, Ordering::Relaxed);
+    IN_PLACE_INDIRECT[1].fetch_add(u64::from(in_place_order()), Ordering::Relaxed);
+    let slot = match kind {
+        2 => 1,
+        10 => 2,
+        _ => 0,
+    };
+    let mut ranges = IN_PLACE_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+    ranges.entry(arguments >> 20).or_default()[slot] += 1;
+}
+
+/// With the frame line: indirect executions with arguments in place per
+/// frame over `frames`, and the ranges most of them came from.
+pub(crate) fn in_place_indirect_line(frames: f64) {
+    let [all, alone] = [0, 1].map(|i| IN_PLACE_INDIRECT[i].swap(0, Ordering::Relaxed));
+    if all == 0 {
+        return;
+    }
+    let ranges = std::mem::take(&mut *IN_PLACE_RANGES.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut by: Vec<(u64, [u64; 3])> = ranges.into_iter().collect();
+    by.sort_by_key(|(_, n)| std::cmp::Reverse(n.iter().sum::<u64>()));
+    let top: Vec<String> = by
+        .iter()
+        .take(6)
+        .map(|(mb, n)| format!("{:#x}+1MiB: {:.0} draws {:.0} dispatches {:.0} mesh", mb << 20, n[0] as f64 / frames, n[1] as f64 / frames, n[2] as f64 / frames))
+        .collect();
+    tracing::info!(
+        "renderer port 1: indirect executions with arguments or count in place per frame: {:.0}, of them {:.0} clamped after every shader write before them (VICTORY_PORT_CONSTANTS_ORDER); from {} ranges of 1 MiB, the busiest: {}",
+        all as f64 / frames,
+        alone as f64 / frames,
+        by.len(),
+        top.join("; ")
+    );
+}
+
 /// Whether indirect executions of one record are clamped in batches
 /// (`crate::indirect::batch`; `VICTORY_INDIRECT_BATCH=0`: each on its own,
 /// or in windows ([`windows`])).
@@ -699,6 +769,9 @@ pub(crate) struct State {
     pipeline: usize,
     /// View heap, sampler heap.
     heaps: [usize; 2],
+    /// Cached `&'static Heap` pointers for `heaps` (avoids global heap-map
+    /// lookups on every `heap_of` / `tables` / `early_textures` call).
+    bound_heaps: [Option<&'static crate::descriptor::Heap>; 2],
     graphics: Vec<Root>,
     compute: Vec<Root>,
     vertex: [VertexView; 32],
@@ -795,9 +868,7 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, id, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, id, first, n);
-        }
+        crate::descriptor::release_dynamic_many(&self.dynamic);
     }
 }
 
@@ -817,9 +888,8 @@ impl State {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
         }
-        for (heap, id, first, n) in self.dynamic.drain(..) {
-            crate::descriptor::release_dynamic(heap, id, first, n);
-        }
+        crate::descriptor::release_dynamic_many(&self.dynamic);
+        self.dynamic.clear();
         self.fresh_tables.clear();
         self.recording = 0;
         self.root_srv_slots.clear();
@@ -1227,26 +1297,131 @@ fn sweep_per_heap() -> bool {
 pub(crate) struct BufferSweep {
     passes: u64,
     ranges: HeapRanges<std::sync::Arc<crate::shadow::Shadow>>,
+    // Per-part (`slot % HEAP_ROUND`) cached spans and view counts, so each
+    // frame does not rescan every slot in `ranges`.
+    part_spans: [crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>; HEAP_ROUND as usize],
+    part_views: [u32; HEAP_ROUND as usize],
+    dirty_parts: u16,
     // Last refresh frame and covered interval for throttled, unwatched copies.
     unwatched: std::collections::HashMap<u64, (u64, u64, u64)>,
 }
 
 impl Default for BufferSweep {
     fn default() -> Self {
-        Self { passes: 0, ranges: HeapRanges(Vec::new()), unwatched: Default::default() }
+        Self {
+            passes: 0,
+            ranges: HeapRanges(Vec::new()),
+            part_spans: std::array::from_fn(|_| Default::default()),
+            part_views: [0; HEAP_ROUND as usize],
+            dirty_parts: 0,
+            unwatched: Default::default(),
+        }
+    }
+}
+
+impl BufferSweep {
+    fn clear_all(&mut self) {
+        self.ranges.0.clear();
+        for spans in &mut self.part_spans {
+            spans.clear();
+        }
+        self.part_views = [0; HEAP_ROUND as usize];
+        self.dirty_parts = 0;
+    }
+
+    fn forget_part(&mut self, part: u32) {
+        self.ranges.forget_part(part, HEAP_ROUND as u32);
+        let p = part as usize;
+        self.part_spans[p].clear();
+        self.part_views[p] = 0;
+        self.dirty_parts &= !(1u16 << p);
+    }
+
+    fn set(&mut self, slot: u32, range: Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>) {
+        let p = (slot as usize) % (HEAP_ROUND as usize);
+        let old = self.ranges.replace(slot, range.clone());
+        match (&old, &range) {
+            (None, Some(_)) => self.part_views[p] += 1,
+            (Some(_), None) => self.part_views[p] -= 1,
+            _ => {}
+        }
+        if self.dirty_parts & (1u16 << p) != 0 {
+            return;
+        }
+        if let Some((old_shadow, old_from, old_to)) = old {
+            let old_key = std::sync::Arc::as_ptr(&old_shadow) as usize;
+            if let Some((new_shadow, new_from, new_to)) = &range {
+                let new_key = std::sync::Arc::as_ptr(new_shadow) as usize;
+                if old_key == new_key && old_from == *new_from && old_to == *new_to {
+                    return;
+                }
+                if old_key == new_key
+                    && let Some(span) = self.part_spans[p].get_mut(&old_key)
+                    && span.1 < old_from
+                    && old_to < span.2
+                {
+                    span.1 = span.1.min(*new_from);
+                    span.2 = span.2.max(*new_to);
+                    return;
+                }
+            }
+            self.dirty_parts |= 1u16 << p;
+            return;
+        }
+        if let Some((shadow, from, to)) = range {
+            let key = std::sync::Arc::as_ptr(&shadow) as usize;
+            let span = self.part_spans[p].entry(key).or_insert_with(|| (shadow, from, to));
+            span.1 = span.1.min(from);
+            span.2 = span.2.max(to);
+        }
+    }
+
+    fn spans(&mut self) -> (crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>, u32) {
+        let mut dirty = self.dirty_parts;
+        self.dirty_parts = 0;
+        while dirty != 0 {
+            let p = dirty.trailing_zeros() as usize;
+            dirty &= dirty - 1;
+            let part = &mut self.part_spans[p];
+            part.clear();
+            let mut count = 0u32;
+            for (shadow, from, to) in self.ranges.part_ranges(p as u32, HEAP_ROUND as u32) {
+                count += 1;
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
+                let span = part.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
+                span.1 = span.1.min(*from);
+                span.2 = span.2.max(*to);
+            }
+            self.part_views[p] = count;
+        }
+        let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = Default::default();
+        for part in &self.part_spans {
+            for (&key, (shadow, from, to)) in part {
+                let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
+                span.1 = span.1.min(*from);
+                span.2 = span.2.max(*to);
+            }
+        }
+        let views: u32 = self.part_views.iter().sum();
+        (spans, views)
     }
 }
 
 impl<T> HeapRanges<T> {
+    #[cfg(test)]
     fn set(&mut self, slot: u32, range: Option<(T, u64, u64)>) {
+        let _ = self.replace(slot, range);
+    }
+
+    fn replace(&mut self, slot: u32, range: Option<(T, u64, u64)>) -> Option<(T, u64, u64)> {
         let slot = slot as usize;
         if range.is_none() && slot >= self.0.len() {
-            return;
+            return None;
         }
         if slot >= self.0.len() {
             self.0.resize_with(slot + 1, || None);
         }
-        self.0[slot] = range;
+        std::mem::replace(&mut self.0[slot], range)
     }
 
     /// Forgets the slots of one of `parts` parts
@@ -1255,6 +1430,11 @@ impl<T> HeapRanges<T> {
         self.0.iter_mut().skip(part as usize).step_by(parts as usize).for_each(|r| *r = None);
     }
 
+    fn part_ranges(&self, part: u32, parts: u32) -> impl Iterator<Item = &(T, u64, u64)> {
+        self.0.iter().skip(part as usize).step_by(parts as usize).flatten()
+    }
+
+    #[cfg(test)]
     fn ranges(&self) -> impl Iterator<Item = &(T, u64, u64)> {
         self.0.iter().flatten()
     }
@@ -1585,23 +1765,27 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     // released resource goes stale without a write, and a slot written
     // before its memory had a host copy is only made then.
     let mut kept = host.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner());
-    let BufferSweep { passes, ranges, unwatched } = &mut *kept;
     let changed = host.buffer_changes();
-    let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
+    let all = kept.passes == 0 || (kept.passes % HEAP_ROUND == 0 && !heap_spread());
     let slots = if all {
-        ranges.0.clear();
+        kept.clear_all();
         host.buffer_slots()
     } else if heap_spread() {
-        // The written ones, and this pass's part of the others.
-        let (part, parts) = ((*passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
-        ranges.forget_part(part, parts);
+        // The written ones, and this pass's part of the others (deduplicated so
+        // slots in both `part` and `changed` are not looked up twice).
+        let part = (kept.passes % HEAP_ROUND) as u32;
+        kept.forget_part(part);
         let mut slots = host.buffer_slots_of::<{ HEAP_ROUND as u32 }>(part);
-        slots.extend(changed);
+        if !changed.is_empty() {
+            slots.extend(changed);
+            slots.sort_unstable();
+            slots.dedup();
+        }
         slots
     } else {
         changed
     };
-    *passes += 1;
+    kept.passes += 1;
     // Whether the device was there before the pass: a view that removes
     // it is named below.
     static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1664,23 +1848,16 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
             }
             range
         });
-        ranges.set(index, range);
+        kept.set(index, range);
     }
     if crate::picked::on() {
         crate::picked::shown(unordered, all);
     }
     #[cfg(feature = "diagnostics")]
     let looked = std::time::Instant::now();
-    // Per host copy, the span its picked views cover.
-    let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = Default::default();
-    let mut views = 0u32;
-    for (shadow, from, to) in ranges.ranges() {
-        views += 1;
-        let key = std::sync::Arc::as_ptr(shadow) as usize;
-        let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-        span.1 = span.1.min(*from);
-        span.2 = span.2.max(*to);
-    }
+    // Per host copy, the span its picked views cover (merged from the cached
+    // per-part spans rather than rescanning every slot in `ranges`).
+    let (spans, views) = kept.spans();
     let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
     // Memory that is not write-watched is copied whole by every refresh.
     // It was once refreshed only every 120 frames (unmapped pages read
@@ -1698,7 +1875,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     for (shadow, from, to) in spans.values() {
         if every > 1 && shadow.unwatched() {
             let id = shadow.id();
-            if let Some(&(last, low, high)) = unwatched.get(&id)
+            if let Some(&(last, low, high)) = kept.unwatched.get(&id)
                 && frame >= last && frame - last < every && low <= *from && *to <= high
             {
                 next_unwatched.insert(id, (last, low, high));
@@ -1708,7 +1885,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         }
         found.push((shadow.clone(), *from, (*to).min(*from + shadow.left(*from))));
     }
-    *unwatched = next_unwatched;
+    kept.unwatched = next_unwatched;
     drop(kept);
     #[cfg(feature = "diagnostics")]
     let refreshed = std::time::Instant::now();
@@ -1764,12 +1941,23 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// A host compute library bound its own pipeline, root signature and heaps.
+    pub(crate) fn external_compute(&mut self) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [usize::MAX; 2];
+        self.host_heaps_set = false;
+    }
+
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
         self.heaps = [0; 2];
+        self.bound_heaps = [None; 2];
         for &h in heaps {
             if !h.is_null() {
-                let samplers = crate::descriptor::heap(h).samplers();
-                self.heaps[usize::from(samplers)] = h as usize;
+                let heap = crate::descriptor::heap(h);
+                let idx = usize::from(heap.samplers());
+                self.heaps[idx] = h as usize;
+                self.bound_heaps[idx] = Some(heap);
             }
         }
     }
@@ -2159,11 +2347,12 @@ impl State {
     }
 
     /// The bound heap holding `handle`.
+    #[inline]
     fn heap_of(&self, handle: u64) -> Option<&'static crate::descriptor::Heap> {
-        self.heaps
+        self.bound_heaps
             .iter()
-            .filter(|&&h| h != 0)
-            .map(|&h| crate::descriptor::heap(h as This))
+            .flatten()
+            .copied()
             .find(|h| h.index(handle).is_some())
     }
 
@@ -2284,6 +2473,7 @@ impl State {
         {
             once!("a dispatch without a view heap that needs one gets the title's");
             self.heaps[0] = heap;
+            self.bound_heaps[0] = Some(crate::descriptor::heap(heap as This));
         }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them, with both a view heap and a sampler heap bound.
@@ -2294,11 +2484,7 @@ impl State {
         if (fallback && !self.host_heaps_set) || self.host_heaps != self.heaps {
             let mut view_heap: Option<ID3D12DescriptorHeap> = None;
             let mut sampler_heap: Option<ID3D12DescriptorHeap> = None;
-            for &h in &self.heaps {
-                if h == 0 {
-                    continue;
-                }
-                let title_heap = crate::descriptor::heap(h as This);
+            for title_heap in self.bound_heaps.iter().flatten().copied() {
                 if let Some(host_heap) = title_heap.host() {
                     if title_heap.samplers() {
                         sampler_heap = Some(host_heap.heap.clone());
@@ -2313,18 +2499,21 @@ impl State {
             if fallback && sampler_heap.is_none() {
                 sampler_heap = crate::host::host().and_then(|h| h.fallback_sampler_heap().cloned());
             }
-            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = Vec::with_capacity(2);
+            let mut heaps: [Option<ID3D12DescriptorHeap>; 2] = [None, None];
+            let mut n_heaps = 0;
             if let Some(h) = view_heap {
                 list.keep(&h);
-                heaps.push(Some(h));
+                heaps[n_heaps] = Some(h);
+                n_heaps += 1;
             }
             if let Some(h) = sampler_heap {
                 list.keep(&h);
-                heaps.push(Some(h));
+                heaps[n_heaps] = Some(h);
+                n_heaps += 1;
             }
-            if !heaps.is_empty() {
+            if n_heaps > 0 {
                 // SAFETY: an open list and shader-visible heaps.
-                unsafe { l.SetDescriptorHeaps(&heaps) };
+                unsafe { l.SetDescriptorHeaps(&heaps[..n_heaps]) };
             }
             self.host_heaps = self.heaps;
             self.host_heaps_set = true;
@@ -3103,13 +3292,7 @@ impl State {
         } else {
             return;
         };
-        let Some(heap) = self
-            .heaps
-            .iter()
-            .filter(|&&h| h != 0)
-            .map(|&h| crate::descriptor::heap(h as This))
-            .find(|h| !h.samplers())
-        else {
+        let Some(heap) = self.bound_heaps[0] else {
             return;
         };
         let Some(host) = heap.host() else {
@@ -4064,6 +4247,19 @@ impl State {
         crate::pipeline::host_pipeline(self.pipeline as This).is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores))
     }
 
+    /// Diagnostics: what kind of dispatch `p` is, for the stamps around it.
+    #[cfg(feature = "diagnostics")]
+    fn stamp_kind(&self, p: &HostPipeline) -> crate::host::rtstamps::Kind {
+        use crate::host::rtstamps::Kind;
+        if crate::pipeline::is_builder(self.pipeline as This) {
+            Kind::Builder
+        } else if p.stages.iter().any(|s| s.translated().host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY)) {
+            Kind::Walks
+        } else {
+            Kind::Other
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
@@ -4191,8 +4387,14 @@ impl State {
             }
         }
         note_defrag(p, Some(u64::from(x) * u64::from(y) * u64::from(z)));
+        #[cfg(feature = "diagnostics")]
+        let stamp = crate::host::rtstamps::before(&list.list);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(gx, gy, gz) };
+        #[cfg(feature = "diagnostics")]
+        if stamp.is_some() {
+            crate::host::rtstamps::after(&list.list, stamp, self.stamp_kind(p), p.pso.as_raw() as usize, &p.name);
+        }
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
@@ -4955,7 +5157,7 @@ impl State {
                         tally(18, 1);
                     }
                 }
-                for k in selected {
+                for &k in selected.iter() {
                     if group.entry(k).is_some() {
                         continue;
                     }
@@ -5616,13 +5818,32 @@ impl State {
             return true;
         }
 
+        // Renderer port 1: arguments (or their count) in the title's memory
+        // read in place ([`in_place_order`]): clamped alone, right before
+        // their execution, after a wait for every earlier shader write.
+        let in_place = args.in_place() || counter.as_ref().is_some_and(|(s, _)| s.in_place());
+        if in_place {
+            in_place_indirect(arguments, kind);
+        }
+        let ordered = in_place && in_place_order();
+        // Alone (`VICTORY_PORT_CONSTANTS_ORDER_ALONE=1`): no batch at all.
+        // Else a batch that a shader writing buffers was recorded after is
+        // not used: a new one is opened here, after it (what
+        // `VICTORY_INDIRECT_BATCH=1` does for every batch).
+        let alone = ordered && in_place_alone();
+        if ordered {
+            if alone || self.batch.as_ref().is_some_and(|b| b.wrote) {
+                self.batch = None;
+            }
+            self.window = None;
+        }
         // One record without a count: clamped in a batch (`batches`). A
         // spread dispatch's signature reads [row, asked x, x, y, z] records:
         // its job writes them (`batch::SPREAD`; read as spread words, plain
         // [x, y, z] gave the culling's mesh records 102,272 groups and the
         // world drew nothing; left out of batches, it ran at 14.6 fps
         // against 20.7 with spreading off, run avmsp1).
-        let batch = if batches() > 0 && max == 1 && count.is_none() {
+        let batch = if !alone && batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
             self.batched(list, &args, arguments, if is_spread { crate::indirect::batch::SPREAD } else { kind })
         } else {
@@ -5638,6 +5859,7 @@ impl State {
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
         let windowed = windows()
+            && !ordered
             && kind != DISPATCH
             && max == 1
             && count.is_none()
@@ -5890,6 +6112,8 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        #[cfg(feature = "diagnostics")]
+        let stamp = if kind == DISPATCH { crate::host::rtstamps::before(&list.list) } else { None };
         let count_buffer = counter.as_ref().map(|(s, _)| &s.buffer);
         let count_offset = counter.as_ref().map_or(0, |(s, at)| s.offset(*at));
         if let (Some(plain), Some((pred, spread_at))) = (plain.as_ref().filter(|_| lean.is_some()), lean) {
@@ -5912,6 +6136,10 @@ impl State {
         }
         if kind == MESH {
             self.mesh_scissor(list, false);
+        }
+        #[cfg(feature = "diagnostics")]
+        if stamp.is_some() {
+            crate::host::rtstamps::after(&list.list, stamp, self.stamp_kind(p), p.pso.as_raw() as usize, &p.name);
         }
         if kind == DISPATCH {
             self.buffers_written();
@@ -6278,6 +6506,27 @@ impl<T: Copy, const N: usize> Few<T, N> {
             }
             self.many.push(what);
         }
+    }
+
+    fn dedup(&mut self)
+    where
+        T: PartialEq,
+    {
+        if !self.many.is_empty() {
+            self.many.dedup();
+            return;
+        }
+        if self.len <= 1 {
+            return;
+        }
+        let mut w = 1;
+        for r in 1..self.len {
+            if self.few[r] != self.few[w - 1] {
+                self.few[w] = self.few[r];
+                w += 1;
+            }
+        }
+        self.len = w;
     }
 }
 

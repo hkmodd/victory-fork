@@ -15,7 +15,7 @@ const MAX_FILE_SIZE: usize = 640 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
-    "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "py", "cmd", "sh",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
@@ -23,6 +23,7 @@ const ALLOWED_NAMES: &[&str] = &[
     ".editorconfig",
     ".victory-root",
     "pre-commit",
+    "launch.bat",
     "LICENSE",
     "LICENSE-MIT",
     "LICENSE-APACHE",

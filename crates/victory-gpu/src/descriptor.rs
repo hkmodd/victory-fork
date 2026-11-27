@@ -808,6 +808,7 @@ static SYNC_SPLIT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomi
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
     crate::port_descriptors::line(frames);
+    crate::draw::in_place_indirect_line(frames);
     let [twins, moved, lost] = [0, 1, 2].map(|i| host::TWINS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if twins > 0 {
         tracing::info!(
@@ -912,19 +913,34 @@ pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T>
     heaps.iter().any(|&(_, _, h)| h == heap).then(|| f(unsafe { &*(heap as *const Heap) }))
 }
 
-/// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap is still there, and `id` says it is the one that
-/// took them ([crate::descriptor::host::HostHeap::id]): the title can release
-/// the heap a list's slots came from, and a later heap can be made at the
-/// same address before the list is reset.
+/// Gives back dynamic slots of the host heaps behind title heaps, each if
+/// that heap is still there and its id says it is the one that took them
+/// ([crate::descriptor::host::HostHeap::id]): the title can release the heap
+/// a list's slots came from, and a later heap can be made at the same
+/// address before the list is reset. In batches by heap: `SHADER_HEAPS` and
+/// each host heap's dynamic lock are taken once per run of the same heap
+/// (xavi 13e1f5ed0).
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, id: u64, first: u32, n: u32) {
+pub(crate) fn release_dynamic_many(entries: &[(usize, u64, u32, u32)]) {
+    if entries.is_empty() {
+        return;
+    }
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-    if heaps.iter().any(|&(_, _, h)| h == heap)
-        // SAFETY: registered heaps are live (removed when dropped).
-        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
-    {
-        host.release(id, first, n);
+    let mut batch: Vec<(u32, u32)> = Vec::new();
+    let mut i = 0;
+    while i < entries.len() {
+        let (heap, id) = (entries[i].0, entries[i].1);
+        batch.clear();
+        while i < entries.len() && entries[i].0 == heap && entries[i].1 == id {
+            batch.push((entries[i].2, entries[i].3));
+            i += 1;
+        }
+        if heaps.iter().any(|&(_, _, h)| h == heap)
+            // SAFETY: registered heaps are live (removed when dropped).
+            && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+        {
+            host.release_many(id, &batch);
+        }
     }
 }
 
