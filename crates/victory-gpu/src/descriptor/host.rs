@@ -606,43 +606,64 @@ static FLIPS: Mutex<Vec<Flip>> = Mutex::new(Vec::new());
 /// until its new one is made and uploaded (as the title wrote it,
 /// [`HostHeap::mirror`], or as the texture pass took it,
 /// [`HostHeap::show_later`]): the title record's handle and key, the frame
-/// it was first so, and why the swap that was to end it was let go, if one
-/// was.
+/// it was first so, why the swap that was to end it was let go, if one was,
+/// and how many times the sweep found it so already.
 struct Holding {
     handle: u64,
     key: u64,
     since: u64,
     why: &'static str,
+    looks: u32,
 }
 
-/// The slots kept so, by heap (its address) and slot. A swap is made only
-/// by a flip ([`HostHeap::texture_slots_flip`]), and a flip is let go when
-/// the record was written again, when the texture's memory was unmapped by
+/// The slots kept so, by heap (its address) and slot, and the same in the
+/// order the sweep is to look at them (the frame, heap, slot and record
+/// key): each frame's sweep takes only those whose time has come, not the
+/// whole set. A swap is made only by a flip
+/// ([`HostHeap::texture_slots_flip`]), and a flip is let go when the
+/// record was written again, when the texture's memory was unmapped by
 /// then, when the host could not make the view, or never comes (a list
-/// whose steps never ran, an upload job that did not end). The write
-/// was marked done when the upload was recorded: nothing brought the slot
-/// back to the queue, and it showed the other texture for the rest of the
-/// run. (And while the card has no room, the pass holds back the slot of a
+/// whose steps never ran, an upload job that did not end). The write was
+/// marked done when the upload was recorded: nothing brought the slot back
+/// to the queue, and it showed the other texture for the rest of the run.
+/// (And while the card has no room, the pass holds back the slot of a
 /// texture without its host copy, which goes on showing the other one as
-/// long as that lasts.) The prison guard's forearms showed a normal map's flat blue in
-/// some runs and the tattooed skin in others (amb-t6, amb-t8).
-static HOLDING: Mutex<std::collections::BTreeMap<(usize, u32), Holding>> =
-    Mutex::new(std::collections::BTreeMap::new());
+/// long as that lasts.) The prison guard's forearms showed a normal map's
+/// flat blue in some runs and the tattooed skin in others (amb-t6, amb-t8).
+struct Holdings {
+    by_slot: std::collections::HashMap<(usize, u32), Holding>,
+    order: std::collections::VecDeque<(u64, usize, u32, u64)>,
+}
+
+static HOLDING: Mutex<Option<Holdings>> = Mutex::new(None);
+
+fn with_holding<T>(f: impl FnOnce(&mut Holdings) -> T) -> T {
+    let mut holding = HOLDING.lock().unwrap_or_else(|e| e.into_inner());
+    f(holding.get_or_insert_with(|| Holdings { by_slot: Default::default(), order: Default::default() }))
+}
 
 /// Since the start: slots found still showing the texture they showed
 /// before their new one [`kept_sweep`] frames after it was asked for (a
-/// lost swap); of them made from their new view; whose new texture had no
-/// host copy yet (due again, left as they were: the card may have had no
-/// room); given the neutral texture (the host could not make the view);
-/// and flips let go because the host could not make the view (index 3).
-static SWEPT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+/// lost swap, each slot and record once); of them made from their new
+/// view; whose new texture had no host copy yet (due again, left as they
+/// were: the card had no room for it; each once); given the neutral
+/// texture (the host could not make the view); flips let go because the
+/// host could not make the view; the looks again at those without a host
+/// copy; of the slots without one at the first look, those that showed
+/// their own texture at a later one.
+static SWEPT: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// The sweep's own clock, since the start: frames it ran in, nanoseconds,
+/// the longest, and slots it looked at.
+static SWEEP_TIME: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// After how many frames a slot that still shows the texture it showed
 /// before its new one, with the title's record unchanged, is taken for a
 /// lost swap: it is made from its new view then if that texture has its
 /// host copy (the neutral texture if the host cannot make the view), and
-/// its texture is due again either way (`VICTORY_KEPT_SWEEP=<frames>`, 120; `0`: such slots are counted and
-/// logged and stay as they are, as before).
+/// its texture is due again either way (`VICTORY_KEPT_SWEEP=<frames>`,
+/// 120; `0`: such slots are counted and logged and stay as they are, as
+/// before).
 fn kept_sweep() -> (u64, bool) {
     const FRAMES: u64 = 120;
     static SWEEP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -654,12 +675,28 @@ fn kept_sweep() -> (u64, bool) {
 
 /// Why the flip of a kept slot was let go: noted on its [`Holding`].
 fn holding_lost(heap: usize, index: u32, key: u64, why: &'static str) {
-    let mut holding = HOLDING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(h) = holding.get_mut(&(heap, index))
-        && h.key == key
-    {
-        h.why = why;
-    }
+    with_holding(|kept| {
+        if let Some(h) = kept.by_slot.get_mut(&(heap, index))
+            && h.key == key
+        {
+            h.why = why;
+        }
+    });
+}
+
+/// What the sweep's numbers say, for the statistics line: its time per
+/// frame on average and the longest (microseconds), slots it looked at a
+/// frame, slots tracked now.
+fn sweep_numbers() -> (f64, f64, f64, usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let frames = SWEEP_TIME[0].load(Relaxed).max(1) as f64;
+    let tracked = HOLDING.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |k| k.by_slot.len());
+    (
+        SWEEP_TIME[1].load(Relaxed) as f64 / frames / 1e3,
+        SWEEP_TIME[2].load(Relaxed) as f64 / 1e3,
+        SWEEP_TIME[3].load(Relaxed) as f64 / frames,
+        tracked,
+    )
 }
 
 /// Makes the slots whose new texture's upload has run
@@ -2909,19 +2946,26 @@ impl HostHeap {
     fn hold(&self, index: u32, handle: u64, key: u64) {
         let heap = std::ptr::from_ref(self) as usize;
         let since = crate::frame::current();
-        let mut holding = HOLDING.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = holding.entry((heap, index)).or_insert(Holding { handle, key, since, why: "no swap came" });
-        if entry.key != key {
-            *entry = Holding { handle, key, since, why: "no swap came" };
-        }
+        let at = since + kept_sweep().0;
+        with_holding(|kept| {
+            if kept.by_slot.get(&(heap, index)).is_some_and(|h| h.key == key) {
+                return;
+            }
+            kept.by_slot.insert((heap, index), Holding { handle, key, since, why: "no swap came", looks: 0 });
+            kept.order.push_back((at, heap, index, key));
+        });
     }
 
-    /// The slots of this heap kept showing another texture ([`HOLDING`]):
-    /// those whose swap came are let go; one still kept [`kept_sweep`]
-    /// frames after it was asked for, with the title's record as it was, is
-    /// a lost swap. It is made from its new view (the neutral texture if
-    /// the host cannot make that), and its texture is due again so that the
-    /// texture pass uploads what it holds. Once a frame.
+    /// The slots of this heap kept showing another texture ([`HOLDING`])
+    /// whose time has come: one whose swap came, or that was written again,
+    /// is let go; one still kept [`kept_sweep`] frames after it was so, with
+    /// the title's record as it was, is a lost swap. It is made from its new
+    /// view if that texture has its host copy (the neutral texture if the
+    /// host cannot make the view); without one it is left as it is and
+    /// looked at again as many frames later. Either way its texture is due
+    /// again, so that the texture pass uploads what it holds. Once a frame,
+    /// on the thread whose texture pass runs first in it (or an upload
+    /// thread's [`flip_now`]); its time is on the statistics line.
     fn sweep_kept(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
@@ -2929,34 +2973,49 @@ impl HostHeap {
         if LAST.swap(frame, Relaxed) == frame {
             return;
         }
+        let began = std::time::Instant::now();
         let heap = std::ptr::from_ref(self) as usize;
         let (frames, remake) = kept_sweep();
         // (Taken out under the map's lock, looked at under each slot's.)
         let mut lost = Vec::new();
-        {
-            let mut holding = HOLDING.lock().unwrap_or_else(|e| e.into_inner());
-            if holding.is_empty() {
-                return;
-            }
-            holding.retain(|&(h, index), kept| {
-                if h != heap {
-                    return true;
+        let looked = with_holding(|kept| {
+            let mut looked = 0u64;
+            let mut others = Vec::new();
+            while let Some(&(at, h, index, key)) = kept.order.front() {
+                if at > frame {
+                    break;
                 }
+                kept.order.pop_front();
+                looked += 1;
+                if h != heap {
+                    others.push((at, h, index, key));
+                    continue;
+                }
+                // Replaced by a later one, which has its own place in order.
+                let Some(holding) = kept.by_slot.get(&(h, index)).filter(|k| k.key == key) else {
+                    continue;
+                };
+                let holding = (holding.handle, holding.since, holding.why, holding.looks);
+                kept.by_slot.remove(&(h, index));
                 // Swapped, showing nothing of another texture any more, or
                 // written again (that write is in the queue).
                 let shown = self.made.get(index);
-                if shown == Some(kept.key) || shown == Some(0) || record_key(kept.handle) != kept.key {
-                    return false;
+                if shown == Some(key) || shown == Some(0) || record_key(holding.0) != key {
+                    if holding.3 > 0 && shown == Some(key) {
+                        SWEPT[6].fetch_add(1, Relaxed);
+                    }
+                    continue;
                 }
-                if frame.saturating_sub(kept.since) < frames {
-                    return true;
-                }
-                lost.push((index, kept.handle, kept.key, kept.since, kept.why));
-                false
-            });
-        }
+                lost.push((index, key, holding));
+            }
+            // (Another heap's, put back: a title has one view heap.)
+            for other in others.into_iter().rev() {
+                kept.order.push_front(other);
+            }
+            looked
+        });
         let (mut due, mut again) = (Vec::new(), Vec::new());
-        for (index, handle, key, since, why) in lost {
+        for (index, key, (handle, since, why, looks)) in lost {
             let _made = self.made.lock(index);
             let Some(shown) = self.made.get(index) else {
                 continue;
@@ -2964,34 +3023,7 @@ impl HostHeap {
             if shown == key || shown == 0 || record_key(handle) != key {
                 continue;
             }
-            let n = SWEPT[0].fetch_add(1, Relaxed) + 1;
             let view = view_at(key as u32, (key >> 32) as u32);
-            if n <= 16 || n.is_power_of_two() {
-                let shape = |key: u64| match view_at(key as u32, (key >> 32) as u32) {
-                    Some(View::Placed(false, resource, desc)) => format!(
-                        "{}x{} f{} at {:#x}",
-                        resource[4],
-                        resource[6],
-                        resource[8],
-                        u64::from(desc[10]) | u64::from(desc[11]) << 32
-                    ),
-                    Some(other) => format!("{other:?}").chars().take(80).collect(),
-                    None => "nothing".into(),
-                };
-                tracing::warn!(
-                    lost = n,
-                    slot = index,
-                    frames = frame.saturating_sub(since),
-                    why,
-                    shown = %shape(shown),
-                    new = %shape(key),
-                    remade = remake,
-                    "a slot still showed the texture it showed before its new one: its swap was lost (VICTORY_KEPT_SWEEP)"
-                );
-            }
-            if !remake {
-                continue;
-            }
             // Made from its new view only if that texture has its host copy:
             // none is made here (the card may have no room for it, which is
             // when the pass leaves such slots for later).
@@ -3005,10 +3037,46 @@ impl HostHeap {
                 View::Shader(r, _) => crate::resource::made_copy(*r as crate::object::This).is_some(),
                 _ => false,
             };
-            if !view.as_ref().is_some_and(has_copy) {
+            let copy = view.as_ref().is_some_and(has_copy);
+            if looks > 0 {
+                SWEPT[5].fetch_add(1, Relaxed);
+            } else {
+                let n = SWEPT[0].fetch_add(1, Relaxed) + 1;
+                if n <= 16 || n.is_power_of_two() {
+                    let shape = |key: u64| match view_at(key as u32, (key >> 32) as u32) {
+                        Some(View::Placed(false, resource, desc)) => format!(
+                            "{}x{} f{} levels {} at {:#x}",
+                            resource[4],
+                            resource[6],
+                            resource[8],
+                            resource[7] >> 16,
+                            u64::from(desc[10]) | u64::from(desc[11]) << 32
+                        ),
+                        Some(other) => format!("{other:?}").chars().take(80).collect(),
+                        None => "nothing".into(),
+                    };
+                    tracing::warn!(
+                        lost = n,
+                        slot = index,
+                        frames = frame.saturating_sub(since),
+                        why,
+                        shown = %shape(shown),
+                        new = %shape(key),
+                        new_has_host_copy = copy,
+                        remade = remake && copy,
+                        "a slot still showed the texture it showed before its new one: its swap was lost (VICTORY_KEPT_SWEEP)"
+                    );
+                }
+            }
+            if !remake {
+                continue;
+            }
+            if !copy {
                 // Left as it is, due again, and looked at again later.
-                SWEPT[2].fetch_add(1, Relaxed);
-                again.push((index, handle, key, why));
+                if looks == 0 {
+                    SWEPT[2].fetch_add(1, Relaxed);
+                }
+                again.push((index, handle, key, since, why, looks + 1));
                 due.push(index);
                 continue;
             }
@@ -3041,14 +3109,24 @@ impl HostHeap {
             due.push(index);
         }
         if !again.is_empty() {
-            let mut holding = HOLDING.lock().unwrap_or_else(|e| e.into_inner());
-            for (index, handle, key, why) in again {
-                holding.entry((heap, index)).or_insert(Holding { handle, key, since: frame, why });
-            }
+            with_holding(|kept| {
+                for (index, handle, key, since, why, looks) in again {
+                    if kept.by_slot.contains_key(&(heap, index)) {
+                        continue;
+                    }
+                    kept.by_slot.insert((heap, index), Holding { handle, key, since, why, looks });
+                    kept.order.push_back((frame + frames, heap, index, key));
+                }
+            });
         }
         for index in due {
             self.queue_texture(index, true, false, frame);
         }
+        let took = began.elapsed().as_nanos() as u64;
+        SWEEP_TIME[0].fetch_add(1, Relaxed);
+        SWEEP_TIME[1].fetch_add(took, Relaxed);
+        SWEEP_TIME[2].fetch_max(took, Relaxed);
+        SWEEP_TIME[3].fetch_add(looked, Relaxed);
     }
 
     /// The memory of the texture title slot `index` views is there (again):
@@ -5564,8 +5642,9 @@ fn rewritten(kin: Kin, kept: bool) {
     REWRITTEN[4].fetch_add(u64::from(kept), Relaxed);
     let n: u64 = REWRITTEN[..4].iter().map(|n| n.load(Relaxed)).sum();
     if n.is_multiple_of(5000) {
+        let sweep = sweep_numbers();
         tracing::info!(
-            "slots that showed a texture and were written with another, since the start: {} of the same kind elsewhere, {} of another size, {} others, {} of another dimension; {} of them kept what they showed meanwhile (VICTORY_KEEP_SHOWN); swaps lost, the slot still showing the other texture {} frames on: {} ({} made from the new view, {} whose new texture had no host copy yet, {} given the neutral texture; VICTORY_KEPT_SWEEP); swaps whose view the host could not make: {}",
+            "slots that showed a texture and were written with another, since the start: {} of the same kind elsewhere, {} of another size, {} others, {} of another dimension; {} of them kept what they showed meanwhile (VICTORY_KEEP_SHOWN); swaps lost, the slot still showing the other texture {} frames on: {} ({} made from the new view, {} whose new texture had no host copy yet, {} given the neutral texture; VICTORY_KEPT_SWEEP; each slot once); of those without a host copy, looks again {} and shown with their own texture later {}; swaps whose view the host could not make: {}; the sweep {:.1} us a frame (the longest {:.0} us), {:.1} slots looked at a frame, {} tracked now",
             REWRITTEN[0].load(Relaxed),
             REWRITTEN[1].load(Relaxed),
             REWRITTEN[2].load(Relaxed),
@@ -5576,7 +5655,13 @@ fn rewritten(kin: Kin, kept: bool) {
             SWEPT[1].load(Relaxed),
             SWEPT[2].load(Relaxed),
             SWEPT[4].load(Relaxed),
-            SWEPT[3].load(Relaxed)
+            SWEPT[5].load(Relaxed),
+            SWEPT[6].load(Relaxed),
+            SWEPT[3].load(Relaxed),
+            sweep.0,
+            sweep.1,
+            sweep.2,
+            sweep.3
         );
     }
 }
