@@ -1,4 +1,4 @@
-# AGENTS.md — VIctory fork (hyphennn base), contratto operativo dell'agente
+# AGENTS.md — VIctory fork, contratto operativo dell'agente
 
 Questo file è il contratto di ogni sessione (umana o agente) su questo repository. Si legge per intero
 prima di agire. Lo stato vivo è in `STATE.md` (fuori da git); questo file cambia solo quando cambia il metodo.
@@ -14,22 +14,39 @@ Il titolo Xbox Series su PC **come retail, senza compromessi**:
 
 Ogni lavoro deve spostare uno di G1-G4 **in una misura** (immagine o numero). Se non sposta niente, non si fa.
 
+**Condizioni fisse della North Star (decisione dell'Host, non negoziabili):** Series X, uscita 4K, nessun
+abbassamento di risoluzione interna (mai Full HD/1080p), mai `--console series-s`. Una run fuori da queste
+condizioni non si lancia nemmeno come sonda.
+
+**Il fine prevale sul metodo.** Se un passo di questo loop allontana da G1-G4 o rallenta il percorso più corto
+verso di essi, il passo è sbagliato: si dice all'Host e si corregge questo file. Mai scegliere il passo piccolo e
+sicuro quando il passo grosso è quello che serve.
+
 ## 2. Il loop (ogni ciclo, nell'ordine; nessuna fase si salta)
 
+0. **BASE PER MISURA.** La base è il ramo che, misurato qui nelle condizioni fisse (§1, §3), è più avanti su G1-G4.
+   Un fork che si dichiara più avanti si compila puro (fuori dal repo, `D:\Temp\<fork>`), gira col **suo** set e
+   poi col **nostro**, affiancato al nostro main: se è avanti, diventa la base e se ne fondono **tutti** i commit
+   (merge, non pezzi; un commit che rompe si corregge in avanti). Misura del 2026-11-27 (STATE nodo 232): Cool Fox
+   col suo set si blocca prima del mondo, col nostro fa 14,9 fps contro 18,4 e perde i capelli: **base = il nostro
+   main**. Dai donatori si prende il pezzo che sposta una misura **qui**; i pezzi provati su AMD si portano e si
+   rendono corretti su NVIDIA (wave32, 4080) prima di giudicarli.
 1. **ALIGN.** Esegui `bash /d/Tools/victory-align.sh`: fa il merge di origin/main (fxceless) nel main locale e
    ricompila. Gira anche da cron ogni 20 min (va ricreato a ogni sessione: CronCreate `7,27,47 * * * *`).
 2. **SCAN.** Esegui `bash /d/Tools/victory-forkscan.sh`: stampa i commit nuovi di ogni fork della famiglia
-   (§6) dall'ultima scansione. Cron ogni ora (`41 * * * *`). Ogni commit nuovo viene classificato in
-   STATE.md → "Coda porting": G1/G2/G3/G4, il costo, l'evidenza (misura del donatore o sola dichiarazione).
-3. **PICK.** Scegli **un** pezzo, quello con il massimo guadagno atteso per unità di lavoro, e con evidenza.
-   Priorità: crash/blocco > G1 visibile nella nostra vista > G3 > resto.
-4. **PORT / FIX.** Porta il pezzo come commit singolo, con
-   `git cherry-pick -x <sha>` (oppure riscrittura manuale se non si applica). Crediti nel messaggio:
-   `(port of <Fork> <sha>, GPL-3.0)`. Mai mescolare due pezzi in un commit.
+   (§6) dall'ultima scansione. Cron ogni ora (`41 * * * *`). Serve a: (a) accorgersi se un fork dichiara di essere
+   più avanti della base (allora si misura, passo 0); (b) trovare il pezzo che attacca il **muro misurato** di oggi
+   (STATE.md, PROSSIMO) o un difetto **visibile da noi**. In coda entra solo ciò che passa (a) o (b), con evidenza.
+3. **PICK.** Priorità: crash/blocco > muro di G3 misurato > G1 visibile nella nostra vista > resto. Un pezzo che non
+   tocca il muro di oggi (es. lane CPU quando il muro è la scheda) non si porta per G3.
+4. **PORT / FIX.** Un pezzo per commit, con `git cherry-pick -x <sha>` (oppure riscrittura manuale). Crediti nel
+   messaggio: `(port of <Fork> <sha>, GPL-3.0)`. Mai mescolare due pezzi in un commit.
 5. **BUILD + TEST.** Build diag (§4). `cargo test` sul crate toccato. Se non compila, il pezzo non entra.
 6. **RUN.** Una run standard (§3), una variabile alla volta rispetto al riferimento.
-7. **JUDGE.** Si decide sulle immagini affiancate, agli stessi secondi, e sui numeri di `fps.py`.
-   Migliora → resta. Uguale ma corretto → resta. Peggiora o dubbio → `git revert`, si annota il perché.
+7. **JUDGE.** Si decide sulle immagini affiancate, agli stessi secondi, e sui numeri di `fps.py`, a parità di
+   stato della libreria PSO (fredda contro fredda, calda contro calda).
+   Migliora → resta. Uguale ma corretto → resta. Peggiora o dubbio → si cerca la causa; `git revert` solo con la
+   causa annotata.
 8. **COMMIT + STATE.** Commit locale. STATE.md: FATTO (un nodo), coda aggiornata, PROSSIMO (uno solo).
    Ai checkpoint, push del ramo di integrazione sul fork nostro (`hk`), mai su origin.
 
@@ -87,7 +104,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\Tools\victory\run.ps1 -Na
 
 | Remote/ramo | Repository | Cosa porta di meglio (da verificare per misura) |
 |---|---|---|
-| origin/main | fxceless/victory-fork | **Base.** Switch di velocità misurati (README); 10,3 fps nelle prime stanze con INDIRECT_GATHER |
+| ghosty/main | DoubleGhosty/cool_fox | Misurato qui 2026-11-27: dietro di noi (14,9 vs 18,4 fps, senza capelli). Donatore di pezzi G4/G2. `scripts/play.ps1` = il suo set |
+| origin/main | fxceless/victory-fork | Upstream del repo (watchdog ALIGN). Switch di velocità misurati (README); 10,3 fps nelle prime stanze con INDIRECT_GATHER |
 | uilian/main | uiliannn/VItoriaBr | Base hyphennn + port da DexNom/Belobug: quad read con helper lane (righe su vernice, vetro, pelle), `victory warm`, priorità alle pipeline, formati 189-191, dot4 impacchettati, ambiente da profondità (Belobug), analisi comparative in `docs/` |
 | itsbatt/main | Itsbatt/victory-unified | fxceless + grafica Belobug unificate, cap 30 fps, liste GPU in volo limitate a 128 |
 | zettrox/main | Zettrox/ztrx | Il più avanti nella storia (prologo, "Gone Fishing", 1h30 senza crash); grafica peggiore |
