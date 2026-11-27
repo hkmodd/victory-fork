@@ -72,6 +72,9 @@ pub(super) fn folder() -> Option<PathBuf> {
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
+/// Host pipelines with static samplers, made every run outside the library
+/// ([`with_static_samplers`]).
+pub(crate) static SAMPLED: AtomicU64 = AtomicU64::new(0);
 /// For the memory lines: the bytes of the library's file, kept in memory
 /// while the library lives, and the bytes the last save wrote (a buffer of
 /// that size is made, filled and written every time pipelines were added,
@@ -625,7 +628,9 @@ pub(crate) fn pipeline(
     };
     let wide = HSTRING::from(name);
     let Some(library) = library().filter(|_| !STATIC_SAMPLERS.get()) else {
-        MADE.fetch_add(1, Ordering::Relaxed);
+        // Made every run on purpose: not a library miss (`made` stays the
+        // count of pipelines the library should have held).
+        if STATIC_SAMPLERS.get() { &SAMPLED } else { &MADE }.fetch_add(1, Ordering::Relaxed);
         return create();
     };
     let began = std::time::Instant::now();

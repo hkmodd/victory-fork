@@ -945,12 +945,13 @@ static PEAK: AtomicU64 = AtomicU64::new(0);
 /// The workers ran out of work: logged after a batch of 10 or more, and
 /// the cache saved (at most every 20 s).
 fn drained() {
-    use super::library::{EARLY, LOADED, MADE};
+    use super::library::{EARLY, LOADED, MADE, SAMPLED};
     if PEAK.swap(0, Ordering::Relaxed) >= 10 {
         tracing::info!(
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            static_samplers = SAMPLED.load(Ordering::Relaxed),
             "host pipelines all made"
         );
     }
