@@ -88,6 +88,8 @@ pub(crate) struct Pending {
     /// ([`for_formats`]): a chain from the title's pipeline, one link per
     /// set of formats met, never shortened.
     variant: OnceLock<Arc<Pending>>,
+    /// When its making began ([`Pending::make`]), for [`wait`].
+    began: OnceLock<Instant>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -113,6 +115,7 @@ impl Pending {
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
             made: OnceLock::new(),
+            began: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
             handed: AtomicBool::new(false),
@@ -124,6 +127,7 @@ impl Pending {
     }
 
     fn make(&self) {
+        let _ = self.began.set(Instant::now());
         self.make_with(|| {
             if let Some(hash) = denied(&self.shaders) {
                 tracing::warn!(hash, shaders = ?self.shaders, "pipeline not built: its shader is in VICTORY_DENY_PIPELINES");
@@ -431,6 +435,15 @@ fn wait(p: &Pending, frame: u64) {
     if left.is_zero() {
         return;
     }
+    // Not for one being made longer than that already: what takes seconds
+    // ends in some later frame whatever this one waits, and every frame
+    // that drew with it waited the whole budget for nothing (ghosty run
+    // merged1: one pipeline 91 s in the making, 500 ms of each 684 ms frame).
+    // Passes over the screen keep their budget. `VICTORY_PIPELINE_WAIT_LONG=1`:
+    // waited for, as before.
+    if !screen && making_long(p) {
+        return;
+    }
     let waiting = crate::timeline::span("pipeline: first use waits for a host pipeline");
     let started = Instant::now();
     let (lock, done) = &DONE;
@@ -470,6 +483,13 @@ fn wait(p: &Pending, frame: u64) {
         crate::copystat::C::PipelineWaitUs,
         started.elapsed().as_micros() as u64,
     );
+}
+
+/// Whether `p` has been in the making for longer than a second.
+fn making_long(p: &Pending) -> bool {
+    static WAIT_LONG: OnceLock<bool> = OnceLock::new();
+    !*WAIT_LONG.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_LONG").is_some_and(|v| v == "1"))
+        && p.began.get().is_some_and(|t| t.elapsed() > Duration::from_secs(1))
 }
 
 const NOT_QUEUED: u8 = 0;
