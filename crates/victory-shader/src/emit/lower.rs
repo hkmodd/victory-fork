@@ -1529,9 +1529,9 @@ pub fn set_thread_max_wave(lanes: Option<u32>) {
 }
 
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
-    // A scalar select or branch uses the condition of the whole guest wave,
-    // even when the preceding mask operation has no scalar-dword consumers.
-    if matches!(i.fields, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Valu(_))
+    // A scalar select uses the condition of the whole guest wave, even
+    // when the preceding mask operation has no scalar-dword consumers.
+    if matches!(i.fields, Fields::Sop { .. } | Fields::Valu(_))
         && i.read(Reg::Scc).is_some_and(|s| st.scc_some.contains_key(&s))
     {
         return true;
@@ -5171,25 +5171,6 @@ impl<'a> Lower<'a> {
         let both = self.s.m.bin(at, Bin::Or, lo, hi);
         let z = self.s.m.i32(0);
         Ok(self.s.m.cmp(at, pred::NE, both, z))
-    }
-
-    fn is_wave_scc_branch(&self, b: usize) -> bool {
-        let Some(last) = self.x.p.blocks[b].insts.last() else {
-            return false;
-        };
-        if !matches!(last.name(), "s_cbranch_scc0" | "s_cbranch_scc1") {
-            return false;
-        }
-        let Some(scc) = last.read(Reg::Scc) else {
-            return false;
-        };
-        if !self.x.st.scc_some.contains_key(&scc) {
-            return false;
-        }
-        let def_block = self.def_block.get(&scc).copied().unwrap_or(b);
-        !self.x.p.blocks[def_block].insts.iter().any(|i| {
-            i.write(Reg::Scc) == Some(scc) && i.write(Reg::S(crate::ir::EXEC)).is_some()
-        })
     }
 
     fn wave_wide(&mut self, b: usize, when: Bool) -> Result<V, Why> {
@@ -13955,7 +13936,7 @@ impl<'a> Lower<'a> {
             } => {
                 // A negated condition branches the other way round.
                 let (cond, taken, not_taken) = match self.x.st.bools.node(when) {
-                    _ if self.x.st.wide.contains(&b) || self.is_wave_scc_branch(b) => {
+                    _ if self.x.st.wide.contains(&b) => {
                         let c = self.wave_wide(b, when).map_err(|w| unsupported(offset, w))?;
                         (c, taken, not_taken)
                     }
