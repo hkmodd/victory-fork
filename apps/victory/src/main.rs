@@ -5,6 +5,8 @@
 
 mod census;
 mod inspect;
+#[cfg(windows)]
+mod nvidia;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
 mod run;
@@ -179,6 +181,12 @@ enum Command {
         #[arg(long)]
         device: bool,
     },
+    /// Fetch NVIDIA's DLSS files (Streamline 2.14.16, about 70 MB, NVIDIA's
+    /// licences) from github.com/NVIDIA-RTX/Streamline into
+    /// %LOCALAPPDATA%\victory\nvidia-sdk, where `run` with VICTORY_DLSS=1
+    /// looks for them.
+    #[cfg(windows)]
+    GetDlss,
 }
 
 fn parse_size(value: &str) -> Result<[u32; 2], &'static str> {
@@ -279,6 +287,8 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        #[cfg(windows)]
+        Command::GetDlss => nvidia::get_dlss(),
     }
 }
 

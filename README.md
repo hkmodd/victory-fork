@@ -59,7 +59,8 @@ the frame now is the one thread that submits the title's work to the card
 | `VICTORY_AMBIENT_SETTLE` | How fast light settles after walking indoors (on by default, `250,3`; `0` turns it off) |
 | `VICTORY_TEXTURE_STORE=1` | Converted textures kept between runs (about 8 ms a frame for now: off) |
 | `VICTORY_DLSS=1` (with `VICTORY_FSR_4K`) | The title's FidelityFX upscale is done by NVIDIA DLSS Super Resolution through Streamline, loaded at run time (signature checked, nothing proxied, no frame generation); the DLSS mode follows the render size the title picks. Without Streamline or DLSS support, the PC FidelityFX path as before. Not measured yet |
-| `VICTORY_STREAMLINE_DIR` | The folder with Streamline's `sl.interposer.dll` and `sl.dlss.dll` (default `C:\dev\sdk\streamline-sdk-v2.14.16\bin\x64`) |
+| `VICTORY_STREAMLINE_DIR` | The folder with Streamline's `sl.interposer.dll` and `sl.dlss.dll`. Without it `run` looks in `%LOCALAPPDATA%\victory\nvidia-sdk\Streamline\bin\x64`, then beside the program and the title (their `nvidia-sdk\Streamline\bin\x64`, then the folder itself); none found, it asks once [Y/n] (only at a terminal; `n` is remembered) to fetch them, otherwise DLSS stays off |
+| `victory get-dlss` | Fetches NVIDIA's DLSS files (Streamline 2.14.16, about 70 MB, NVIDIA's licences, saved beside them) from NVIDIA's own release at github.com/NVIDIA-RTX/Streamline into `%LOCALAPPDATA%\victory\nvidia-sdk` (`scripts\get-nvidia-sdks.ps1`, embedded; takes only the DLLs out of the zip by range requests). Clears an earlier "no" |
 | `VICTORY_DLSS_PRESET` | DLSS preset: `default`, `e`, `f`, `j`, `k`, `l`, `m` |
 | `VICTORY_DLSS_JITTER`, `VICTORY_DLSS_MV` | `x,y` multipliers of the jitter and motion vectors given to DLSS (default `1,1`), for sign checks |
 | `VICTORY_DLSS_REACTIVE=0` | The title's reactive mask is not given to DLSS |

@@ -10,7 +10,8 @@
 //!   mode follows the sizes the title passes (a 2/3 scene is quality).
 //!   `VICTORY_DLSS_PRESET` (default, e, f, j, k, l, m) picks the model.
 //! - `VICTORY_STREAMLINE_DIR`: the folder of `sl.interposer.dll`, its plugins
-//!   and NGX's DLLs (default [`DEFAULT_DIR`]).
+//!   and NGX's DLLs (default [`default_dir`], where `victory get-dlss` puts
+//!   them; `victory run` also looks beside the program and the title).
 //!
 //! Anything missing (the folder, a signature, the feature on this GPU, the
 //! device hand-over) leaves the FidelityFX path as it was, with a warning in
@@ -37,8 +38,31 @@ use windows::core::Interface;
 
 use crate::object::Object;
 
-/// Where `sl.interposer.dll` is looked for without `VICTORY_STREAMLINE_DIR`.
-pub const DEFAULT_DIR: &str = r"C:\dev\sdk\streamline-sdk-v2.14.16\bin\x64";
+/// Where `victory get-dlss` puts NVIDIA's files:
+/// `%LOCALAPPDATA%\victory\nvidia-sdk` (none without `%LOCALAPPDATA%`).
+pub fn nvidia_home() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .filter(|v| !v.is_empty())
+        .map(|base| PathBuf::from(base).join("victory").join("nvidia-sdk"))
+}
+
+/// The folder of `sl.interposer.dll` in a folder of NVIDIA's files (the
+/// layout of Streamline's release and of `victory get-dlss`).
+pub fn bin_dir(sdk: &Path) -> PathBuf {
+    sdk.join("Streamline").join("bin").join("x64")
+}
+
+/// Where `sl.interposer.dll` is looked for without `VICTORY_STREAMLINE_DIR`:
+/// [`bin_dir`] of [`nvidia_home`].
+pub fn default_dir() -> PathBuf {
+    nvidia_home().map(|home| bin_dir(&home)).unwrap_or_default()
+}
+
+/// Whether a folder has Streamline's interposer.
+pub fn has_interposer(dir: &Path) -> bool {
+    dir.join(INTERPOSER).is_file()
+}
+
 const INTERPOSER: &str = "sl.interposer.dll";
 /// The project id NGX is given (engine "custom", no NVIDIA application id).
 const PROJECT_ID: &CStr = c"6f0d7b2e-3a41-4c1e-9b57-2d8e4f1a9c30";
@@ -71,7 +95,7 @@ impl Asked {
         Ok(Asked {
             dlss: var("VICTORY_DLSS").is_some_and(|v| v.trim() == "1"),
             preset,
-            dir: var("VICTORY_STREAMLINE_DIR").map_or_else(|| PathBuf::from(DEFAULT_DIR), PathBuf::from),
+            dir: var("VICTORY_STREAMLINE_DIR").filter(|v| !v.is_empty()).map_or_else(default_dir, PathBuf::from),
             jitter: plan::pair(var("VICTORY_DLSS_JITTER").as_deref()),
             mvec: plan::pair(var("VICTORY_DLSS_MV").as_deref()),
             reactive: var("VICTORY_DLSS_REACTIVE").is_none_or(|v| v.trim() != "0"),

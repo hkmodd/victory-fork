@@ -75,7 +75,21 @@ pub fn run(
         // the GPU runs it; otherwise the PC FidelityFX, as without it. Both
         // before the first lookup builds the import registry, and Streamline
         // before the title makes its device.
-        let asked = victory_hle::streamline::Asked::from_env().map_err(anyhow::Error::msg)?;
+        // NVIDIA's files: VICTORY_STREAMLINE_DIR, `get-dlss`'s folder, beside
+        // this program or the title; missing, fetched after asking.
+        let mut asked = victory_hle::streamline::Asked::from_env().map_err(anyhow::Error::msg)?;
+        if asked.dlss {
+            let program = std::env::current_exe().ok();
+            let beside: Vec<&Path> = [program.as_deref().and_then(Path::parent), exe.parent()]
+                .into_iter()
+                .flatten()
+                .filter(|dir| !dir.as_os_str().is_empty())
+                .collect();
+            match crate::nvidia::streamline_dir(&beside).or_else(crate::nvidia::offer_dlss) {
+                Some(dir) => asked.dir = dir,
+                None => asked.dlss = false,
+            }
+        }
         if asked.dlss && victory_hle::streamline::init(&asked) {
             victory_hle::modules::fidelityfx::use_dlss();
             println!("upscaler       DLSS Super Resolution (Streamline {})", asked.dir.display());
