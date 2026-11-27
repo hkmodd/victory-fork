@@ -236,10 +236,13 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         // world and lighting set-up passes) or with `compute_waits`: made
         // here, or waited for while a worker makes it, instead of dropping
         // its dispatch after the frame's budget. `make` keeps its panic guard.
-        if p.graphics.is_none() && (compute_waits() || crate::frame::current() < 600) {
+        let frame = crate::frame::current();
+        if p.graphics.is_none() && (compute_waits() || frame < 600) && compute_wait_left(frame) {
+            let started = Instant::now();
             p.make();
+            compute_waited(frame, started.elapsed());
         } else {
-            wait(p, crate::frame::current());
+            wait(p, frame);
         }
     }
     let made = p.made.get()?.as_ref();
@@ -252,6 +255,50 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         crate::host::first_use(&host.name);
     }
     made
+}
+
+/// What the dispatches of one title frame may wait, all together, for
+/// compute pipelines made on the spot (`VICTORY_COMPUTE_WAIT_MS`, 15 s; 0:
+/// no cap). Past it the frame's other first dispatches go by the frame's
+/// budget ([`wait`]) and are dropped while their pipeline is not there.
+/// Below the title's 30 s watchdog with the 10 s of the passes over the
+/// screen: on a cold pipeline library the frame where the world starts met
+/// ~1600 compute programs and waited 31 s for them, and the title wrote to
+/// 0x0 (victory-image+0x23cf683) at frame 1370 / 1404 (runs avmnew1-2).
+fn compute_wait_cap() -> Duration {
+    static CAP: OnceLock<Duration> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        let millis = std::env::var("VICTORY_COMPUTE_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(15_000);
+        Duration::from_millis(millis)
+    })
+}
+
+/// The frame the compute waits belong to, and what they took of it.
+static COMPUTE_SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+
+/// Whether frame `frame` has compute waiting left ([`compute_wait_cap`]).
+fn compute_wait_left(frame: u64) -> bool {
+    let spent = COMPUTE_SPENT.lock().unwrap_or_else(|e| e.into_inner());
+    cap_left(*spent, frame, compute_wait_cap())
+}
+
+/// `spent` = (frame, waited): whether `frame` is still under `cap`.
+fn cap_left(spent: (u64, Duration), frame: u64, cap: Duration) -> bool {
+    cap.is_zero() || spent.0 != frame || spent.1 < cap
+}
+
+/// Counts `waited` of compute making against frame `frame`.
+fn compute_waited(frame: u64, waited: Duration) {
+    let mut spent = COMPUTE_SPENT.lock().unwrap_or_else(|e| e.into_inner());
+    let was_left = cap_left(*spent, frame, compute_wait_cap());
+    if spent.0 != frame {
+        *spent = (frame, Duration::ZERO);
+    }
+    spent.1 += waited;
+    if was_left && !cap_left(*spent, frame, compute_wait_cap()) {
+        tracing::warn!(frame, ms = spent.1.as_millis() as u64, waiting = waiting(),
+            "compute pipelines waited for past VICTORY_COMPUTE_WAIT_MS in one frame: the frame's other first dispatches go by its budget");
+    }
 }
 
 /// Whether a dispatch waits for its compute pipeline until it is made,
@@ -655,6 +702,16 @@ mod tests {
         assert_eq!(worker_count(None, 64), 14);
         assert_eq!(worker_count(Some(0), 24), 1);
         assert_eq!(worker_count(Some(20), 24), 20);
+    }
+
+    #[test]
+    fn compute_waits_stop_at_the_frame_cap_and_start_again_next_frame() {
+        let cap = Duration::from_secs(15);
+        assert!(cap_left((u64::MAX, Duration::ZERO), 7, cap));
+        assert!(cap_left((7, Duration::from_secs(14)), 7, cap));
+        assert!(!cap_left((7, Duration::from_secs(15)), 7, cap));
+        assert!(cap_left((7, Duration::from_secs(40)), 8, cap));
+        assert!(cap_left((7, Duration::from_secs(40)), 7, Duration::ZERO));
     }
 
     #[test]
