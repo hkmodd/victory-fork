@@ -373,40 +373,484 @@ fn nvidia_wave_reduction_and_lane_reads_match_cpu() {
 }
 
 #[test]
-#[ignore = "requires VICTORY_WAVE_PAIRS=1 and a physical 32-lane GPU"]
+#[ignore = "requires a physical 32-lane GPU"]
 fn nvidia_paired_permute_obeys_exec() {
-    assert!(std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "1"));
-    let mut body = vec![
-        sop1(0x04, 2, EXEC),
-        vop2(0x25, 2, k(1), 0),  // v2 = lane + 1
-        vop2(0x1d, 3, k(32), 0), // v3 = partner lane
-        vop2(0x1a, 3, k(2), 3),
-        vop1(0x01, 4, k(17)),
-        vopc(0xd4, 0, 0), // v_cmpx_gt_u32 exec, s0, v0
-        0xdacc_0000,
-        0x0400_0203, // ds_bpermute_b32 v4, v3, v2
-        sop1(0x04, EXEC, 2),
+    crate::emit::with_wave_pairs(true, permute_half_fixture);
+}
+
+#[test]
+#[ignore = "requires VICTORY_WAVE_PAIRS=0 and a physical 32-lane GPU"]
+fn exact_permute_obeys_exec() {
+    assert!(!std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "1"));
+    crate::emit::with_wave_pairs(false, permute_half_fixture);
+}
+
+fn permute_half_fixture() {
+    for offset in [0u32, 4, 128] {
+        let mut body = vec![
+            sop1(0x04, 2, EXEC),
+            vop2(0x25, 2, k(1), 0),
+            vop2(0x1d, 3, k(33), 0),
+            vop2(0x1a, 3, k(2), 3),
+            vop1(0x01, 4, k(17)),
+            vopc(0xd4, 0, 0),
+            0xdacc_0000 | offset,
+            0x0400_0203,
+            sop1(0x04, EXEC, 2),
+        ];
+        body.extend(stores([4, 0, 2, 0]));
+        execute_wave32(
+            &native(&body),
+            &[(0, 0), (1, 0), (31, 0), (32, 0), (33, 0), (63, 0), (64, 0)],
+            |limit, _| {
+                (0..64)
+                    .flat_map(|lane| {
+                        let partner = (lane & 32) | (((lane ^ 33) + offset / 4) & 31);
+                        let value = if lane >= limit {
+                            17
+                        } else if partner >= limit {
+                            0
+                        } else {
+                            partner + 1
+                        };
+                        [value, lane, lane + 1, lane]
+                    })
+                    .collect()
+            },
+        );
+    }
+}
+
+fn fp32_reduce(op: u32, identity: u32) -> Vec<u32> {
+    let mut words = super::super::wave::WAVE_OR_V7_TO_S7.to_vec();
+    if identity != 0 {
+        words[2] = (words[2] & !0x1ff) | LIT;
+        words.insert(3, identity);
+    }
+    for w in &mut words {
+        if *w >> 25 == 28 {
+            *w = (*w & 0x01ff_ffff) | op << 25;
+        }
+    }
+    words
+}
+
+fn fp32_program(op: u32, identity: u32, other: [u32; 3], lds: bool) -> NativeProgram {
+    let mut body = vec![vop1(1, 7, 1), vop2(0x1b, 4, k(3), 0)];
+    for (i, bits) in other.into_iter().enumerate() {
+        body.extend([
+            vopc(0xc5, k(i as u32 + 1), 4), // v_cmp_ne_u32 vcc, i+1, v4
+            vop2(1, 7, LIT, 7),
+            bits, // v_cndmask_b32 v7, bits, v7, vcc
+        ]);
+    }
+    if lds {
+        body.extend([
+            vop2(0x1a, 2, k(2), 0),
+            0xd834_0000,
+            0x0000_0702, // ds_write_b32 v2, v7
+            vop2(0x1d, 3, k(32), 0),
+            vop2(0x1a, 3, k(2), 3),
+        ]);
+    }
+    body.extend([
+        sop1(4, 12, EXEC),
+        vop2(0x1d, 5, k(45), 0), // sparse EXEC across either half
+        vopc(0xd4, 0, 5),
+    ]);
+    if lds {
+        body.extend([0xd8d8_0000, 0x0700_0003]); // ds_read_b32 v7, v3, under EXEC
+    }
+    body.extend(fp32_reduce(op, identity));
+    body.extend([sop1(4, EXEC, 12), vop1(1, 9, 7)]);
+    body.extend(stores([9, 0, 0, 0]));
+    let mut program = native(&body);
+    if lds && let StageIo::Cs(cs) = &mut program.io {
+        cs.rsrc2 |= 1 << 15;
+    }
+    program
+}
+
+fn fp32_reference(op: u32, a: u32, b: u32) -> u32 {
+    let flush = |bits| {
+        if bits & 0x7fff_ffff < 0x0080_0000 {
+            bits & 0x8000_0000
+        } else {
+            bits
+        }
+    };
+    let (a, b) = (flush(a), flush(b));
+    let (x, y) = (f32::from_bits(a), f32::from_bits(b));
+    if op == 3 {
+        if x.is_nan() {
+            return a;
+        }
+        if y.is_nan() {
+            return b;
+        }
+        if x.is_infinite() && y == -x {
+            return 0xffc0_0000;
+        }
+        return flush((x + y).to_bits());
+    }
+    if y.is_nan() {
+        return a;
+    }
+    if x.is_nan() {
+        return b;
+    }
+    if x == 0.0 && y == 0.0 {
+        return if op == 15 { a | b } else { a & b };
+    }
+    if (op == 15 && x < y) || (op == 16 && x > y) {
+        a
+    } else {
+        b
+    }
+}
+
+fn fp32_expected(op: u32, ident: u32, values: [u32; 4], active: u32, lds: bool) -> Vec<u32> {
+    let mut lanes: [u32; 64] = std::array::from_fn(|lane| {
+        if (lane as u32 ^ 45) < active {
+            values[(if lds { lane ^ 32 } else { lane }) & 3]
+        } else {
+            ident
+        }
+    });
+    for (width, indices) in [
+        (8, &[1, 0, 3, 2, 5, 4, 7, 6][..]),
+        (8, &[2, 2, 0, 0, 6, 6, 4, 4][..]),
+        (8, &[4, 4, 4, 4, 0, 0, 0, 0][..]),
+    ] {
+        let old = lanes;
+        lanes = std::array::from_fn(|i| {
+            fp32_reference(op, old[i / width * width + indices[i % width]], old[i])
+        });
+    }
+    let old = lanes;
+    lanes = std::array::from_fn(|i| fp32_reference(op, old[i ^ 15], old[i]));
+    let old = lanes;
+    lanes = std::array::from_fn(|i| fp32_reference(op, old[(i / 16 ^ 1) * 16], old[i]));
+    let result = fp32_reference(op, lanes[32], lanes[0]);
+    (0..64)
+        .flat_map(|lane| [result, lane, lane, lane])
+        .collect()
+}
+
+#[test]
+#[ignore = "requires NVIDIA Wave32 hardware and VICTORY_WAVE_PAIRS_FP32=non-ieee-rne-ftz"]
+fn nvidia_paired_fp32_ordered_sum() {
+    let other = [
+        1.0f32.to_bits(),
+        (-16_777_216.0f32).to_bits(),
+        1.0f32.to_bits(),
     ];
-    body.extend(stores([4, 0, 2, 0]));
+    let values = [16_777_216.0f32.to_bits(), other[0], other[1], other[2]];
+    let linear = values
+        .into_iter()
+        .cycle()
+        .take(64)
+        .fold(0, |sum, term| fp32_reference(3, sum, term));
+    assert_ne!(fp32_expected(3, 0, values, 64, false)[0], linear);
+    let cases = [
+        (0, 0),
+        (32, 16_777_216.0f32.to_bits()),
+        (33, 16_777_216.0f32.to_bits()),
+        (64, 16_777_216.0f32.to_bits()),
+        (64, 0x7f80_0021),
+        (19, 0x7fc0_0011),
+    ];
+    execute_wave32(&fp32_program(3, 0, other, false), &cases, |n, src| {
+        fp32_expected(3, 0, [src, other[0], other[1], other[2]], n, false)
+    });
+    let other = [0x8000_0000; 3];
     execute_wave32(
-        &native(&body),
-        &[(1, 0), (32, 0), (33, 0), (64, 0)],
-        |limit, _| {
-            (0..64)
-                .flat_map(|lane| {
-                    let partner = lane ^ 32;
-                    let value = if lane >= limit {
-                        17
-                    } else if partner >= limit {
-                        0
-                    } else {
-                        partner + 1
-                    };
-                    [value, lane, lane + 1, lane]
-                })
-                .collect()
+        &fp32_program(3, 0x8000_0000, other, false),
+        &[(1, 0x8000_0001), (64, 0x8000_0000)],
+        |n, src| {
+            fp32_expected(
+                3,
+                0x8000_0000,
+                [src, other[0], other[1], other[2]],
+                n,
+                false,
+            )
         },
     );
+    let other = [0xff80_0000, 0x0080_0001, 0x8080_0000];
+    execute_wave32(
+        &fp32_program(3, 0, other, true),
+        &[(7, 0x7f80_0000), (64, 0x7f80_0000), (64, 0x0080_0000)],
+        |n, src| fp32_expected(3, 0, [src, other[0], other[1], other[2]], n, true),
+    );
+    let other = [0, 0x8080_0000, 0x8000_0000];
+    execute_wave32(
+        &fp32_program(3, 0, other, false),
+        &[(64, 0x0080_0001), (64, 0x0080_0002)],
+        |n, src| fp32_expected(3, 0, [src, other[0], other[1], other[2]], n, false),
+    );
+    let other = [0x8080_0001, 0x0080_0000, 0x8080_0001];
+    execute_wave32(
+        &fp32_program(3, 0, other, false),
+        &[(64, 0x0080_0000)],
+        |n, src| {
+            let expected = fp32_expected(3, 0, [src, other[0], other[1], other[2]], n, false);
+            assert_eq!(expected[0], 0x8000_0000);
+            expected
+        },
+    );
+}
+
+#[test]
+#[ignore = "requires NVIDIA Wave32 hardware and VICTORY_WAVE_PAIRS_FP32=non-ieee-rne-ftz"]
+fn nvidia_paired_fp32_min_max() {
+    for (op, ident) in [(15, 0x7f80_0000), (16, 0xff80_0000)] {
+        for other in [
+            [0, 0x8000_0000, 0x8000_0001],
+            [0x7fc0_0001, 0x7f80_0002, 0xffc0_0003],
+        ] {
+            let cases = [
+                (0, 0),
+                (17, 0x7fc0_0011),
+                (32, 0x7f80_0000),
+                (64, 0x7f80_0011),
+                (64, 1),
+            ];
+            execute_wave32(&fp32_program(op, ident, other, false), &cases, |n, src| {
+                fp32_expected(op, ident, [src, other[0], other[1], other[2]], n, false)
+            });
+        }
+    }
+}
+
+#[test]
+fn paired_fp32_refuses_an_unconfirmed_guest_mode() {
+    const TEST: &str = "WAVE64_FP32_MODE_TEST";
+    if std::env::var_os(TEST).is_some() {
+        let program = fp32_program(3, 0, [0; 3], false);
+        let p = crate::spill::build(&program).unwrap();
+        let bytes = crate::dxbc::build(&[]);
+        let c = crate::dxbc::Container::parse(&bytes).unwrap();
+        let old = lower::TEST_HOST_WAVE.replace(Some(32));
+        let result = crate::emit::paired(&c, &program, &p);
+        lower::TEST_HOST_WAVE.set(old);
+        assert!(matches!(
+            result,
+            Err(ShaderError::Unsupported {
+                what: "paired FP32 reduction requires a confirmed non-IEEE RNE/FTZ guest mode",
+                ..
+            })
+        ));
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "paired_fp32_refuses_an_unconfirmed_guest_mode",
+            "--nocapture",
+        ])
+        .env(TEST, "1")
+        .env_remove("VICTORY_WAVE_PAIRS_FP32")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
+
+/// The water's whole-wave sums as the console compiler expands them (the transmission
+/// volumetrics programs 5dc3b25986622949 and 6f225b641c5b0708): two FP32 sums in a row, the
+/// first leaving its partial sums in v1 and v2, which the second clears in every lane
+/// (`v_cndmask_b32 v1, 0, v7, s[4:5]`, `v_permlanex16_b32 v2, v1, 0, 0`); then the 64-bit
+/// float count of the lanes (a sum of `term`, 1.0 in the water: `None` a uniform that is not
+/// a constant). `seen`: the second sum's partials are read afterwards.
+fn water_sums(seen: bool, term: Option<u32>) -> NativeProgram {
+    let mut body = vec![
+        vop1(1, 7, 1), // v_mov_b32 v7, s1
+        sop1(4, 12, EXEC),
+        vop2(0x1d, 5, k(45), 0), // sparse EXEC across either half
+        vopc(0xd4, 0, 5),
+    ];
+    body.extend(fp32_reduce(3, 0));
+    body.push(vop1(1, 8, 7)); // v_mov_b32 v8, s7: the first sum
+    body.extend(fp32_reduce(3, 0));
+    body.push(vop1(1, 10, k(0))); // v_mov_b32 v10, 0
+    match term {
+        Some(hi) => body.extend([vop1(1, 11, LIT), hi]),
+        None => body.push(vop1(1, 11, 2)), // v_mov_b32 v11, s2
+    }
+    body.extend([
+        0xBE92_25C1, // s_or_saveexec_b64 s[18:19], -1
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0xD501_0002,
+        0x004A_1502, // v_cndmask_b32 v2, v2, v10, s[18:19]
+        0xD501_0003,
+        0x004A_1703, // v_cndmask_b32 v3, v3, v11, s[18:19]
+    ]);
+    for dpp in [0xDE54_C100, 0x9360_1200, 0x0009_2400] {
+        body.extend([
+            0x7E08_02E9,
+            dpp | 2, // v_mov_b32 v4, v2 dpp8:[...]
+            0x7E0A_02E9,
+            dpp | 3, // v_mov_b32 v5, v3 dpp8:[...]
+            0xD564_0002,
+            0x0002_0504, // v_add_f64 v[2:3], v[4:5], v[2:3]
+        ]);
+    }
+    body.extend([
+        0x7E08_02FA,
+        0xFF09_4002, // v_mov_b32 v4, v2 row_mirror bound_ctrl:1
+        0x7E0A_02FA,
+        0xFF09_4003, // v_mov_b32 v5, v3 row_mirror bound_ctrl:1
+        0xD564_0002,
+        0x0002_0504,
+        0xD778_0004,
+        0x0201_0102, // v_permlanex16_b32 v4, v2, 0, 0
+        0xD778_0005,
+        0x0201_0103, // v_permlanex16_b32 v5, v3, 0, 0
+        0xD564_0002,
+        0x0002_0504,
+        0xD760_0010,
+        0x0001_4102, // v_readlane_b32 s16, v2, 32
+        0xD760_0011,
+        0x0001_4103, // v_readlane_b32 s17, v3, 32
+        0xD564_0002,
+        0x0002_0410, // v_add_f64 v[2:3], s[16:17], v[2:3]
+        0xD760_0010,
+        0x0001_0102, // v_readlane_b32 s16, v2, 0
+        0xD760_0011,
+        0x0001_0103, // v_readlane_b32 s17, v3, 0
+        sop1(3, 14, 16),
+        sop1(3, 15, 17),
+        sop1(4, EXEC, 18), // s_mov_b64 exec, s[18:19]
+        sop1(4, EXEC, 12),
+        vop1(1, 9, 7),   // the second sum
+        vop1(1, 10, 14), // the count's low dword
+        vop1(1, 11, if seen { v(1) } else { 15 }),
+    ]);
+    body.extend(stores([8, 9, 10, 11]));
+    native(&body)
+}
+
+#[test]
+fn paired_fp32_takes_the_water_sums() {
+    const TEST: &str = "WAVE64_FP32_WATER_TEST";
+    if std::env::var_os(TEST).is_some() {
+        let bytes = crate::dxbc::build(&[]);
+        let c = crate::dxbc::Container::parse(&bytes).unwrap();
+        let translate = |program: NativeProgram| {
+            let p = crate::spill::build(&program).unwrap();
+            let old = lower::TEST_HOST_WAVE.replace(Some(32));
+            let r = crate::emit::paired(&c, &program, &p).map(|(_, wave)| wave);
+            lower::TEST_HOST_WAVE.set(old);
+            r
+        };
+        let one = Some(0x3FF0_0000);
+        assert!(matches!(translate(water_sums(false, one)), Ok(Some(32))));
+        // -1.0 and 0.0 count too
+        assert!(matches!(
+            translate(water_sums(false, Some(0xBFF0_0000))),
+            Ok(Some(32))
+        ));
+        assert!(matches!(
+            translate(water_sums(false, Some(0))),
+            Ok(Some(32))
+        ));
+        // a partial sum read afterwards is no full reduction
+        assert!(matches!(
+            translate(water_sums(true, one)),
+            Err(ShaderError::Unsupported {
+                what: "a paired FP32 section without a proven full reduction",
+                ..
+            })
+        ));
+        // 64-bit float sums that may round (2^1023 overflows), or of a term not known: refused
+        for term in [Some(0x7FE0_0000), None] {
+            assert!(matches!(
+                translate(water_sums(false, term)),
+                Err(ShaderError::Unsupported {
+                    what: "a paired FP64 reduction",
+                    ..
+                })
+            ));
+        }
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["paired_fp32_takes_the_water_sums", "--nocapture"])
+        .env(TEST, "1")
+        .env("VICTORY_WAVE_PAIRS_FP32", "non-ieee-rne-ftz")
+        // (the default passes, fast math among them: the paired program is written without)
+        .env_remove("VICTORY_SHADER_OPT")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
+
+/// The water tile programs' LDS use (5dc3b25986622949 at 0x21c..0x4c4): thread 0 alone stores
+/// the tile's starting maximum (0, dword 0) and minimum (-1, dword 1), then every thread
+/// `ds_max_u32`s and `ds_min_u32`s its key in and reads both back. `max_start` replaces the 0;
+/// `stray`: a write at an address that is not a constant; `atomics: false` leaves them out.
+fn tile_min_max(max_start: u32, stray: bool, atomics: bool) -> NativeProgram {
+    let mut body = vec![
+        sop1(4, 12, EXEC),     // s_mov_b64 s[12:13], exec
+        vopc(0xd2, k(0), 0),   // v_cmpx_eq_u32 exec, 0, v0
+        vop1(1, 3, LIT),
+        max_start,             // v_mov_b32 v3, max_start
+        vop1(1, 4, k(65)),     // v_mov_b32 v4, -1
+        vop1(1, 5, k(0)),      // v_mov_b32 v5, 0
+        0xD838_0100,
+        0x0004_0305,           // ds_write2_b32 v5, v3, v4 offset1:1
+        sop1(4, EXEC, 12),     // s_mov_b64 exec, s[12:13]
+        vop1(1, 5, k(0)),      // v_mov_b32 v5, 0
+    ];
+    if stray {
+        body.extend([0xD834_0000, 0x0000_0000]); // ds_write_b32 v0, v0
+    }
+    if atomics {
+        body.extend([
+            0xD81C_0004,
+            0x0000_0005, // ds_min_u32 v5, v0 offset:4
+            0xD820_0000,
+            0x0000_0005, // ds_max_u32 v5, v0
+        ]);
+    }
+    body.extend([0xD8DC_0100, 0x0600_0005]); // ds_read2_b32 v[6:7], v5 offset1:1
+    body.extend(stores([6, 7, 0, 0]));
+    let mut program = native(&body);
+    if let StageIo::Cs(cs) = &mut program.io {
+        cs.rsrc2 |= 1 << 15;
+    }
+    program
+}
+
+#[test]
+fn accumulator_inits_are_hoisted_to_the_start() {
+    let hoists = |program: NativeProgram| {
+        let p = crate::spill::build(&program).unwrap();
+        lower::lds_init_hoists(&p, 128)
+    };
+    assert_eq!(hoists(tile_min_max(0, false, true)), [(0, 0), (1, u32::MAX)]);
+    // a start that is not the maximum's identity stays where it is
+    assert_eq!(hoists(tile_min_max(5, false, true)), [(1, u32::MAX)]);
+    // plain stores (a flag, data) are not accumulators
+    assert_eq!(hoists(tile_min_max(0, false, false)), []);
+    // a write that could land anywhere: nothing is known
+    assert_eq!(hoists(tile_min_max(0, true, true)), []);
+    // the program still translates, both ways
+    let bytes = crate::dxbc::build(&[]);
+    let c = crate::dxbc::Container::parse(&bytes).unwrap();
+    let program = tile_min_max(0, false, true);
+    let p = crate::spill::build(&program).unwrap();
+    let old = lower::TEST_HOST_WAVE.replace(Some(32));
+    let paired = crate::emit::paired(&c, &program, &p);
+    lower::TEST_HOST_WAVE.set(old);
+    let (shader, wave) = paired.unwrap();
+    assert_eq!(wave, Some(32));
+    if let Ok(mut v) = super::super::validator::Validator::load(
+        super::super::validator::Validator::default_path().as_deref(),
+    ) {
+        let mut dxil = shader.dxil.clone();
+        v.validate(&mut dxil).unwrap();
+    }
 }
 
 #[test]
@@ -517,6 +961,10 @@ fn execute_wave32_dispatch(
     let was = lower::TEST_HOST_WAVE.replace(Some(lanes));
     let result = crate::emit::emit(&c, native, &p, &st, &io, &res);
     let key = crate::emit::translation_fingerprint();
+    if let Ok(mode) = std::env::var("VICTORY_WAVE_PAIRS_FP32") {
+        let entry = format!("VICTORY_WAVE_PAIRS_FP32={mode}");
+        assert!(key.windows(entry.len()).any(|w| w == entry.as_bytes()));
+    }
     lower::TEST_HOST_WAVE.set(was);
     let global_pairs = std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "1");
     let paired = global_pairs || crate::emit::WAVE_PAIRS_HERE.get();

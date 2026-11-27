@@ -925,3 +925,220 @@ fn paired_lowering_scope_restores_on_unwind() {
     assert!(failed.is_err());
     assert!(!super::PAIRED.get());
 }
+
+/// The structure builder's group prefix sums (#39321a95223001ed, #77360df21e12ea43,
+/// #9fc111d3be79364f: wave64, 256 or 512 threads), words 0x14c..0x210 as the console
+/// compiler made them: each wave's last lane parks its total in shared memory, a barrier,
+/// then every wave but the first adds up the totals of the waves before it in a loop over a
+/// lane test (`v_cmpx_eq_u32 exec, s18, v7`) that carries the running sum in `s17` with a
+/// `v_readfirstlane_b32` of `s17 + lds[s18 * 4]`. The `s_load_dword` of a root constant at
+/// 0x1a0 is two `s_nop`s here (no root parameters); 0x1cc is the loop's alignment pad.
+/// `addr` is the register the loop's `ds_read_b32` takes its address from: v8 (the
+/// program's, `v_mov_b32 v8, s16`) or v0 (a per-lane address, to see the refusal stay).
+fn prefix_sum_words(addr: u32) -> Vec<u32> {
+    vec![
+        0x7E0C_0300, // v_mov_b32 v6, v0 (the lane's own partial sum)
+        0x7E0E_0300, // v_mov_b32 v7, v0
+        0xBE80_0380, // 14c s_mov_b32 s0, 0
+        0xBE81_03C1, // 150 s_mov_b32 s1, -1
+        0x4A0C_0D07, // 154 v_add_nc_u32 v6, v7, v6
+        0xD765_0007, // 158 v_mbcnt_lo_u32_b32 v7, -1, 0
+        0x0001_00C1,
+        0xD760_0006, // 160 v_readlane_b32 s6, v6, 31
+        0x0001_3F06,
+        0xD766_0009, // 168 v_mbcnt_hi_u32_b32 v9, -1, v7
+        0x0002_0EC1,
+        0x2C0E_0086, // 170 v_lshrrev_b32 v7, 6, v0 (the console wave's number in the group)
+        0xD501_0008, // 174 v_cndmask_b32 v8, 0, s6, s[0:1]
+        0x0000_0C80,
+        0xBE80_047E, // 17c s_mov_b64 s[0:1], exec
+        0x4A0C_0D08, // 180 v_add_nc_u32 v6, v8, v6
+        0x7DA4_12BF, // 184 v_cmpx_eq_u32 exec, 63, v9 (the wave's last lane)
+        0x3410_0E82, // 188 v_lshlrev_b32 v8, 2, v7
+        0xD834_0000, // 18c ds_write_b32 v8, v6 (the wave's total)
+        0x0000_0608,
+        0xBEFE_0400, // 194 s_mov_b64 exec, s[0:1]
+        0xBF8C_C07F, // 198 s_waitcnt lgkmcnt(0)
+        0xBF8A_0000, // 19c s_barrier
+        0xBF80_0000, // 1a0 (s_load_dword s5, s[2:3], 0x10)
+        0xBF80_0000,
+        0x7E10_0280, // 1a8 v_mov_b32 v8, 0
+        0xBE80_047E, // 1ac s_mov_b64 s[0:1], exec
+        0x7DAA_0E80, // 1b0 v_cmpx_ne_u32 exec, 0, v7 (every wave but the first)
+        0xBF88_0014, // 1b4 s_cbranch_execz 0x208
+        0xBE82_047E, // 1b8 s_mov_b64 s[2:3], exec
+        0xBE86_047E, // 1bc s_mov_b64 s[6:7], exec
+        0xBE92_0380, // 1c0 s_mov_b32 s18, 0
+        0xBE91_0380, // 1c4 s_mov_b32 s17, 0
+        0xBF82_0003, // 1c8 s_branch 0x1d8
+        0xBF80_0000, // 1cc (pad)
+        0x87FE_0610, // 1d0 s_and_b64 exec, s[16:17], s[6:7]
+        0x7E22_0508, // 1d4 v_readfirstlane_b32 s17, v8 (the running sum)
+        0x8F10_8212, // 1d8 s_lshl_b32 s16, s18, 2
+        0x8112_8112, // 1dc s_add_i32 s18, s18, 1
+        0x7E10_0210, // 1e0 v_mov_b32 v8, s16
+        0xD8D8_0000, // 1e4 ds_read_b32 v8, v{addr}
+        0x0800_0000 | addr,
+        0xBF8C_C07F, // 1ec s_waitcnt lgkmcnt(0)
+        0x4A10_1011, // 1f0 v_add_nc_u32 v8, s17, v8
+        0xBE90_047E, // 1f4 s_mov_b64 s[16:17], exec
+        0x7DA4_0E12, // 1f8 v_cmpx_eq_u32 exec, s18, v7
+        0xBF80_0000, // 1fc s_nop 0
+        0x8A86_7E06, // 200 s_andn2_b64 s[6:7], s[6:7], exec
+        0xBF85_FFF2, // 204 s_cbranch_scc1 0x1d0
+        0xBEFE_0400, // 208 s_mov_b64 exec, s[0:1]
+        0x4A0C_0D08, // 20c v_add_nc_u32 v6, v8, v6
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xD834_0040, // ds_write_b32 v1, v6 offset:64 (keeps the sum live)
+        0x0000_0601,
+        S_ENDPGM,
+    ]
+}
+
+fn lower_wave64_on_32(words: &[u32], threads: u32) -> Result<Lowered, crate::ShaderError> {
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 256,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 15, // 2560 bytes: the totals and one dword a thread
+            threads: [threads, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, true, 256).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let prev = super::TEST_HOST_WAVE.replace(Some(32));
+    let out = lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+    });
+    super::TEST_HOST_WAVE.set(prev);
+    out
+}
+
+#[test]
+fn the_builders_prefix_sum_lowers_exactly_on_32_lane_waves() {
+    // The running sum `s17 + lds[s18 * 4]` is the same in every lane (a scalar plus a
+    // shared-memory read at a scalar address, after the barrier), so each host half's
+    // first lane holds the console's first lane's value: no exchange, which would need
+    // every lane of the group (the loop runs only in waves past the first).
+    for threads in [256, 512] {
+        if let Err(e) = lower_wave64_on_32(&prefix_sum_words(8), threads) {
+            panic!("{threads} threads: the builder's prefix sum must lower on 32-lane waves, got: {e}");
+        }
+    }
+}
+
+#[test]
+fn a_first_lane_read_of_a_per_lane_shared_memory_read_is_still_refused() {
+    // The same loop with the read at the lane's own address: the first lane's value may
+    // be in the other host half, and not every lane runs the loop.
+    let err = lower_wave64_on_32(&prefix_sum_words(0), 256)
+        .err()
+        .expect("a per-lane shared-memory read must not count as the same in every lane")
+        .to_string();
+    assert!(err.contains("a first-lane read where not every lane runs"), "got: {err}");
+}
+
+#[test]
+fn a_first_lane_read_of_a_uniform_shared_memory_read_lowers_on_wave32() {
+    // PR #36's own case: inside a lane branch (`v0 < 1`) a shared-memory read at a
+    // uniform address (`v1 = s16`) plus a scalar, read by its first lane; at the
+    // per-lane address v0 it stays refused.
+    let make = |addr: u32| {
+        vec![
+            0xBE90_0380, // s_mov_b32 s16, 0
+            0xBE91_0380, // s_mov_b32 s17, 0
+            0xD760_0004, // v_readlane_b32 s4, v0, 0 (the halves exchange)
+            0x0001_0100,
+            0x7D88_0081, // v_cmp_gt_u32_e32 vcc, 1, v0
+            0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
+            0xBF88_0005, // s_cbranch_execz -> restore exec
+            0x7E02_0210, // v_mov_b32 v1, s16
+            0xD8D8_0000, // ds_read_b32 v2, v{addr}
+            0x0200_0000 | addr,
+            0x4A10_0411, // v_add_nc_u32 v8, s17, v2
+            0x7E22_0508, // v_readfirstlane_b32 s17, v8
+            0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+            0x8011_0411, // s_add_u32 s17, s17, s4
+            0x7E06_0211, // v_mov_b32 v3, s17
+            0xD834_0000, // ds_write_b32 v0, v3
+            0x0000_0300,
+            S_ENDPGM,
+        ]
+    };
+    if let Err(e) = lower_wave64_on_32(&make(1), 128) {
+        panic!("a uniform ds_read_b32 plus a scalar must count as the same in every lane, got: {e}");
+    }
+    let err = lower_wave64_on_32(&make(0), 128).err().expect("per-lane ds_read_b32 must be refused").to_string();
+    assert!(err.contains("a first-lane read where not every lane runs"), "got: {err}");
+}
+
+#[test]
+fn the_builders_prefix_sum_lowers_and_validates_as_a_spilled_dispatch_x_program() {
+    // As the builder has it: a spilled user-data table (s[0:1], user data 16), so a
+    // `DispatchX` may count threads and the threads past the count stay for the barrier and
+    // the halves' exchange (`partial_active`). They skip the loop's shared-memory read, so
+    // the running sum's first-lane read must take the first lane within the count.
+    let words = prefix_sum_words(8);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 256,
+        layout: vec![RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 16,
+            slot: 0,
+        }],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 2 << 1 | 5 << 15, // s[0:1]: the spilled table's pointer; 2560 bytes LDS
+            threads: [256, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    assert!(crate::spill::is_spilled(&native));
+    let p = crate::spill::build(&native).expect("spill::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let prev = super::TEST_HOST_WAVE.replace(Some(32));
+    let out = lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+    });
+    super::TEST_HOST_WAVE.set(prev);
+    let out = out.unwrap_or_else(|e| panic!("the spilled prefix sum must lower on 32-lane waves, got: {e}"));
+    let counts = RootType::Other(super::super::USER_DISPATCH_THREADS);
+    assert!(
+        out.user_data.iter().any(|u| u.root == counts && u.dword == 0),
+        "the program does not take the DispatchX thread count of x"
+    );
+    if let Ok(mut v) = super::super::validator::Validator::load(super::super::validator::Validator::default_path().as_deref()) {
+        let mut copy = out.dxil.clone();
+        v.validate(&mut copy).unwrap_or_else(|e| panic!("DXIL validation failed: {e}"));
+    }
+}

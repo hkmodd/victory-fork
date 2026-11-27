@@ -105,7 +105,66 @@ pub(crate) struct Staging {
     /// buffers and goes back to it ([`staging_buffer`]); 0: a buffer of its
     /// own, released when this is dropped.
     pooled: u64,
+    /// Detiled on the card (`crate::gpudetile`, `VICTORY_GPU_DETILE`):
+    /// `buffer` then holds the title's bytes as they lie in its memory
+    /// (and the levels' mask and the pattern tables after them), and this
+    /// what the card detiles them into and the list copies from.
+    gpu: Option<Gpu>,
 }
+
+/// A texture's detiling on the card ([`Staging::gpu`]).
+struct Gpu {
+    /// Device-local, laid out as `footprints`; in the common state between
+    /// submissions.
+    linear: ID3D12Resource,
+    /// Its pool size ([`linear_buffer`]; 0: not pooled).
+    pooled: u64,
+    raw: crate::gpudetile::Raw,
+    jobs: Vec<crate::gpudetile::Job>,
+    /// The submission whose prelude last recorded the detiling (one
+    /// detiling serves every list of a submission: they all copy what the
+    /// staging buffer holds when the submission runs).
+    recorded: std::sync::atomic::AtomicU64,
+}
+
+/// Device-local buffers of [`Gpu::linear`] nothing holds, by size.
+static SPARE_LINEAR: Mutex<(std::collections::BTreeMap<u64, Vec<SpareLinear>>, u64)> =
+    Mutex::new((std::collections::BTreeMap::new(), 0));
+
+struct SpareLinear(ID3D12Resource);
+// SAFETY: a device-local buffer only lists name.
+unsafe impl Send for SpareLinear {}
+
+/// A device-local buffer of `total` bytes shaders may write, in the common
+/// state, and its pool size (0: not pooled); kept and used again as the
+/// staging buffers are ([`staging_buffer`]). Its contents are whatever the
+/// last texture left: the card writes every row's own bytes anew.
+fn linear_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, u64)> {
+    let size = total.max(64 << 10).next_power_of_two();
+    if size > SPARE_MOST.1 || !staging_pool() {
+        return host.uav_buffer(total).map(|b| (b, 0));
+    }
+    let spare = {
+        let mut all = SPARE_LINEAR.lock().unwrap_or_else(|e| e.into_inner());
+        let taken = all.0.get_mut(&size).and_then(Vec::pop);
+        if taken.is_some() {
+            all.1 -= size;
+        }
+        taken
+    };
+    match spare {
+        Some(SpareLinear(buffer)) => Some((buffer, size)),
+        None => host.uav_buffer(size).map(|b| (b, size)),
+    }
+}
+
+/// Since the last frame-rate line, of detiling on the PC: the time it took
+/// (microseconds, all threads), the bytes of title memory detiled, the
+/// textures.
+pub(crate) static DETILED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// Since the last frame-rate line: the bytes detiled either way, by
+/// swizzle mode (`victory_formats::texture::Swizzle` numbers 0 to 27).
+pub(crate) static BY_MODE: [std::sync::atomic::AtomicU64; 28] = [const { std::sync::atomic::AtomicU64::new(0) }; 28];
 
 /// A staging buffer nothing holds: the buffer and where it is mapped.
 struct Spare(ID3D12Resource, usize);
@@ -635,6 +694,15 @@ impl Drop for Staging {
                 all.0.entry(self.pooled).or_default().push(Spare(self.buffer.clone(), self.data as usize));
             }
         }
+        if let Some(gpu) = &self.gpu
+            && gpu.pooled != 0
+        {
+            let mut all = SPARE_LINEAR.lock().unwrap_or_else(|e| e.into_inner());
+            if all.1 + gpu.pooled <= spare_most() {
+                all.1 += gpu.pooled;
+                all.0.entry(gpu.pooled).or_default().push(SpareLinear(gpu.linear.clone()));
+            }
+        }
     }
 }
 
@@ -1002,7 +1070,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         {
             let f = footprint.Footprint;
             // SAFETY: live resources.
-            let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
+            let (gpu, d) = unsafe { (staging.copy_source().GetGPUVirtualAddress(), texture.GetDesc()) };
             let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
             list.note_read(
                 || {
@@ -1035,7 +1103,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         };
         let from = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: as above.
-            pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
+            pResource: unsafe { std::mem::transmute_copy(staging.copy_source()) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                 PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
@@ -1046,6 +1114,11 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         };
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+    }
+    // On the card's way: the list's prelude detiles the staging buffer into
+    // the buffer the copies above read, at submission.
+    if staging.gpu.is_some() {
+        list.detile_first(staging.clone());
     }
     // When the list is submitted, its copy takes what the staging buffer
     // holds by then: noted before the check below, which sets `dirty`
@@ -1304,6 +1377,29 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
 }
 
 impl Staging {
+    /// The buffer the list copies the texture's subresources from.
+    fn copy_source(&self) -> &ID3D12Resource {
+        self.gpu.as_ref().map_or(&self.buffer, |g| &g.linear)
+    }
+
+    /// On the card's way: records in `list` (the prelude of a list of
+    /// submission `submission`) the detiling of the staging buffer, unless
+    /// a prelude of the same submission already did. False if nothing was
+    /// recorded.
+    pub(crate) fn record_detile(&self, list: &ID3D12GraphicsCommandList, submission: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (Some(gpu), Some(detiler)) = (&self.gpu, crate::gpudetile::detiler()) else {
+            return false;
+        };
+        if gpu.recorded.swap(submission, Relaxed) == submission {
+            return false;
+        }
+        crate::gpudetile::record(list, detiler, &self.buffer, &gpu.linear, &gpu.jobs);
+        crate::gpudetile::STATS[0].fetch_add(1, Relaxed);
+        crate::gpudetile::STATS[1].fetch_add(gpu.jobs.len() as u64, Relaxed);
+        true
+    }
+
     /// Levels on demand: what says, beside the mapping, which levels of
     /// the texture are the title's now. First the lowest level a live view
     /// of the texture shows (0 without a view that says): the title's own
@@ -1755,6 +1851,29 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
+        use std::sync::atomic::Ordering::Relaxed;
+        let started = std::time::Instant::now();
+        let size = (self.layout.size as usize).min(tiled.len());
+        if let Some(mode) = BY_MODE.get(self.layout.desc.swizzle.0 as usize) {
+            mode.fetch_add(size as u64, Relaxed);
+        }
+        if let Some(gpu) = &self.gpu {
+            // The card's way: the bytes as they are, and which levels are
+            // the title's; the prelude's shader does the rest.
+            // SAFETY: the staging buffer's mapping holds `gpu.raw.bytes`
+            // (the layout's size, then the mask and the tables), written
+            // only here, under `last`'s lock.
+            unsafe {
+                std::ptr::copy_nonoverlapping(tiled.as_ptr(), self.data, size);
+                crate::gpudetile::write_mask(&gpu.raw, self.data, held);
+            }
+            crate::gpudetile::STATS[2].fetch_add(size as u64, Relaxed);
+            crate::gpudetile::STATS[3].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+            return;
+        }
+        DETILED[1].fetch_add(size as u64, Relaxed);
+        DETILED[2].fetch_add(1, Relaxed);
+        let _timed = DetileTimed(started);
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = self.part(i);
             let f = footprint.Footprint;
@@ -1781,6 +1900,16 @@ impl Staging {
                 return;
             }
         }
+    }
+}
+
+/// Adds the time since its start to [`DETILED`] when dropped (the PC's
+/// detile returns early on a refused subresource).
+struct DetileTimed(std::time::Instant);
+
+impl Drop for DetileTimed {
+    fn drop(&mut self) {
+        DETILED[0].fetch_add(self.0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -2164,7 +2293,29 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
             Some(&mut total),
         );
     }
-    let (piece, buffer, base, data, pooled) = match crate::pool::staging(host, total) {
+    // On the card's way (`VICTORY_GPU_DETILE`): the dispatches, if every
+    // subresource can be detiled so, and the buffer they write.
+    let gpu = if crate::gpudetile::on() && crate::gpudetile::detiler().is_some() {
+        let raw = crate::gpudetile::raw_layout(&layout);
+        let jobs = crate::gpudetile::jobs(&layout, &footprints, &rows, u32::from(d.MipLevels), &raw);
+        let linear = jobs.as_ref().and_then(|_| linear_buffer(host, total));
+        match (jobs, linear) {
+            (Some(jobs), Some((linear, pooled))) => {
+                crate::gpudetile::STATS[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Some(Gpu { linear, pooled, raw, jobs, recorded: std::sync::atomic::AtomicU64::new(0) })
+            }
+            _ => {
+                crate::gpudetile::STATS[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // A piece of the shared staging pool holds the PC's detiled bytes; the
+    // card's way reads its raw bytes from the start of a buffer of its own.
+    let piece = if gpu.is_none() { crate::pool::staging(host, total) } else { None };
+    let (piece, buffer, base, data, pooled) = match piece {
         Some((piece, buffer, base, data)) => (Some(piece), buffer, base, data, 0),
         None => {
             // (`VICTORY_RESIDENCY=1`: no buffer of its own for a texture
@@ -2176,7 +2327,13 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
                 crate::residency::note_staging_deferred();
                 return None;
             }
-            let (buffer, data, pooled) = staging_buffer(host, total)?;
+            let (buffer, data, pooled) = staging_buffer(host, gpu.as_ref().map_or(total, |g| g.raw.bytes))?;
+            if let Some(gpu) = &gpu {
+                // SAFETY: a new staging buffer of `raw.bytes` (all zeros: the
+                // texture reads as zeros until its first detiling, as on the PC's
+                // way) that nothing else holds.
+                unsafe { crate::gpudetile::write_tables(&layout, &gpu.raw, data) };
+            }
             crate::host::name_frame(&buffer, || {
                 format!(
                     "staging of {resource:?} {}x{}x{} f{}",
@@ -2222,6 +2379,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
         pooled,
+        gpu,
     });
     map.insert(resource as usize, s.clone());
     Some(s)

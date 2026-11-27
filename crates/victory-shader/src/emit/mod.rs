@@ -1041,7 +1041,11 @@ fn paired(
             what: "paired lanes outside compute",
         });
     };
-    if crate::spill::is_spilled(native) {
+    // `VICTORY_WAVE_PAIRS_SPILLED=1`: try it anyway (the structure builder's
+    // three wave64 programs are spilled ones; offline checks first).
+    if crate::spill::is_spilled(native)
+        && std::env::var_os("VICTORY_WAVE_PAIRS_SPILLED").is_none_or(|v| v != "1")
+    {
         return Err(ShaderError::Unsupported {
             offset: 0,
             what: "paired Wave64 for spilled DispatchX programs is not validated",

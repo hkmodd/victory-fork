@@ -108,6 +108,9 @@ pub(crate) enum Cast {
     FpToSi = 4,
     UiToFp = 5,
     SiToFp = 6,
+    /// 32- to 64-bit float: a plain double operation, unlike the integer conversions to
+    /// doubles (which need the double extensions flag).
+    FpExt = 8,
     Bitcast = 11,
 }
 
@@ -261,6 +264,10 @@ pub(crate) struct Module {
     tags: HashMap<u32, Tag>,
     /// A block that was closed by a meet: later instructions aimed at it belong in the continuation.
     redirect: HashMap<usize, usize>,
+    /// Written without the fast-math flags whatever [`opt::FAST`] says: a program whose
+    /// float results must be the console's bit for bit (the ordered paired FP32
+    /// reductions), while the others keep the flags.
+    pub exact_floats: bool,
 }
 
 impl Module {
@@ -963,7 +970,7 @@ impl Module {
         w.exit();
 
         // Not in unit tests: their expected bitcode is the plain one.
-        let fast = !cfg!(test) && super::shader_opt() & opt::FAST != 0;
+        let fast = !cfg!(test) && !self.exact_floats && super::shader_opt() & opt::FAST != 0;
         let fast_bits = fast_math_bits();
         w.enter(FUNCTION_BLOCK, 4);
         w.record(1, &[layout.len() as u64]);

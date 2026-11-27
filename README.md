@@ -141,6 +141,24 @@ this fork's word pairs and runs. The copies are walked for patches only when one
 last submission, the patched bytes are left out of this fork's landings until sent as the changed
 ranges are, and two copies in one buffer get a barrier between their patches.
 
+### Merged from fxceless/victory-fork (2026-11-27, 03:45 UTC)
+
+Upstream's notes of commits 8a32d0ba to 67429060 (their numbers, on their machine):
+
+- **The ray-tracing structure builder runs** (`VICTORY_BVH_BUILDER`, now on by default; `=0` turns it
+  off): its last three programs, the group prefix sums, translate (a shared-memory read at a uniform
+  address counts as lane-uniform, after PR #36). **Known problem: about 30-40 s after the builder
+  starts, the title crashes on a write to address 0 (two runs, with and without
+  `VICTORY_BVH_QUARANTINE`).** Until that is traced, set `VICTORY_BVH_BUILDER=0` to play.
+- **Water:** the two water programs run in the paired wave64 form (pull request #1419 plus exact
+  reductions here; set `VICTORY_WAVE_PAIRS_ONLY=5dc3b25986622949,6f225b641c5b0708`,
+  `VICTORY_WAVE_PAIRS_FP32=non-ieee-rne-ftz`): the water has its green colour. The tile start values the
+  corner thread skips on an early return are now set by every thread first (`VICTORY_LDS_INIT_HOIST=0`
+  off), for the flickering dark tiles; not yet confirmed in a game run.
+- **New, off by default:** `VICTORY_GPU_DETILE` (textures detiled on the card), `VICTORY_INPLACE_CONSTANTS`
+  (the title's constants heap read by the card in place; did not open in its first run),
+  `VICTORY_PATCH_LEAN`, `VICTORY_DUMP_REFUSED=<dir>` (saves shaders that do not translate).
+
 What is known to be wrong:
 
 - Trees, signs and far objects flicker in the distance in some places.
