@@ -177,22 +177,17 @@ impl Notes {
         self.read(shard_of(page)).parts_since(page, taken)
     }
 
-    /// The notes of pages `[first, last)` in page order, `each` of them
-    /// until it says no: whether it never did. A part at a time.
+    /// The notes of pages `[first, last)`, one shard at a time, until the
+    /// predicate says no. Large ranges visit each shard once.
     fn each(&self, first: usize, last: usize, mut each: impl FnMut(usize, u64) -> bool) -> bool {
         match pieces(first, last) {
-            Some(pieces) => pieces.into_iter().all(|(from, to)| {
+            Some(mut pieces) => pieces.all(|(from, to)| {
                 let s = self.read(shard_of(from));
                 s.written.range(from..to).all(|(&p, &w)| each(p, w))
             }),
-            None => {
-                let mut all: Vec<(usize, u64)> = Vec::new();
-                for shard in 0..SHARDS {
-                    all.extend(self.read(shard).written.range(first..last).map(|(&p, &w)| (p, w)));
-                }
-                all.sort_unstable();
-                all.into_iter().all(|(p, w)| each(p, w))
-            }
+            None => (0..SHARDS).all(|shard| {
+                self.read(shard).written.range(first..last).all(|(&p, &w)| each(p, w))
+            }),
         }
     }
 
@@ -203,6 +198,9 @@ impl Notes {
             out.push((p, w));
             true
         });
+        if pieces(first, last).is_none() {
+            out.sort_unstable();
+        }
         out
     }
 
@@ -238,15 +236,19 @@ impl Notes {
 /// The pieces of pages `[first, last)` in page order, each in one part;
 /// `None` for a range of more pieces than is worth walking (then each part
 /// is looked at once).
-fn pieces(first: usize, last: usize) -> Option<Vec<(usize, usize)>> {
-    if first >= last {
-        return Some(Vec::new());
-    }
-    let (a, b) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
-    if b - a >= 4 * SHARDS {
+fn pieces(first: usize, last: usize) -> Option<impl Iterator<Item = (usize, usize)>> {
+    let (a, end) = if first < last {
+        (first >> SHARD_SHIFT, ((last - 1) >> SHARD_SHIFT) + 1)
+    } else {
+        (0, 0)
+    };
+    if end - a > 4 * SHARDS {
         return None;
     }
-    Some((a..=b).map(|piece| (first.max(piece << SHARD_SHIFT), last.min((piece + 1) << SHARD_SHIFT))).collect())
+    Some((a..end).map(move |piece| {
+        let step = 1 << SHARD_SHIFT;
+        (first.max(piece * step), last.min((piece + 1).saturating_mul(step)))
+    }))
 }
 
 /// Parts of [`Notes`] held ([`Notes::hold`]).
@@ -279,7 +281,6 @@ impl Held<'_> {
     fn range(&self, first: usize, last: usize) -> Vec<(usize, u64)> {
         match pieces(first, last) {
             Some(pieces) => pieces
-                .into_iter()
                 .flat_map(|(from, to)| self.shard(from).written.range(from..to).map(|(&p, &w)| (p, w)))
                 .collect(),
             None => {
@@ -6003,8 +6004,16 @@ mod port7_tests {
         assert_eq!(shards_of(P - 1, P + 1), 0b11);
         assert_eq!(shards_of(63 * P, 65 * P), 1 << 63 | 1);
         assert_eq!(shards_of(5, 5 + SHARDS * P), u64::MAX);
-        assert_eq!(pieces(P - 2, 2 * P + 3), Some(vec![(P - 2, P), (P, 2 * P), (2 * P, 2 * P + 3)]));
-        assert_eq!(pieces(0, 1 << 40), None);
+        assert_eq!(
+            pieces(P - 2, 2 * P + 3).unwrap().collect::<Vec<_>>(),
+            [(P - 2, P), (P, 2 * P), (2 * P, 2 * P + 3)]
+        );
+        assert_eq!(pieces(7, 4).unwrap().next(), None);
+        assert_eq!(
+            pieces(usize::MAX - 1, usize::MAX).unwrap().next(),
+            Some((usize::MAX - 1, usize::MAX))
+        );
+        assert!(pieces(0, 1 << 40).is_none());
         let notes = Notes::new();
         let mut want: BTreeMap<usize, u64> = BTreeMap::new();
         let mut seed = 7;
