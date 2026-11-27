@@ -4426,9 +4426,56 @@ impl State {
             once!(?role, "no stand-in for the indirect light: missing image UAV");
             return false;
         };
+        // A depth-stencil texture's view of its stencil plane (formats
+        // X32_TYPELESS_G8X24_UINT, X24_TYPELESS_G8_UINT, or a 2D view of plane
+        // 1) is no depth: the estimate made of it puts every point far away
+        // with its normal to the camera (flat floors; trustno1's capture
+        // haze2 named #6481's stencil plane at the depth place). Then another
+        // depth view of the program's tables, of the image's size, is taken.
+        // (The description's words are D3D12_SHADER_RESOURCE_VIEW_DESC's: its
+        // union starts at word 4, so a 2D view's plane is word 6.)
+        let stencil_at = |(slot, offset): (u8, u32)| {
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                return false;
+            };
+            let view = crate::descriptor::view(table + u64::from(offset) * 4);
+            match view.map(|v| crate::descriptor::host::placed_texture(&v).unwrap_or(v)) {
+                Some(View::Shader(_, Some(d))) => {
+                    matches!(crate::resource::pc_format(d[0]), 22 | 47) || (d[1] == 4 && d[6] == 1)
+                }
+                _ => false,
+            }
+        };
+        let depth_like = |d: &D3D12_RESOURCE_DESC| {
+            use windows::Win32::Graphics::Dxgi::Common::{
+                DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+                DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
+            };
+            d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                && matches!(
+                    d.Format,
+                    DXGI_FORMAT_R32_TYPELESS
+                        | DXGI_FORMAT_D32_FLOAT
+                        | DXGI_FORMAT_R32G8X24_TYPELESS
+                        | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                        | DXGI_FORMAT_R24G8_TYPELESS
+                        | DXGI_FORMAT_D24_UNORM_S8_UINT
+                )
+        };
         let depth = match role {
             Role::Resolve => {
-                let Some((seen, depth)) = entry(ResourceType::Srv, DEPTH) else {
+                let found = if stencil_at(DEPTH) {
+                    once!(?role, ?DEPTH, "stand-in: the depth place names a stencil plane; another depth view of the tables is taken");
+                    t.used
+                        .iter()
+                        .filter(|u| u.kind == ResourceType::Srv && u.root == RootType::Table)
+                        .filter(|u| !stencil_at((u.slot, u.table_offset_dwords)))
+                        .filter_map(|u| entry(ResourceType::Srv, (u.slot, u.table_offset_dwords)))
+                        .find(|(d, _)| depth_like(d) && (d.Width, d.Height) == (of.Width, of.Height))
+                } else {
+                    entry(ResourceType::Srv, DEPTH)
+                };
+                let Some((seen, depth)) = found else {
                     once!(?role, "no stand-in for the indirect light: missing depth SRV");
                     return false;
                 };
@@ -4473,7 +4520,11 @@ impl State {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
             return None;
         };
-        let resource = match (kind, crate::descriptor::view(table + u64::from(offset) * 4)?) {
+        // A view of a texture the title placed in its memory is a placed
+        // record; its host texture is the one placed_texture names.
+        let view = crate::descriptor::view(table + u64::from(offset) * 4)?;
+        let view = crate::descriptor::host::placed_texture(&view).unwrap_or(view);
+        let resource = match (kind, view) {
             (ResourceType::Srv, View::Shader(r, _)) | (ResourceType::Uav, View::Unordered(r, ..)) => r,
             _ => return None,
         };
