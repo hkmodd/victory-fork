@@ -43,6 +43,23 @@ fn bad_keys<'a>(text: &'a str, fingerprint: &str) -> HashSet<&'a str> {
         .collect()
 }
 
+fn completed_keys<'a>(text: &'a str, fingerprint: &str) -> HashSet<&'a str> {
+    text.lines()
+        .filter_map(|line| {
+            // Older journals also counted refusals as completed.
+            let (recorded, key) = line.strip_prefix("v2 ")?.split_once(' ')?;
+            (recorded == fingerprint).then_some(key)
+        })
+        .collect()
+}
+
+fn record_completion(out: &mut impl Write, fingerprint: &str, key: &str, there: bool) -> Result<()> {
+    if there {
+        writeln!(out, "v2 {fingerprint} {key}").context("writing warm-done.txt")?;
+    }
+    Ok(())
+}
+
 pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, these: Option<String>) -> Result<()> {
     let dir = folder()?;
     if let Some(these) = these {
@@ -59,14 +76,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let bad_file = dir.join("warm-bad.txt");
     let entries = known::warm_entries(&dir);
     let listed = std::fs::read_to_string(&done_file).unwrap_or_default();
-    let mut done: HashSet<&str> = HashSet::new();
-    for line in listed.lines() {
-        if let Some((of, key)) = line.split_once(' ')
-            && of == fingerprint
-        {
-            done.insert(key);
-        }
-    }
+    let done = completed_keys(&listed, &fingerprint);
     let listed_bad = if again || std::env::var_os("VICTORY_WARM_BAD").is_some_and(|v| v == "0") {
         String::new()
     } else {
@@ -116,7 +126,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                 println!("{count} of {}, {:.0} s", all.len(), began.elapsed().as_secs_f64());
             }
             drop(state);
-            writeln!(lock(&done_out), "{fingerprint} {}", entries[n].key).context("writing warm-done.txt")
+            record_completion(&mut *lock(&done_out), &fingerprint, &entries[n].key, there)
         },
         |n, why| {
             println!("pipeline {n} {}: {why}", entries[n].key);
@@ -370,6 +380,17 @@ fn make(dir: &Path, these: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::windows::process::CommandExt;
+
+    #[test]
+    fn warm_completion_keeps_refusals_and_ambiguous_legacy_records_pending() {
+        let mut journal = b"fingerprint legacy\nv2 earlier old\n".to_vec();
+        record_completion(&mut journal, "fingerprint", "refused", false).unwrap();
+        record_completion(&mut journal, "fingerprint", "compiled", true).unwrap();
+        assert_eq!(
+            completed_keys(std::str::from_utf8(&journal).unwrap(), "fingerprint"),
+            HashSet::from(["compiled"])
+        );
+    }
 
     #[test]
     fn quarantine_expires_with_the_fingerprint_and_keeps_legacy_keys() {
