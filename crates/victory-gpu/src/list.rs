@@ -793,6 +793,57 @@ const UAV_BARRIER: Barrier = Barrier {
     last: 0,
 };
 
+/// Whether a batch's transitions of one host resource are merged (`host_transitions`).
+/// `VICTORY_BARRIER_MERGE=0`: each title barrier is passed on as before.
+#[cfg(windows)]
+fn merge_transitions() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BARRIER_MERGE").is_none_or(|v| v != "0"))
+}
+
+/// A title barrier batch as valid host barriers (port of looper 75296eddb). Textures are
+/// tracked whole, so the title's transitions of several subresources of one texture become
+/// transitions of all of it, and D3D12 forbids two transitions of a subresource in one
+/// `ResourceBarrier` call, and transitions to the state they start from. The transitions of
+/// one host resource (with the same split flags) become one, from the first state to the
+/// last; one that ends where it began is dropped, or is a UAV barrier on that resource when
+/// the state is unordered access.
+#[cfg(windows)]
+fn host_transitions(list: &crate::host::HostList, barriers: &[Barrier]) -> Vec<Barrier> {
+    const UNORDERED_ACCESS: u32 = 0x8;
+    let mut host: Vec<Barrier> = Vec::with_capacity(barriers.len());
+    for b in barriers {
+        let Some(t) = host_barrier(list, b) else {
+            continue;
+        };
+        if t.kind == 0
+            && let Some(h) =
+                host.iter_mut().find(|h| h.kind == 0 && h.first == t.first && h.flags == t.flags)
+        {
+            h.last = t.last;
+            continue;
+        }
+        host.push(t);
+    }
+    let mut i = 0;
+    while i < host.len() {
+        let b = host[i];
+        if b.kind == 0 && (b.second >> 32) as u32 == b.last as u32 {
+            let uav = b.last as u32 == UNORDERED_ACCESS
+                && !host.iter().any(|h| h.kind == 2 && (h.first.is_null() || h.first == b.first));
+            if uav {
+                host[i] = Barrier { kind: 2, flags: 0, first: b.first, second: 0, last: 0 };
+                i += 1;
+            } else {
+                host.remove(i);
+            }
+            continue;
+        }
+        i += 1;
+    }
+    host
+}
+
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
@@ -804,10 +855,11 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         }
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
-        let mut host: Vec<Barrier> = barriers
-            .iter()
-            .filter_map(|b| host_barrier(list, b))
-            .collect();
+        let mut host: Vec<Barrier> = if merge_transitions() {
+            host_transitions(list, barriers)
+        } else {
+            barriers.iter().filter_map(|b| host_barrier(list, b)).collect()
+        };
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
         if barriers.iter().any(|b| {
