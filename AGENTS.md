@@ -96,6 +96,9 @@ non si può è una domanda a cui si risponde per iscritto **prima** dell'azione.
   il gioco girava senza guardia; con `-t dx12` +4 GB di privata, chiuso a 34 GB; il log resta vuoto). Contatori GPU solo
   device-wide accanto a una run normale (`run.ps1 -GpuMetricsAt <s>`). **Meccanico:** guard.ps1 cerca l'exe fra i
   discendenti e, se non lo trova, chiude l'albero del cmd; il VERDICT richiede report delle pipeline e ≥4 finestre di mondo.
+- **E12 DECISIONE DATA = SCRITTA SUBITO** (2026-11-27: download a consenso dei binari Streamline già deciso dall'Host,
+  richiesto di nuovo dopo una compattazione). Ogni decisione dell'Host entra in STATE.md DECISIONI nello stesso turno.
+  Prima di ogni domanda all'Host: `grep -n <tema> STATE.md`; se la risposta c'è, si esegue, non si chiede.
 
 ## 3. Protocollo di run (standard)
 
