@@ -571,7 +571,7 @@ pub struct Player {
 }
 
 /// What a command of a list is timed as.
-type Stamp = (usize, &'static str, u32);
+type Stamp = (usize, &'static str, u32, u64);
 
 /// With a stamp of a copy to a texture: this bit and the texture's number
 /// stand for the pipeline's.
@@ -2585,7 +2585,11 @@ impl Player {
                     } => COPY_TO | dst,
                     _ => NONE,
                 };
-                stamps.push((**next as usize, category, runs));
+                let groups = match c {
+                    Cmd::Dispatch { groups } => groups.iter().map(|&g| u64::from(g)).product(),
+                    _ => 0,
+                };
+                stamps.push((**next as usize, category, runs, groups));
                 **next += 1;
             }
         }
@@ -3193,13 +3197,23 @@ impl Player {
     fn detail(&self, built: &Sends, stamps: &[Vec<u64>], o: &Options, report: &mut Report) {
         let mut kinds: BTreeMap<&str, (Vec<f64>, u32)> = BTreeMap::new();
         let mut shaders: HashMap<u32, (Vec<f64>, u32)> = HashMap::new();
+        // Thread groups launched by each pipeline's direct dispatches, in one loop.
+        let mut groups: HashMap<u32, (u64, u32)> = HashMap::new();
+        for l in built.steps.iter().flat_map(|(_, l)| l) {
+            for &(_, _, pso, g) in &l.stamps {
+                if pso != NONE && g != 0 {
+                    let e = groups.entry(pso).or_default();
+                    *e = (e.0 + g, e.1 + 1);
+                }
+            }
+        }
         let loops = if stamps.len() > 2 { &stamps[1..] } else { stamps };
         for stamps in loops {
             let mut of_kind: BTreeMap<&str, (f64, u32)> = BTreeMap::new();
             let mut of_shader: HashMap<u32, (f64, u32)> = HashMap::new();
             for l in built.steps.iter().flat_map(|(_, l)| l) {
                 let mut before = stamps[l.first as usize];
-                for &(at, kind, pso) in &l.stamps {
+                for &(at, kind, pso, _) in &l.stamps {
                     let ms = stamps[at].saturating_sub(before) as f64 * 1e3 / self.frequency;
                     before = before.max(stamps[at]);
                     let k = of_kind.entry(kind).or_default();
@@ -3243,6 +3257,10 @@ impl Player {
                         format!("copies to #{} {}", pso & !COPY_TO, r.name)
                     }
                     None => self.pipeline_name(pso),
+                };
+                let name = match groups.get(&pso) {
+                    Some(&(g, d)) => format!("{name}  [{} groups per dispatch, {d} dispatches]", g / u64::from(d)),
+                    None => name,
                 };
                 (ms, n, name)
             })
