@@ -125,6 +125,7 @@ fn build() -> [u8; 32] {
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
+            "VICTORY_THREAD_TICKET",
             "VICTORY_BVH_MISS",
             "VICTORY_BVH_NO_HIT",
             // The list this file reads for the translator ([`translate`]).
