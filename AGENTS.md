@@ -31,8 +31,9 @@ sicuro quando il passo grosso è quello che serve.
    col suo set si blocca prima del mondo, col nostro fa 14,9 fps contro 18,4 e perde i capelli: **base = il nostro
    main**. Dai donatori si prende il pezzo che sposta una misura **qui**; i pezzi provati su AMD si portano e si
    rendono corretti su NVIDIA (wave32, 4080) prima di giudicarli.
-1. **ALIGN.** Esegui `bash /d/Tools/victory-align.sh`: fa il merge di origin/main (fxceless) nel main locale e
-   ricompila. Gira anche da cron ogni 20 min (va ricreato a ogni sessione: CronCreate `7,27,47 * * * *`).
+1. **ALIGN: SOSPESO** (Host, 2026-11-27). Upstream 5dbf5ce22 ha sostituito il suo albero con trustno1 VIctory-NVIDIA,
+   misurato qui peggio (Lucia senza testa). origin/main non si fonde più in automatico: è un donatore come gli
+   altri (§2 passo 4), il nostro main va avanti da solo. Niente cron di `victory-align.sh`.
 2. **SCAN.** Esegui `bash /d/Tools/victory-forkscan.sh`: stampa i commit nuovi di ogni fork della famiglia
    (§6) dall'ultima scansione. Cron ogni ora (`41 * * * *`). Serve a: (a) accorgersi se un fork dichiara di essere
    più avanti della base (allora si misura, passo 0); (b) trovare il pezzo che attacca il **muro misurato** di oggi
@@ -105,7 +106,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\Tools\victory\run.ps1 -Na
 | Remote/ramo | Repository | Cosa porta di meglio (da verificare per misura) |
 |---|---|---|
 | ghosty/main | DoubleGhosty/cool_fox | Misurato qui 2026-11-27: dietro di noi (14,9 vs 18,4 fps, senza capelli). Donatore di pezzi G4/G2. `scripts/play.ps1` = il suo set |
-| origin/main | fxceless/victory-fork | Upstream del repo (watchdog ALIGN). Switch di velocità misurati (README); 10,3 fps nelle prime stanze con INDIRECT_GATHER |
+| origin/main | fxceless/victory-fork | Dal 5dbf5ce22 = trustno1 VIctory-NVIDIA (non si fonde più, solo donatore). Prima: switch di velocità misurati (README); 10,3 fps nelle prime stanze con INDIRECT_GATHER |
 | uilian/main | uiliannn/VItoriaBr | Base hyphennn + port da DexNom/Belobug: quad read con helper lane (righe su vernice, vetro, pelle), `victory warm`, priorità alle pipeline, formati 189-191, dot4 impacchettati, ambiente da profondità (Belobug), analisi comparative in `docs/` |
 | itsbatt/main | Itsbatt/victory-unified | fxceless + grafica Belobug unificate, cap 30 fps, liste GPU in volo limitate a 128 |
 | zettrox/main | Zettrox/ztrx | Il più avanti nella storia (prologo, "Gone Fishing", 1h30 senza crash); grafica peggiore |
