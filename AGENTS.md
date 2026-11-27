@@ -42,10 +42,12 @@ sicuro quando il passo grosso è quello che serve.
    tocca il muro di oggi (es. lane CPU quando il muro è la scheda) non si porta per G3.
 4. **PORT / FIX.** Un pezzo per commit, con `git cherry-pick -x <sha>` (oppure riscrittura manuale). Crediti nel
    messaggio: `(port of <Fork> <sha>, GPL-3.0)`. Mai mescolare due pezzi in un commit.
-5. **BUILD + TEST.** Build diag (§4). `cargo test` sul crate toccato. Se non compila, il pezzo non entra.
-6. **RUN.** Una run standard (§3), una variabile alla volta rispetto al riferimento.
+5. **BUILD + TEST + PRECOMPILE.** Build diag (§4). `cargo test` sul crate toccato. Se non compila, il pezzo non
+   entra. Poi **sempre** `warm.ps1 -Set "<set della run>"` (shader + pipeline, §2b E1): senza, run.ps1 rifiuta.
+6. **RUN.** Una run standard (§3), una variabile alla volta rispetto al riferimento (o un pacchetto di leve
+   piccole, §2b E5). Dopo un cambio di traduzione la prima run è `-WarmUp`, la misura è la seconda.
 7. **JUDGE.** Si decide sulle immagini affiancate, agli stessi secondi, e sui numeri di `fps.py`, a parità di
-   stato della libreria PSO (fredda contro fredda, calda contro calda).
+   stato della libreria PSO: solo run con `VERDICT: MEASUREMENT valid` (made=0), come il riferimento.
    Migliora → resta. Uguale ma corretto → resta. Peggiora o dubbio → si cerca la causa; `git revert` solo con la
    causa annotata.
 8. **COMMIT + STATE.** Commit locale. STATE.md: FATTO (un nodo), coda aggiornata, PROSSIMO (uno solo).
@@ -55,11 +57,51 @@ sicuro quando il passo grosso è quello che serve.
 niente (mondo, fps, fix) senza uno screenshot e un log **di quella run**. Le ipotesi si scrivono con la loro
 evidenza (codice, disassembly, log, misura del donatore). "Proviamo" non è un metodo: prima la causa, poi il fix.
 
+## 2b. Guardie anti-errore (obbligatorie; ognuna nasce da un errore vero, data e run fra parentesi)
+
+Un errore non si scusa: si rende impossibile. Dove si può la guardia è **meccanica** (lo script rifiuta); dove
+non si può è una domanda a cui si risponde per iscritto **prima** dell'azione. Una risposta che manca = non si agisce.
+
+- **E1 CAMBIO DI TRADUZIONE = PRECOMPILA TUTTO** (avmscc1, 2026-11-27: bump a v8 e run subito, 0,2 fps per 140 s,
+  presentata come verifica). Cambio di `TRANSLATOR_VERSION`, del codice del traduttore, di uno switch nella chiave
+  di traduzione (`shader_cache.rs` `build()`: fra gli altri `VICTORY_EARLY_DEPTH`, `VICTORY_WAVE_PAIRS_ONLY`,
+  `VICTORY_THREAD_TICKET`, `VICTORY_SHADER_OPT`), o build nuova: `warm.ps1 -Set "<set>"` (= `victory shaders` +
+  `victory warm --used`, cache del driver, poi timbro exe+set), poi **una** run `-WarmUp` (riempie la libreria
+  `host-pipelines-<chiave>.bin`), poi la misura. **Meccanico:** run.ps1 rifiuta senza timbro per quell'exe e quel
+  set, e rifiuta un exe più vecchio dei sorgenti.
+- **E2 IL VERDETTO È DELLO SCRIPT** (avmscc2: 317 pipeline costruite nella run, giudicata contro avmv7b che ne aveva
+  0). Un numero si riferisce all'Host solo con `VERDICT: MEASUREMENT valid` stampato da run.ps1 (somma dei `made=`
+  di "host pipelines all made" = 0). Altrimenti la run si ripete, non si commenta.
+- **E3 DEFAULT DEI TOOL LETTI NEL SORGENTE** (replay `--retranslate`: host-wave di default 64 = RDNA, 127 shader
+  rifiutati, primo A/B nullo). Prima di usare un'opzione per una misura si legge il suo default. Trappole note:
+  replay `--host-wave 32` sempre; replay e `victory` con cwd = checkout (victory.toml); exe dal repo non scrive fuori.
+- **E4 ARCHIVIO PRIMA DELL'ESPERIMENTO** (WAVE_PAIRS 1f1fbd86 e `--one-submit` rimisurati da capo). Prima di ogni
+  esperimento: `grep -n <hash|switch|idea> STATE.md STATE-archive.md`; se c'è, si cita il nodo e si rifà solo se la
+  variabile è cambiata (e si dice quale).
+- **E5 PREVISIONE SCRITTA CON IL MODELLO DEL FRAME.** Prima di ogni run, una riga: "prevedo X fps perché ...".
+  Il titolo tiene 2 frame in volo: T ≈ (R+L)/2, un taglio di c ms di scheda vale ~c/2 di frame. Leve sotto 3 ms
+  si giudicano **in pacchetto**, mai da sole (da sole sono sempre "rumore"). Esito lontano dalla previsione = si
+  cerca perché prima della run successiva.
+- **E6 UN BLOCCO NON FERMA IL LOOP** (2026-11-27: fermo sui contatori GPU, Host: "non stavi seguendo un goal?").
+  Il blocco va in STATE.md (BLOCCO) in una riga e la leva successiva parte nello stesso turno.
+- **E7 NOMI ONESTI.** Ogni run si annuncia per quello che è: riscaldamento, sonda (immagine sbagliata ammessa),
+  misura. "Verifica" solo per una run che passa E1 ed E2.
+- **E8 NIENTE CPU PESANTE DURANTE UNA RUN MISURATA** (build, warm, replay, scansioni pesanti): spostano il lane.
+- **E9 CONTROLLO PRIMA DI OGNI AZIONE COSTOSA** (run, bump, merge, commit), una riga ciascuno: (1) cosa sposta di
+  G1-G4 e di quanto; (2) exe, set e libreria sono quelli del riferimento?; (3) cosa invaliderebbe il risultato;
+  (4) nodo d'archivio pertinente.
+- **E10 ERRORE = GUARDIA NUOVA NELLO STESSO TURNO.** Se un errore passa comunque, nello stesso turno si aggiunge la
+  guardia che lo avrebbe fermato (script, test o riga qui, con la run che l'ha mostrato). Mai solo "errore mio".
+
 ## 3. Protocollo di run (standard)
 
 ```
-powershell -NoProfile -ExecutionPolicy Bypass -File D:\Tools\victory\run.ps1 -Name <nome> [-Set "VICTORY_X=1,VICTORY_Y=2"] [-CapSec 330]
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\Tools\victory\warm.ps1 -Set "<set>"
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\Tools\victory\run.ps1 -Name <nome> [-Set "VICTORY_X=1,VICTORY_Y=2"] [-CapSec 330] [-WarmUp]
 ```
+- **Pre-flight (run.ps1, meccanico):** rifiuta se l'exe è più vecchio di un `.rs`/`Cargo.toml` o se manca il timbro
+  di `warm.ps1` per quell'exe e quel set (`D:\Tools\victory\warm-stamp.txt`, `stamp.ps1`). `-WarmUp` salta il timbro
+  e marca la run come riscaldamento. **Post-run:** riga `VERDICT:` (misura valida solo con made=0).
 - Lanciare sempre dal tool PowerShell, in background. Dentro c'è la guardia di memoria (`D:\Tools\victory\guard.ps1`,
   MaxPriv 34 GB, MinFreeCommit 10 GB, kill solo per PID verificato).
 - Input fisso: Enter ogni 5 s da 15 a 140 s; `VICTORY_KEYS_ONLY=1` (pad e tastiera reali ignorati). La schermata
@@ -72,7 +114,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\Tools\victory\run.ps1 -Na
   default 8 ogni frame salvato costa 235 ms e falsa gli fps); desktop in `desk_<nome>` a 60, 150, 205, 220, 235, 250 s.
 - Numeri: `python -I D:\Tools\victory\fps.py <log>` stampa, per finestre di 5 s, fps, mediana, frame più lungo,
   lavoro del thread di submit, copie, copia indietro (ms e MB), scheda ferma, draw.
-- Riferimento di confronto: l'ultima run standard su main senza switch (in STATE.md). `ref_base` non si cancella.
+- Riferimento di confronto: l'ultima run su main **col set standard** (STATE.md, CONOSCENZA MISURATA) con
+  `VERDICT: MEASUREMENT valid`; fps medi nelle finestre 195-300 s (`fps1.py`), rumore ±0,7. `ref_base` non si cancella.
 
 ## 4. Build e strumenti
 
@@ -80,6 +123,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\Tools\victory\run.ps1 -Na
 |---|---|
 | Build diag | `TEMP=TMP=D:/Temp/victory cargo build -q --profile diag -p victory --features diagnostics` → `target\diag\victory.exe` |
 | Test | `cargo test -q -p <crate> [--features diagnostics] <filtro>` |
+| Precompilazione | `warm.ps1 -Set "<set>"`: `victory shaders <gioco>` (cache DXIL) + `victory warm --used` (le ~2400 pipeline usate, nella cache del driver, chiave = traduzione + driver) + timbro. La libreria `host-pipelines-<chiave>.bin` la riempie la run `-WarmUp` |
 | Switch documentati | README del repository, sezione "Status of this fork": ogni `VICTORY_*` con la misura dell'autore |
 | Disassembly / decompilazione dell'exe | Ghidra headless via MCP (`pyghidra-mcp`, porta 8000, `D:\Tools\start-ghidra-mcp.cmd`), exe già importato |
 | Timeline CPU+GPU | Nsight Systems 2025.5.2 (`C:\Program Files\NVIDIA Corporation\Nsight Systems 2025.5.2`): thread di submit, code, fence |
@@ -121,9 +165,10 @@ I fork AMD vanno verificati su NVIDIA: un pezzo che dipende da wave64 o da compo
 
 ## 7. Conoscenza misurata (ancore; dettagli e date in STATE.md)
 
-- Mondo su main 0b0074e, default: 4,5-5,4 fps; frame 195-215 ms; copia indietro 125-150 ms / 52 MB; ~7000 draw.
-- Set del README (ASYNC_SUBMIT, QUEUE2, INDIRECT_WINDOW, TEXTURE_NO_WAIT, COPY_PLAIN): 5,0-6,4 fps; copia
-  indietro 30-40 ms; **muro = thread di submit, 135-190 ms per frame**.
-- README upstream (465b94f): ~50 ms di scheda per frame sono le passate del titolo tradotte. Per i 30 fps servono
-  sia la CPU (submit, copie) sia shader tradotti più snelli.
-- Ombre nere = ray tracing spento nel nostro albero.
+- Oggi (2026-11-27, v7 caldo avmv7b): **18,4 fps** nel mondo col set standard, frame 51-60 ms. Muro doppio:
+  **scheda ~55 ms** (liste del titolo 41, nostre 5, buchi 9) e lane ~35 ms. 30 fps = 33 ms di entrambi.
+- La scheda è lavoro degli shader tradotti diffuso su ~1270 pipeline (nessuna voce ≥5 ms); l'emulazione wave64 NON
+  è il muro (nodo 234); le leve a switch del traduttore sono esaurite. Senza contatori GPU (BLOCCO, impostazione
+  dell'Host) si lavora a pacchetti di leve misurate (E5).
+- Storico: main 0b0074e 4,5-5,4 fps con muro = thread di submit 135-190 ms (risolto dalla linea avatarmanz).
+- Ombre nere = builder RT spento (`BVH_BUILDER=0`, guardia di memoria).
