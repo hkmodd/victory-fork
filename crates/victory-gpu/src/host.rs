@@ -1868,6 +1868,12 @@ pub(crate) struct HostList {
     open_queries: Mutex<Vec<(ID3D12QueryHeap, u32, u32, usize)>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
+    /// The pair of timestamps its run is timed with since its last reset
+    /// (`crate::cardmeter`), or none.
+    meter: AtomicU32,
+    /// With `crate::cardmeter::pipelines`: the pair of the pipeline bound
+    /// last, open until the next one is bound or the list closes.
+    pipeline_meter: AtomicU32,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -5425,6 +5431,8 @@ impl Host {
                 clamp_window: Mutex::new(None),
                 open_queries: Mutex::new(Vec::new()),
                 _alive: Counted::new(),
+                meter: AtomicU32::new(u32::MAX),
+                pipeline_meter: AtomicU32::new(u32::MAX),
                 #[cfg(feature = "diagnostics")]
                 notes,
                 #[cfg(feature = "diagnostics")]
@@ -5734,6 +5742,7 @@ impl Host {
                     let timed_list = timed;
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    let timed_card = crate::cardmeter::begin(list, crate::cardmeter::Kind::Sync);
                     // The masked patches first (fxceless 3221ac428): each
                     // buffer from the common state to unordered access, its
                     // words, then back (the copies below promote it again).
@@ -5892,6 +5901,7 @@ impl Host {
                         }
                     }
                     parted = card_part(4, parted);
+                    crate::cardmeter::end(list, timed_card);
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     card_part(6, parted);
@@ -5979,6 +5989,7 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    let timed_card = crate::cardmeter::begin(list, crate::cardmeter::Kind::Check);
                     // What the submission's shaders wrote, first.
                     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -6003,6 +6014,7 @@ impl Host {
                         card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
+                    crate::cardmeter::end(list, timed_card);
                     list.Close()?;
                     list.cast()
                 })()
@@ -8054,6 +8066,12 @@ impl HostList {
         self.batches_common();
         self.card_budget_out();
         self.take_coming();
+        crate::cardmeter::end(&self.list, crate::cardmeter::Span::from_raw(self.pipeline_meter.swap(u32::MAX, Ordering::Relaxed)));
+        crate::cardmeter::end_named(
+            &self.list,
+            crate::cardmeter::Span::from_raw(self.meter.swap(u32::MAX, Ordering::Relaxed)),
+            &self.pipelines.lock().unwrap_or_else(|e| e.into_inner()),
+        );
         #[cfg(feature = "diagnostics")]
         crate::shot::close(self);
         #[cfg(feature = "diagnostics")]
@@ -8139,6 +8157,8 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        self.meter
+            .store(crate::cardmeter::begin(&self.list, crate::cardmeter::Kind::Lists).raw(), Ordering::Relaxed);
         // A frame shot tells the lists begun inside its frame from the ones
         // it found half recorded, and times each from its very start: what
         // the card does in a list before the title's first command is the
@@ -8703,6 +8723,11 @@ impl HostList {
     /// the list is reset, and its name noted, the first time only (a kept
     /// pipeline's address names no other).
     pub(crate) fn bind_pipeline(&self, name: &str, pso: &ID3D12PipelineState, root: &ID3D12RootSignature) {
+        if crate::cardmeter::pipelines() {
+            // The pipeline before it ends here on the card's clock.
+            crate::cardmeter::end(&self.list, crate::cardmeter::Span::from_raw(self.pipeline_meter.swap(u32::MAX, Ordering::Relaxed)));
+            self.pipeline_meter.store(crate::cardmeter::begin_named(&self.list, name).raw(), Ordering::Relaxed);
+        }
         {
             let mut deferred = self.deferred();
             if !deferred.bound.insert(pso.as_raw() as usize) {
