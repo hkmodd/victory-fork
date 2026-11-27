@@ -459,26 +459,6 @@ impl Structured {
     }
 }
 
-thread_local! {
-    /// Set by [`with_per_lane`]: no branch is taken wave-wide of its own accord.
-    static PER_LANE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Runs `f` with the branches on a mask operation's SCC split per lane, each lane by its own
-/// bit ([`Structured::wave_scc`] left empty), as before #66: inexact where an arm runs lanes
-/// whose own bit went the other way, but a program whose wave-wide form does not translate
-/// is drawn instead of dropped (`emit::emit`).
-pub fn with_per_lane<T>(f: impl FnOnce() -> T) -> T {
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            PER_LANE.set(self.0);
-        }
-    }
-    let _restore = Restore(PER_LANE.replace(true));
-    f()
-}
-
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
     structure_wide(program, &HashSet::new())
@@ -715,8 +695,7 @@ impl<'a> Lanes<'a> {
             {
                 self.when[b] = Some(self.branch(last));
                 self.wave_any[b] = self.wave_kind(last);
-                if !PER_LANE.get()
-                    && matches!(last.name(), "s_cbranch_scc0" | "s_cbranch_scc1")
+                if matches!(last.name(), "s_cbranch_scc0" | "s_cbranch_scc1")
                     && let Some(scc) = last.read(Reg::Scc)
                     && self.scc_lane.contains_key(&scc)
                     && !self.scc_every.contains(&scc)
