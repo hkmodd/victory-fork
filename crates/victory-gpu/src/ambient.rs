@@ -451,6 +451,11 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float3 was = unpack(light[p]);
     // Filter magenta garbage probes left by uninitialized/corrupted memory on AMD.
     if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
+    // And the bluer kind of it (blue over 2.5x green and over red): left as
+    // a faint violet by the line above (a purple-blue glow on a lit sheet of
+    // paper in the prison cell, RTX 5080). The sky's light keeps green above
+    // 0.4x blue, sunsets keep blue low, so neither is touched.
+    if (was.b > 2.5 * was.g && was.b > was.r && was.b > 0.02) was = 0.0;
     float left = dot(was, LUMA);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
