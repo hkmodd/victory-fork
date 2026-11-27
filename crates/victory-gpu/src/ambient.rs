@@ -545,7 +545,11 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role != Role::Radiance && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
         return false;
     }
-    if role == Role::Air && (constant > 0.0 || air() == 0.0) {
+    // The air's bound works with the constant too: the light around (the
+    // cells) is kept in both forms, and the points seen are gathered for it
+    // below. Without the bound the air held the sky's light indoors: orange
+    // clouds that burst in the prison's cells and a brown veil in its halls.
+    if role == Role::Air && air() == 0.0 {
         return false;
     }
     static SAID: Mutex<u32> = Mutex::new(0);
@@ -600,7 +604,8 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
             }
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
             Role::Resolve => {
-                if constant == 0.0 {
+                // (With the constant, only for the air's bound.)
+                if constant == 0.0 || air() > 0.0 {
                     run(&pass.place, 8, 9, 1);
                     run(&pass.gather, 20, 45, 1);
                 }
