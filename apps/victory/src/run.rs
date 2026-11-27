@@ -71,19 +71,32 @@ pub fn run(
     let image = if let Some(preset) = fsr {
         anyhow::ensure!(matches!(console, Console::SeriesX), "FSR 4K requires Series X mode");
         fsr_4k::prepare_fsr_4k(&mut prepared, preset)?;
-        let dir = cfg.fidelityfx_dir.as_deref().context(
-            "FSR 4K requires amd_fidelityfx_upscaler_dx12.dll. Set VICTORY_FIDELITYFX_DIR or [paths].fidelityfx_dir to its folder.",
-        )?;
-        // Select the provider before the first lookup builds the import registry.
-        victory_hle::modules::fidelityfx::use_host_dir(dir)
-            .map_err(anyhow::Error::msg)
-            .with_context(|| format!("loading FSR 4.1.2 from {}", dir.display()))?;
+        // DLSS (VICTORY_DLSS=1) serves the upscaler when Streamline loads and
+        // the GPU runs it; otherwise the PC FidelityFX, as without it. Both
+        // before the first lookup builds the import registry, and Streamline
+        // before the title makes its device.
+        let asked = victory_hle::streamline::Asked::from_env().map_err(anyhow::Error::msg)?;
+        if asked.dlss && victory_hle::streamline::init(&asked) {
+            victory_hle::modules::fidelityfx::use_dlss();
+            println!("upscaler       DLSS Super Resolution (Streamline {})", asked.dir.display());
+        } else {
+            let dir = cfg.fidelityfx_dir.as_deref().context(
+                "FSR 4K requires amd_fidelityfx_upscaler_dx12.dll. Set VICTORY_FIDELITYFX_DIR or [paths].fidelityfx_dir to its folder.",
+            )?;
+            victory_hle::modules::fidelityfx::use_host_dir(dir)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("loading FSR 4.1.2 from {}", dir.display()))?;
+        }
         // SAFETY: Windows supports setting the environment across threads.
         // No title code has run or queried DXGI yet.
         unsafe { std::env::set_var("VICTORY_DISPLAY_MODE", "3840x2160") };
         let cache = cfg.cache_subdir(&format!("images/fsr-{}-4k-sdr", preset.name()))?;
         victory_loader::load(&prepared, &cache)?
     } else {
+        if std::env::var("VICTORY_DLSS").is_ok_and(|v| v.trim() == "1") {
+            println!("upscaler       VICTORY_DLSS needs VICTORY_FSR_4K (the title's FidelityFX upscale); DLSS stays off");
+            tracing::warn!("VICTORY_DLSS needs VICTORY_FSR_4K; DLSS stays off");
+        }
         victory_loader::load(&prepared, &images)?
     };
     // The program is mapped from the copy `load` wrote: the file's bytes

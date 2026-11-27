@@ -13,6 +13,13 @@
 //! through unchanged: sizes, flags, jitter, motion-vector scale, camera
 //! values, the resource descriptions, the context. Only the upscaler: other
 //! effects (frame generation) are refused.
+//!
+//! With `VICTORY_DLSS=1` and Streamline in place ([`use_dlss`]) the same API
+//! is served by NVIDIA DLSS Super Resolution (`victory_gpu::streamline`): a
+//! context is ours (its flags, sizes and a DLSS viewport), the queries are
+//! answered with FidelityFX's formulas (render size by quality mode, jitter
+//! phases and offsets), and a dispatch is a DLSS evaluation at the same place
+//! on the title's command list.
 #![allow(non_snake_case)]
 // Title code calls these through its import table.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -21,6 +28,7 @@ use std::collections::BTreeMap;
 use std::ffi::{CStr, c_char, c_void};
 use std::path::Path;
 use std::ptr::{null, null_mut};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use victory_gpu::object::Object;
@@ -47,7 +55,10 @@ const GET_VERSIONS: u64 = 4;
 const OVERRIDE_VERSION: u64 = 5;
 const GET_PROVIDER_VERSION: u64 = 6;
 const MEMORY_USAGE_WITH_DEVICE: u64 = 0x1_0009;
+const GET_UPSCALE_RATIO: u64 = 0x1_0002;
 const GET_RENDER_RESOLUTION: u64 = 0x1_0003;
+const GET_JITTER_PHASE_COUNT: u64 = 0x1_0004;
+const GET_JITTER_OFFSET: u64 = 0x1_0005;
 const DISPLAY_RESOLUTION_MOTION_VECTORS: u32 = 1 << 1;
 
 #[repr(C)]
@@ -176,17 +187,33 @@ unsafe impl Send for Host {}
 unsafe impl Sync for Host {}
 
 static HOST: OnceLock<Host> = OnceLock::new();
+/// DLSS serves the title's upscaler ([`use_dlss`]).
+static DLSS: AtomicBool = AtomicBool::new(false);
+/// The DLSS viewport of the next context (one each, from 1).
+static NEXT_VIEWPORT: AtomicU32 = AtomicU32::new(1);
+
 struct Context {
     // Serializes recording and destruction for this particular temporal history.
     live: Mutex<bool>,
     first_dispatch: std::sync::Once,
+    /// The creation flags and largest render and output sizes.
+    flags: u32,
+    max_render: [u32; 2],
+    max_output: [u32; 2],
+    served: Served,
+}
+
+/// Who serves a context.
+enum Served {
     // The FFX API requires pointers in the creation descriptor to remain
     // live through destroy, including our replacement backend.
-    creation: CreateChain,
+    Host { _chain: CreateChain },
+    /// DLSS, on this viewport.
+    Dlss(u32),
 }
 
 struct CreateChain {
-    description: Box<CreateUpscale>,
+    _description: Box<CreateUpscale>,
     _backend: Box<Backend>,
     _version: Box<OverrideVersion>,
 }
@@ -241,7 +268,18 @@ pub fn use_host_dir(dir: &Path) -> Result<(), String> {
 
 /// Whether the host's FidelityFX serves the title's.
 pub fn serving() -> bool {
-    HOST.get().is_some()
+    HOST.get().is_some() || dlss()
+}
+
+/// Serve the title's upscaler with DLSS (Streamline is loaded and DLSS is
+/// supported); before the title's import registry is initialized.
+pub fn use_dlss() {
+    DLSS.store(true, Ordering::Release);
+    tracing::info!("FidelityFX: the title's upscaler is served by DLSS Super Resolution");
+}
+
+fn dlss() -> bool {
+    DLSS.load(Ordering::Acquire)
 }
 
 fn load(dir: &Path) -> Result<(Host, String), String> {
@@ -387,6 +425,9 @@ extern "C" fn ffxCreateContext(
     desc: *mut Header,
     memory: *const c_void,
 ) -> u32 {
+    if dlss() {
+        return create_dlss(context, desc);
+    }
     let Some(host) = HOST.get() else {
         return NO_PROVIDER;
     };
@@ -467,20 +508,69 @@ extern "C" fn ffxCreateContext(
         Arc::new(Context {
             live: Mutex::new(true),
             first_dispatch: std::sync::Once::new(),
-            creation: CreateChain {
-                description: upscale,
-                _backend: backend,
-                _version: requested,
+            flags: upscale.flags,
+            max_render: upscale.max_render,
+            max_output: upscale.max_output,
+            served: Served::Host {
+                _chain: CreateChain {
+                    _description: upscale,
+                    _backend: backend,
+                    _version: requested,
+                },
             },
         }),
     );
     OK
 }
 
-extern "C" fn ffxDestroyContext(context: *mut *mut c_void, memory: *const c_void) -> u32 {
-    let Some(host) = HOST.get() else {
+/// A context served by DLSS: ours, its address the handle the title keeps.
+fn create_dlss(context: *mut *mut c_void, desc: *mut Header) -> u32 {
+    if context.is_null() || desc.is_null() {
+        return PARAMETER;
+    }
+    // SAFETY: the title passes a chain of descriptions.
+    let kind = unsafe { (*desc).kind };
+    if kind != CREATE_UPSCALE {
+        once!(
+            warn,
+            kind = format_args!("{kind:#x}"),
+            "FidelityFX: only the upscaler is served by DLSS; another effect was refused"
+        );
         return NO_PROVIDER;
-    };
+    }
+    // SAFETY: an upscaler description, by its type.
+    let upscale = unsafe { desc.cast::<CreateUpscale>().read() };
+    let viewport = NEXT_VIEWPORT.fetch_add(1, Ordering::Relaxed);
+    let ctx = Arc::new(Context {
+        live: Mutex::new(true),
+        first_dispatch: std::sync::Once::new(),
+        flags: upscale.flags,
+        max_render: upscale.max_render,
+        max_output: upscale.max_output,
+        served: Served::Dlss(viewport),
+    });
+    let handle = Arc::as_ptr(&ctx) as usize;
+    CONTEXTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(handle, ctx);
+    // SAFETY: the title's slot for the context.
+    unsafe { *context = handle as *mut c_void };
+    tracing::info!(
+        viewport,
+        render = ?upscale.max_render,
+        output = ?upscale.max_output,
+        flags = format_args!("{:#x}", upscale.flags),
+        "FidelityFX: upscaler context served by DLSS"
+    );
+    OK
+}
+
+extern "C" fn ffxDestroyContext(context: *mut *mut c_void, memory: *const c_void) -> u32 {
+    let host = HOST.get();
+    if host.is_none() && !dlss() {
+        return NO_PROVIDER;
+    }
     if context.is_null() {
         return PARAMETER;
     }
@@ -496,10 +586,23 @@ extern "C" fn ffxDestroyContext(context: *mut *mut c_void, memory: *const c_void
     if !*live {
         return PARAMETER;
     }
-    // The guest releases a context after submitting its frames. The host
-    // may still be executing their lists, even after guest Execute returns.
-    victory_gpu::external::finish_submitted();
-    let code = unsafe { (host.destroy)(context, memory) };
+    let code = match (&ctx.served, host) {
+        // (`upscaler_destroyed` waits for the submitted lists itself.)
+        (&Served::Dlss(viewport), _) => {
+            victory_gpu::streamline::upscaler_destroyed(viewport);
+            // SAFETY: the title's slot for the context.
+            unsafe { *context = null_mut() };
+            OK
+        }
+        (Served::Host { .. }, Some(host)) => {
+            // The guest releases a context after submitting its frames. The host
+            // may still be executing their lists, even after guest Execute returns.
+            victory_gpu::external::finish_submitted();
+            // SAFETY: the PC provider's context, live and locked.
+            unsafe { (host.destroy)(context, memory) }
+        }
+        (Served::Host { .. }, None) => NO_PROVIDER,
+    };
     if code == OK {
         *live = false;
         let mut contexts = CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -516,12 +619,19 @@ extern "C" fn ffxDestroyContext(context: *mut *mut c_void, memory: *const c_void
 
 /// Settings (key-value pairs, debug messages) name nothing console-specific.
 extern "C" fn ffxConfigure(context: *mut *mut c_void, desc: *mut Header) -> u32 {
+    if dlss() {
+        // DLSS has nothing of FidelityFX's to set.
+        return if desc.is_null() { PARAMETER } else { OK };
+    }
     // SAFETY: the title passes its context and descriptions.
     HOST.get()
         .map_or(NO_PROVIDER, |h| unsafe { (h.configure)(context, desc) })
 }
 
 extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> u32 {
+    if dlss() {
+        return query_dlss(desc);
+    }
     let Some(host) = HOST.get() else {
         return NO_PROVIDER;
     };
@@ -554,9 +664,10 @@ extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> u32 {
 }
 
 extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
-    let Some(host) = HOST.get() else {
+    let host = HOST.get();
+    if host.is_none() && !dlss() {
         return NO_PROVIDER;
-    };
+    }
     if desc.is_null() {
         return PARAMETER;
     }
@@ -605,17 +716,23 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     if !*live {
         return PARAMETER;
     }
-    let create = &ctx.creation.description;
     let Some(output_size) = dispatch_output(
         dispatch.render_size,
         dispatch.upscale_size,
-        create.max_render,
-        create.max_output,
+        ctx.max_render,
+        ctx.max_output,
     ) else {
         once!(warn, render = ?dispatch.render_size, output = ?dispatch.upscale_size,
-            max_render = ?create.max_render, max_output = ?create.max_output,
+            max_render = ?ctx.max_render, max_output = ?ctx.max_output,
             "FidelityFX rejected dispatch dimensions outside the context's allocations");
         return PARAMETER;
+    };
+    let host = match (&ctx.served, host) {
+        (&Served::Dlss(viewport), _) => {
+            return dispatch_dlss(viewport, &ctx, &dispatch, output_size);
+        }
+        (Served::Host { .. }, Some(host)) => host,
+        (Served::Host { .. }, None) => return NO_PROVIDER,
     };
     let list = dispatch.list.cast::<Object>().cast_const();
     victory_gpu::external::record(list, |list| {
@@ -672,7 +789,7 @@ fn record_dispatch(
         backing_extents[index] = Some((desc.Width, desc.Height));
         let needed = minimum_extent(
             index,
-            ctx.creation.description.flags,
+            ctx.flags,
             dispatch.render_size,
             output_size,
         );
@@ -712,6 +829,216 @@ fn record_dispatch(
         );
     }
     code
+}
+
+/// The upscale ratio of a FidelityFX quality mode (native AA, quality,
+/// balanced, performance, ultra performance).
+fn upscale_ratio(mode: u32) -> Option<f32> {
+    Some(match mode {
+        0 => 1.0,
+        1 => 1.5,
+        2 => 1.7,
+        3 => 2.0,
+        4 => 3.0,
+        _ => return None,
+    })
+}
+
+/// The render size FidelityFX gives for `display` in quality `mode`.
+fn render_resolution(display: [u32; 2], mode: u32) -> Option<[u32; 2]> {
+    let ratio = upscale_ratio(mode)?;
+    Some(display.map(|v| (v as f32 / ratio) as u32))
+}
+
+/// FidelityFX's jitter phase count for a render and display width.
+fn jitter_phase_count(render_width: i32, display_width: i32) -> i32 {
+    let ratio = display_width as f32 / render_width.max(1) as f32;
+    (8.0 * ratio * ratio) as i32
+}
+
+fn halton(mut index: i32, base: i32) -> f32 {
+    let (mut f, mut result) = (1.0f32, 0.0f32);
+    while index > 0 {
+        f /= base as f32;
+        result += f * (index % base) as f32;
+        index /= base;
+    }
+    result
+}
+
+/// FidelityFX's jitter offset of frame `index` of `phases`, in pixels.
+fn jitter_offset(index: i32, phases: i32) -> Option<[f32; 2]> {
+    (phases > 0).then(|| {
+        let i = index.rem_euclid(phases) + 1;
+        [halton(i, 2) - 0.5, halton(i, 3) - 0.5]
+    })
+}
+
+/// The provider DLSS answers as, under the version the title asks for.
+const DLSS_PROVIDER_ID: u64 = 0x444c_5353_0412;
+const DLSS_PROVIDER_NAME: &CStr = c"4.1.2";
+
+/// The title's queries, answered for DLSS with FidelityFX's own formulas:
+/// the title then sizes its scene and jitters its camera as for FidelityFX.
+fn query_dlss(desc: *mut Header) -> u32 {
+    if desc.is_null() {
+        return PARAMETER;
+    }
+    let base = desc.cast::<u8>();
+    // SAFETY: the title's description of the kind it names; the offsets are
+    // the FidelityFX API's (`ffx_upscale.h`, `ffx_api.h`).
+    unsafe {
+        let kind = (*desc).kind;
+        let u32_at = |offset: usize| base.add(offset).cast::<u32>().read_unaligned();
+        let ptr_at = |offset: usize| base.add(offset).cast::<*mut c_void>().read_unaligned();
+        match kind {
+            GET_RENDER_RESOLUTION => {
+                let (w, h) = (ptr_at(32).cast::<u32>(), ptr_at(40).cast::<u32>());
+                let Some(size) = render_resolution([u32_at(16), u32_at(20)], u32_at(24)) else {
+                    return PARAMETER;
+                };
+                if !w.is_null() {
+                    *w = size[0];
+                }
+                if !h.is_null() {
+                    *h = size[1];
+                }
+                OK
+            }
+            GET_UPSCALE_RATIO => {
+                let out = ptr_at(24).cast::<f32>();
+                match upscale_ratio(u32_at(16)) {
+                    Some(ratio) if !out.is_null() => {
+                        *out = ratio;
+                        OK
+                    }
+                    _ => PARAMETER,
+                }
+            }
+            GET_JITTER_PHASE_COUNT => {
+                let out = ptr_at(24).cast::<i32>();
+                if out.is_null() {
+                    return PARAMETER;
+                }
+                *out = jitter_phase_count(u32_at(16) as i32, u32_at(20) as i32);
+                OK
+            }
+            GET_JITTER_OFFSET => {
+                let (x, y) = (ptr_at(24).cast::<f32>(), ptr_at(32).cast::<f32>());
+                let Some(offset) = jitter_offset(u32_at(16) as i32, u32_at(20) as i32) else {
+                    return PARAMETER;
+                };
+                if !x.is_null() {
+                    *x = offset[0];
+                }
+                if !y.is_null() {
+                    *y = offset[1];
+                }
+                OK
+            }
+            GET_VERSIONS => {
+                let query = desc.cast::<GetVersions>().read();
+                if query.count.is_null() {
+                    return PARAMETER;
+                }
+                if (!query.ids.is_null() || !query.names.is_null()) && *query.count >= 1 {
+                    if !query.ids.is_null() {
+                        *query.ids = DLSS_PROVIDER_ID;
+                    }
+                    if !query.names.is_null() {
+                        *query.names = DLSS_PROVIDER_NAME.as_ptr();
+                    }
+                }
+                *query.count = 1;
+                OK
+            }
+            GET_PROVIDER_VERSION => {
+                let version = desc.cast::<ProviderVersion>();
+                (*version).id = DLSS_PROVIDER_ID;
+                (*version).name = DLSS_PROVIDER_NAME.as_ptr();
+                OK
+            }
+            MEMORY_USAGE_WITH_DEVICE => {
+                // (DLSS's memory is its own, none of the title's.)
+                let usage = desc.cast::<MemoryUsageWithDevice>().read().usage.cast::<[u64; 2]>();
+                if !usage.is_null() {
+                    *usage = [0, 0];
+                }
+                OK
+            }
+            _ => {
+                once!(
+                    warn,
+                    kind = format_args!("{kind:#x}"),
+                    "FidelityFX: a query DLSS does not answer"
+                );
+                UNKNOWN_TYPE
+            }
+        }
+    }
+}
+
+/// What a dispatch says of the camera, as DLSS is given it.
+fn dlss_camera(
+    dispatch: &DispatchUpscale,
+    output: [u32; 2],
+    flags: u32,
+) -> victory_gpu::streamline::plan::Camera {
+    let f = |i: usize| f32::from_bits(dispatch.settings[i]);
+    victory_gpu::streamline::plan::Camera {
+        jitter: dispatch.jitter,
+        motion_scale: dispatch.motion_scale,
+        render: dispatch.render_size,
+        output,
+        near: f(5),
+        far: f(6),
+        fov_y: f(7),
+        // (A C bool: its low byte.)
+        reset: dispatch.settings[4] & 0xff != 0,
+        flags,
+    }
+}
+
+/// A dispatch of a DLSS context: DLSS records the upscaling on the title's
+/// list, at the place of FidelityFX's.
+fn dispatch_dlss(
+    viewport: u32,
+    ctx: &Context,
+    dispatch: &DispatchUpscale,
+    output: [u32; 2],
+) -> u32 {
+    use victory_gpu::streamline::{self, Taken};
+    let live = ctx.live.lock().unwrap_or_else(|e| e.into_inner());
+    if !*live {
+        return PARAMETER;
+    }
+    let up = streamline::Upscale {
+        viewport,
+        list: dispatch.list.cast::<Object>().cast_const(),
+        resources: dispatch
+            .resources
+            .map(|r| (r.resource.cast::<Object>().cast_const(), r.state)),
+        camera: dlss_camera(dispatch, output, ctx.flags),
+        pre_exposure: f32::from_bits(dispatch.settings[3]),
+    };
+    match streamline::upscale(&up) {
+        Taken::Dlss => {
+            ctx.first_dispatch.call_once(|| {
+                tracing::info!(viewport, render = ?dispatch.render_size, ?output,
+                    jitter = ?dispatch.jitter, motion_vector_scale = ?dispatch.motion_scale,
+                    near = up.camera.near, far = up.camera.far, fov = up.camera.fov_y,
+                    pre_exposure = up.pre_exposure,
+                    "DLSS recorded the title's temporal dispatch");
+            });
+            OK
+        }
+        // (`upscale` says why.)
+        Taken::Failed => PARAMETER,
+        Taken::No(why) => {
+            once!(warn, why, "DLSS did not take the title's upscaling; the output was not written");
+            PARAMETER
+        }
+    }
 }
 
 pub(crate) fn module() -> HleModule {
@@ -825,6 +1152,82 @@ mod tests {
             resolver.classify("amd_fidelityfx_loader_xbox.dll", &symbol),
             None
         );
+    }
+
+    /// What DLSS answers in FidelityFX's place is what FidelityFX answers.
+    #[test]
+    fn dlss_answers_the_queries_as_fidelityfx() {
+        assert_eq!(render_resolution([3840, 2160], 1), Some([2560, 1440]));
+        assert_eq!(render_resolution([3840, 2160], 2), Some([2258, 1270]));
+        assert_eq!(render_resolution([3840, 2160], 0), Some([3840, 2160]));
+        assert_eq!(render_resolution([3840, 2160], 5), None);
+        assert_eq!(jitter_phase_count(2560, 3840), 18);
+        assert_eq!(jitter_phase_count(3840, 3840), 8);
+        let near = |a: Option<[f32; 2]>, b: [f32; 2]| {
+            a.is_some_and(|a| (a[0] - b[0]).abs() < 1e-6 && (a[1] - b[1]).abs() < 1e-6)
+        };
+        assert!(near(jitter_offset(0, 18), [0.0, 1.0 / 3.0 - 0.5]));
+        assert!(near(jitter_offset(1, 18), [0.25 - 0.5, 2.0 / 3.0 - 0.5]));
+        assert_eq!(jitter_offset(18, 18), jitter_offset(0, 18));
+        assert_eq!(jitter_offset(-1, 18), jitter_offset(17, 18));
+        assert_eq!(jitter_offset(0, 0), None);
+        // Through the query, laid out as the title lays it out.
+        #[repr(C)]
+        struct RenderResolution {
+            header: Header,
+            display: [u32; 2],
+            mode: u32,
+            w: *mut u32,
+            h: *mut u32,
+        }
+        let (mut w, mut h) = (0u32, 0u32);
+        let mut q = RenderResolution {
+            header: header(GET_RENDER_RESOLUTION, null_mut()),
+            display: [3840, 2160],
+            mode: 1,
+            w: &mut w,
+            h: &mut h,
+        };
+        assert_eq!(std::mem::offset_of!(RenderResolution, w), 32);
+        assert_eq!(query_dlss(&raw mut q.header), OK);
+        assert_eq!((w, h), (2560, 1440));
+        let mut count = 4u64;
+        let mut id = 0u64;
+        let mut v = GetVersions {
+            header: header(GET_VERSIONS, null_mut()),
+            create_kind: CREATE_UPSCALE,
+            device: null_mut(),
+            count: &mut count,
+            ids: &mut id,
+            names: null_mut(),
+        };
+        assert_eq!(query_dlss(&raw mut v.header), OK);
+        assert_eq!((count, id), (1, DLSS_PROVIDER_ID));
+        let mut other = header(0x1_0006, null_mut());
+        assert_eq!(query_dlss(&raw mut other), UNKNOWN_TYPE);
+    }
+
+    /// A dispatch's settings read as `ffxDispatchDescUpscale` lays them out.
+    #[test]
+    fn a_dispatch_names_its_camera() {
+        // SAFETY: plain data.
+        let mut dispatch: DispatchUpscale = unsafe { std::mem::zeroed() };
+        dispatch.jitter = [0.25, -0.125];
+        dispatch.motion_scale = [2560.0, 1440.0];
+        dispatch.render_size = [2560, 1440];
+        dispatch.settings[4] = 0xabcd_ef01;
+        dispatch.settings[5] = 0.1f32.to_bits();
+        dispatch.settings[6] = f32::MAX.to_bits();
+        dispatch.settings[7] = 0.9f32.to_bits();
+        let camera = dlss_camera(&dispatch, [3840, 2160], 0x29);
+        assert_eq!(camera.render, [2560, 1440]);
+        assert_eq!(camera.output, [3840, 2160]);
+        assert_eq!((camera.near, camera.far, camera.fov_y), (0.1, f32::MAX, 0.9));
+        assert!(camera.reset);
+        assert!(camera.depth_inverted());
+        dispatch.settings[4] = 0xabcd_ef00;
+        assert!(!dlss_camera(&dispatch, [3840, 2160], 0).reset);
+        assert_eq!(std::mem::offset_of!(DispatchUpscale, settings), 0x188);
     }
 
     #[test]

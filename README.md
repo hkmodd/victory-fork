@@ -58,6 +58,13 @@ the frame now is the one thread that submits the title's work to the card
 | `VICTORY_FRAME_INTERVAL_MS=16.667` | Lets the title go above 30 fps (menus and videos reach 60; the game's clock stays right) |
 | `VICTORY_AMBIENT_SETTLE` | How fast light settles after walking indoors (on by default, `250,3`; `0` turns it off) |
 | `VICTORY_TEXTURE_STORE=1` | Converted textures kept between runs (about 8 ms a frame for now: off) |
+| `VICTORY_DLSS=1` (with `VICTORY_FSR_4K`) | The title's FidelityFX upscale is done by NVIDIA DLSS Super Resolution through Streamline, loaded at run time (signature checked, nothing proxied, no frame generation); the DLSS mode follows the render size the title picks. Without Streamline or DLSS support, the PC FidelityFX path as before. Not measured yet |
+| `VICTORY_STREAMLINE_DIR` | The folder with Streamline's `sl.interposer.dll` and `sl.dlss.dll` (default `C:\dev\sdk\streamline-sdk-v2.14.16\bin\x64`) |
+| `VICTORY_DLSS_PRESET` | DLSS preset: `default`, `e`, `f`, `j`, `k`, `l`, `m` |
+| `VICTORY_DLSS_JITTER`, `VICTORY_DLSS_MV` | `x,y` multipliers of the jitter and motion vectors given to DLSS (default `1,1`), for sign checks |
+| `VICTORY_DLSS_REACTIVE=0` | The title's reactive mask is not given to DLSS |
+| `VICTORY_STREAMLINE_LOG=<folder>` | Streamline's verbose log in that folder |
+| `victory upscaler-check [--device] [--output 3840x2160]` | Loads Streamline and says whether this GPU runs DLSS; with `--device`, DLSS upscales stand-in textures three times |
 
 ### Switches merged from fxceless/victory-fork (2026-11-26)
 

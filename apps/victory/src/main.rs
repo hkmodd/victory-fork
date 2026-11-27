@@ -167,6 +167,26 @@ enum Command {
     Replay(replay::Replay),
     /// Show the resolved configuration and check it.
     Config,
+    /// Check DLSS without the title: Streamline loads from
+    /// `VICTORY_STREAMLINE_DIR` (signature, init) and says whether this GPU
+    /// runs DLSS; with --device, DLSS upscales stand-in textures three times.
+    #[cfg(windows)]
+    UpscalerCheck {
+        /// The output size, WIDTHxHEIGHT (the scene is 2/3 of it).
+        #[arg(long, default_value = "3840x2160", value_parser = parse_size)]
+        output: [u32; 2],
+        /// Also make the host device and run DLSS on it.
+        #[arg(long)]
+        device: bool,
+    },
+}
+
+fn parse_size(value: &str) -> Result<[u32; 2], &'static str> {
+    let (w, h) = value.split_once('x').ok_or("expected WIDTHxHEIGHT")?;
+    match (w.trim().parse::<u32>(), h.trim().parse::<u32>()) {
+        (Ok(w), Ok(h)) if w > 0 && h > 0 => Ok([w, h]),
+        _ => Err("expected WIDTHxHEIGHT, both above 0"),
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -252,6 +272,13 @@ fn main() -> Result<()> {
         #[cfg(all(windows, feature = "diagnostics"))]
         Command::Replay(options) => replay::run(options),
         Command::Config => show_config(),
+        #[cfg(windows)]
+        Command::UpscalerCheck { output, device } => {
+            for line in victory_hle::streamline::check(output, device) {
+                println!("{line}");
+            }
+            Ok(())
+        }
     }
 }
 
