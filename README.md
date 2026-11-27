@@ -119,6 +119,27 @@ priority (`VICTORY_PIPELINE_LOWEST=normal`: at normal priority, as upstream). Th
 kept pool serves the work spread over threads. Upstream's quad reads replace this fork's (same
 helper-lane fix); DPP8 inside a quad keeps this fork's per-lane quad read.
 
+### Merged from fxceless/victory-fork (2026-11-27, 01:20 UTC)
+
+Upstream's notes of commits 3221ac42, 0e006f00 and 1f5d17a6 (their numbers, on their machine):
+
+- **The flights are no longer settled for title bytes changed under shader writes
+  (`VICTORY_MASKED_PATCH`, on by default, `0` off, `alt` twenty seconds each way):** a page with more
+  changed runs than the merge's cap goes to the card as a masked patch (offset, byte mask, value per
+  dword) after the flights. In an on/off split: waiting for the card 1 to 2 ms against 11 to 32, the
+  usual frame 10 to 15 ms shorter.
+- **Indirect mesh draws are launched by an amplification stage (`VICTORY_MESH_LAUNCH`, now on by
+  default, `0` off; after pull request #1381):** no clamp pass before each record; the card 5 ms less a
+  frame in an on/off split. The translated mesh shaders follow the same switch (shader caches must be
+  rebuilt).
+
+Here the patch is made where this fork merges a page under shader writes (the pages are merged on
+several threads): a page whose copies of their own would pass `VICTORY_MERGE_RUNS` goes as a patch of
+its exact changed bytes instead of the flights being settled, while pages under the cap still go as
+this fork's word pairs and runs. The copies are walked for patches only when one was made since the
+last submission, the patched bytes are left out of this fork's landings until sent as the changed
+ranges are, and two copies in one buffer get a barrier between their patches.
+
 What is known to be wrong:
 
 - Trees, signs and far objects flicker in the distance in some places.

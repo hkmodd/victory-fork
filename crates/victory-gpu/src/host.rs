@@ -2678,6 +2678,8 @@ struct CardWork {
     fetch: Prelude,
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    /// With `VICTORY_MASKED_PATCH`: [`MASKED_PATCH`]'s pipeline, with `root`.
+    patch_pso: Option<ID3D12PipelineState>,
     /// One dword per piece compared, odd where the piece differs: PC
     /// memory, mapped (buffer, mapping, bytes).
     differs: (ID3D12Resource, usize, u64),
@@ -2695,6 +2697,56 @@ struct CardWork {
 unsafe impl Send for CardWork {}
 
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
+
+/// The masked patch ([`crate::shadow::masked_patch_now`]): per changed
+/// dword of a copy in the card's memory (offset, mask, value; 12 bytes),
+/// the title's changed bytes stored and the others kept, after the flights
+/// before it in the queue. The compare's root signature, so it is bound
+/// with it: `count` words from word `first` of `words`, into `copy`.
+pub(crate) const MASKED_PATCH: &str = r#"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+cbuffer Patch : register(b0) {
+    uint count;
+    uint first;
+    uint unused0;
+    uint unused1;
+    uint unused2;
+    uint unused3;
+};
+ByteAddressBuffer words : register(t0);
+RWByteAddressBuffer copy : register(u0);
+RWByteAddressBuffer unused : register(u1);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= count) return;
+    uint3 w = words.Load3((first + id.x) * 12u);
+    copy.Store(w.x, (copy.Load(w.x) & ~w.y) | (w.z & w.y));
+}
+"#;
+
+/// [`MASKED_PATCH`] compiled (as the compare is, `cs_5_1`).
+fn masked_patch_code() -> windows::core::Result<windows::Win32::Graphics::Direct3D::ID3DBlob> {
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    let mut code = None;
+    // SAFETY: the source and names live through the call; the out pointer is ours.
+    unsafe {
+        D3DCompile(
+            MASKED_PATCH.as_ptr().cast(),
+            MASKED_PATCH.len(),
+            windows::core::s!("masked patch"),
+            None,
+            None,
+            windows::core::s!("main"),
+            windows::core::s!("cs_5_1"),
+            0,
+            0,
+            &mut code,
+            None,
+        )?;
+    }
+    code.ok_or_else(windows::core::Error::empty)
+}
 
 /// The compare of a declared range of a copy in the card's memory with
 /// its bytes from before, one group per 64 KiB piece (cut at multiples of
@@ -2888,6 +2940,9 @@ struct CardPlan {
     /// The copies whose card side was brought up to date, alive until the
     /// submission has run.
     _synced: Vec<std::sync::Arc<crate::shadow::Shadow>>,
+    /// The masked patch's words ([`MASKED_PATCH`]), read by the plan's
+    /// list: alive until the submission has run.
+    _patch: Option<ID3D12Resource>,
     /// The lists of ours the plan recorded (whether the compare, the
     /// list), given back by `Host::card_done`.
     lists: Vec<(bool, Prelude)>,
@@ -4772,6 +4827,17 @@ fn late_line(frames: f64) {
             ms(4),
             u[8],
         );
+        if crate::shadow::masked_patch_mode() != 0 {
+            let p = [0, 1, 2, 3].map(|i| crate::shadow::PATCHED[i].swap(0, Ordering::Relaxed));
+            tracing::info!(
+                "masked patches per frame (VICTORY_MASKED_PATCH): {:.1} pages past the merge's cap patched instead of a settle, \
+                 {:.0} dwords, {:.1} dispatches in {:.1} submissions",
+                p[0] as f64 / frames,
+                p[1] as f64 / frames,
+                p[2] as f64 / frames,
+                p[3] as f64 / frames
+            );
+        }
     }
 }
 
@@ -5346,12 +5412,43 @@ impl Host {
             })?;
             #[cfg(feature = "diagnostics")]
             name(&pso, || crate::replay::play::COMPARE.into());
+            // With `VICTORY_MASKED_PATCH`: the patch's pipeline, and from then
+            // on pages past the merge's cap may be patched.
+            let patch_pso = (crate::shadow::masked_patch_mode() != 0)
+                .then(|| {
+                    let made = masked_patch_code().and_then(|code| {
+                        let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+                        self.device.CreateComputePipelineState::<ID3D12PipelineState>(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                            pRootSignature: std::mem::transmute_copy(&root),
+                            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
+                            ..Default::default()
+                        })
+                    });
+                    match made {
+                        Ok(pso) => {
+                            #[cfg(feature = "diagnostics")]
+                            name(&pso, || "victory: masked patch".into());
+                            crate::shadow::PATCH_READY.store(true, Ordering::Relaxed);
+                            tracing::info!(
+                                "title bytes under flights' shader writes past the merge's cap go up as a masked patch (VICTORY_MASKED_PATCH={})",
+                                if crate::shadow::masked_patch_mode() == 2 { "alt" } else { "1" }
+                            );
+                            Some(pso)
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "VICTORY_MASKED_PATCH: the patch's pipeline could not be made; the flights are settled as before");
+                            None
+                        }
+                    }
+                })
+                .flatten();
             Ok(CardWork {
                 sync: vec![list()?],
                 check: vec![list()?],
                 fetch: list()?,
                 root,
                 pso,
+                patch_pso,
                 differs: (differs, data as usize, results),
                 fetched: None,
                 taken: 0,
@@ -5397,9 +5494,12 @@ impl Host {
         card_cut(&mut cut, 5);
         let gathering = crate::timeline::span("copies in the card's memory: what changed");
         let mut dirty = crate::shadow::card_dirty(sent_as);
+        // The masked patches, taken in the same order of the queue
+        // (`crate::shadow::masked_patch_now`).
+        let patches = crate::shadow::card_patches(sent_as);
         gathering.end();
         card_cut(&mut cut, 6);
-        if declared.is_empty() && dirty.is_empty() && looked.is_empty() {
+        if declared.is_empty() && dirty.is_empty() && looked.is_empty() && patches.is_empty() {
             return None;
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
@@ -5417,6 +5517,37 @@ impl Host {
                 if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
                     dirty.push((shadow.clone(), Vec::new()));
                 }
+            }
+        }
+        // A patched copy is hashed again with the others (its runs, beside
+        // its changed ranges): it is in `dirty`, with no ranges if it had none.
+        for (shadow, _, _) in &patches {
+            if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
+                dirty.push((shadow.clone(), Vec::new()));
+            }
+        }
+        // The patches' words in one buffer the card reads (PC memory), each
+        // copy's from its first word on.
+        let mut patch_buffer: Option<ID3D12Resource> = None;
+        let mut patch_at: Vec<(Arc<crate::shadow::Shadow>, u32, u32)> = Vec::new();
+        if !patches.is_empty() {
+            let words: usize = patches.iter().map(|(_, w, _)| w.len()).sum();
+            match (work.patch_pso.is_some(), self.shared_buffer((words * 12).max(16) as u64)) {
+                (true, Some((buffer, data))) => {
+                    name(&buffer, || "masked patch words".into());
+                    let mut first = 0u32;
+                    for (shadow, w, _) in &patches {
+                        // SAFETY: the mapping holds `words` words of 12 bytes.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(w.as_ptr().cast::<u8>(), data.add(first as usize * 12), w.len() * 12);
+                        }
+                        patch_at.push((shadow.clone(), first, w.len() as u32));
+                        first += w.len() as u32;
+                    }
+                    crate::shadow::PATCHED[3].fetch_add(1, Ordering::Relaxed);
+                    patch_buffer = Some(buffer);
+                }
+                _ => fail(format_args!("no memory or pipeline for the masked patch of host copies in the card's memory (VICTORY_MASKED_PATCH)")),
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
@@ -5441,6 +5572,55 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    // The masked patches first (fxceless 3221ac428): each
+                    // buffer from the common state to unordered access, its
+                    // words, then back (the copies below promote it again).
+                    if let (Some(words), Some(pso)) = (&patch_buffer, &work.patch_pso) {
+                        list.SetComputeRootSignature(&work.root);
+                        list.SetPipelineState(pso);
+                        list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                        list.SetComputeRootShaderResourceView(1, words.GetGPUVirtualAddress());
+                        // (Once for each buffer, however many copies lie in
+                        // it, as the copies' barrier below.)
+                        let mut buffers: Vec<&ID3D12Resource> = Vec::new();
+                        for (s, _, _) in &patch_at {
+                            if !buffers.iter().any(|b| b.as_raw() == s.buffer.as_raw()) {
+                                buffers.push(&s.buffer);
+                            }
+                        }
+                        let moves: Vec<_> = buffers
+                            .iter()
+                            .map(|b| transition(b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+                            .collect();
+                        list.ResourceBarrier(&moves);
+                        let mut patched: Vec<*mut std::ffi::c_void> = Vec::new();
+                        for (shadow, first, count) in &patch_at {
+                            // Two copies in one buffer: the second's stores
+                            // after the first's, which may touch its dwords.
+                            let raw = shadow.buffer.as_raw();
+                            if patched.contains(&raw) {
+                                list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, ..Default::default() }]);
+                            } else {
+                                patched.push(raw);
+                            }
+                            list.SetComputeRootUnorderedAccessView(2, shadow.buffer.GetGPUVirtualAddress());
+                            const MOST: u32 = 65535 * 64;
+                            let mut done = 0u32;
+                            while done < *count {
+                                let n = (*count - done).min(MOST);
+                                let constants = [n, first + done, 0, 0, 0, 0];
+                                list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                                list.Dispatch(n.div_ceil(64), 1, 1);
+                                crate::shadow::PATCHED[2].fetch_add(1, Ordering::Relaxed);
+                                done += n;
+                            }
+                        }
+                        let backs: Vec<_> = buffers
+                            .iter()
+                            .map(|b| transition(b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON))
+                            .collect();
+                        list.ResourceBarrier(&backs);
+                    }
                     if upcheck::on() {
                         looks = upcheck::record(self, list, &dirty);
                     }
@@ -5529,7 +5709,10 @@ impl Host {
                             // (In order: the next of the same piece, of the
                             // tens of thousands there are, says nothing.)
                             let mut runs: Vec<crate::shadow::CardSpan> = Vec::new();
-                            for run in ranges.iter().map(|&(a, b)| shadow.card_run(a, b)) {
+                            // (With the runs its masked patch set: hashed
+                            // again, not copied.)
+                            let patched = patches.iter().find(|(s, _, _)| Arc::ptr_eq(s, shadow)).map_or(&[][..], |(_, _, r)| &r[..]);
+                            for run in ranges.iter().chain(patched).map(|&(a, b)| shadow.card_run(a, b)) {
                                 match runs.last_mut() {
                                     Some(last) if joins && (last.first, last.pieces) == (run.first, run.pieces) => last.to = last.to.max(run.to),
                                     _ => runs.push(run),
@@ -5561,6 +5744,7 @@ impl Host {
             ranges: Vec::new(),
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
+            _patch: patch_buffer,
             lists: used,
             sent_as,
             looks,
@@ -13411,5 +13595,18 @@ mod deferred_tests {
         // Title copy/run clears all pending deduplication state.
         d.gpu_written.clear();
         assert!(d.gpu_written.insert((s2, 0x1000, 64)));
+    }
+}
+
+#[cfg(test)]
+mod masked_patch_compile_tests {
+    /// The patch's source compiles as the compare's does, with the same root
+    /// signature inside it (no device needed).
+    #[test]
+    fn the_masked_patch_compiles() {
+        let code = super::masked_patch_code().expect("MASKED_PATCH compiles");
+        // SAFETY: the blob's own bytes.
+        let size = unsafe { code.GetBufferSize() };
+        assert!(size > 100);
     }
 }
