@@ -39,7 +39,6 @@ use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
 
 /// Words after which a stream is handed to the translating threads.
 const CHUNK: usize = 1024;
-const MAX_THREADS: usize = 32;
 
 /// Whether list calls are only written down (`VICTORY_THIN=1`; needs the line
 /// of submissions, which it turns on).
@@ -173,42 +172,6 @@ static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 static CHUNKS: AtomicU64 = AtomicU64::new(0);
 static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
-#[derive(Clone, Copy)]
-struct OpTime {
-    calls: u64,
-    ns: u64,
-}
-
-impl OpTime {
-    const ZERO: Self = Self { calls: 0, ns: 0 };
-
-    fn add(&mut self, other: Self) {
-        self.calls += other.calls;
-        self.ns += other.ns;
-    }
-}
-
-// A worker times commands locally, then publishes once per chunk to its own slot.
-type OpTimes = [OpTime; UNKNOWN_OP + 1];
-static OP_TIMES: [Mutex<OpTimes>; MAX_THREADS] = [const { Mutex::new([OpTime::ZERO; UNKNOWN_OP + 1]) }; MAX_THREADS];
-
-fn profile_ops() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_THIN_PROFILE").is_some_and(|v| v == "1"))
-}
-
-struct OpTimer<'a> {
-    time: &'a mut OpTime,
-    start: std::time::Instant,
-}
-
-impl Drop for OpTimer<'_> {
-    fn drop(&mut self) {
-        self.time.ns += self.start.elapsed().as_nanos() as u64;
-        self.time.calls += 1;
-    }
-}
-
 fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -268,7 +231,7 @@ impl Recording {
     }
 
     /// Translates what there is.
-    fn run(&self, worker_times: Option<&Mutex<OpTimes>>) {
+    fn run(&self) {
         loop {
             let (chunk, back) = {
                 let mut inner = held(&self.inner);
@@ -285,17 +248,7 @@ impl Recording {
                 (chunk, inner.back as This)
             };
             let began = std::time::Instant::now();
-            let left = || self.abandoned.load(Acquire);
-            let (calls, closed) = if let Some(worker_times) = worker_times {
-                let mut timings = [OpTime::ZERO; UNKNOWN_OP + 1];
-                let result = translate::<true>(back, &chunk, left, &mut timings);
-                for (total, time) in held(worker_times).iter_mut().zip(timings) {
-                    total.add(time);
-                }
-                result
-            } else {
-                translate::<false>(back, &chunk, left, &mut [])
-            };
+            let (calls, closed) = translate(back, &chunk, || self.abandoned.load(Acquire));
             STATS[0].fetch_add(calls, Relaxed);
             STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
             let mut inner = held(&self.inner);
@@ -352,10 +305,8 @@ fn back_list(kind: u32) -> This {
 }
 
 fn start() {
-    let threads = std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8usize).clamp(1, MAX_THREADS);
-    let profiling = profile_ops();
-    for (i, times) in OP_TIMES.iter().take(threads).enumerate() {
-        let worker_times = profiling.then_some(times);
+    let threads = std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8usize).clamp(1, 32);
+    for i in 0..threads {
         let worker = move || {
             crate::cores::keep_many_on_fast_cores("victory-list");
             crate::queue::no_drain_here();
@@ -369,7 +320,7 @@ fn start() {
                         }
                     }
                 };
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| recording.run(worker_times))).is_err() {
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| recording.run())).is_err() {
                     crate::host::fail(format_args!("a thread that translates lists panicked"));
                 }
             }
@@ -410,46 +361,6 @@ pub(crate) fn line(frames: f64) {
         s[2],
         CHUNKS.swap(0, Relaxed) as f64 / frames,
         s[3]
-    );
-    if profile_ops() {
-        opcode_line(frames);
-    }
-}
-
-fn opcode_line(frames: f64) {
-    const CATEGORIES: [&str; 7] = ["draws", "dispatches", "indirect", "tables", "barriers", "copies", "other"];
-    let mut ops = [OpTime::ZERO; UNKNOWN_OP + 1];
-    for worker in &OP_TIMES {
-        let worker = std::mem::replace(&mut *held(worker), [OpTime::ZERO; UNKNOWN_OP + 1]);
-        for (total, time) in ops.iter_mut().zip(worker) {
-            total.add(time);
-        }
-    }
-    let mut categories = [OpTime::ZERO; CATEGORIES.len()];
-    for (op, &time) in ops.iter().enumerate() {
-        categories[category(op as u64)].add(time);
-    }
-    let total_ns: u64 = categories.iter().map(|time| time.ns).sum();
-    if total_ns == 0 {
-        return;
-    }
-    let summary = |name: &str, time: OpTime| {
-        format!(
-            "{name} {:.2} ms/frame ({:.1}%, {:.0} calls/frame, {:.2} us/call)",
-            time.ns as f64 / 1e6 / frames,
-            100.0 * time.ns as f64 / total_ns as f64,
-            time.calls as f64 / frames,
-            time.ns as f64 / 1e3 / time.calls.max(1) as f64,
-        )
-    };
-    let groups = CATEGORIES.into_iter().zip(categories).map(|(name, time)| summary(name, time)).collect::<Vec<_>>();
-    let mut ranked = ops.into_iter().enumerate().filter(|(_, time)| time.calls != 0).collect::<Vec<_>>();
-    ranked.sort_unstable_by_key(|&(op, time)| (std::cmp::Reverse(time.ns), op));
-    let hottest = ranked.into_iter().take(5).map(|(op, time)| summary(op_name(op), time)).collect::<Vec<_>>();
-    tracing::info!(
-        "thin opcode timing (summed worker elapsed): {}; hottest opcodes: {}",
-        groups.join(", "),
-        hottest.join(", ")
     );
 }
 
@@ -517,7 +428,6 @@ macro_rules! plain {
         #[allow(clippy::upper_case_acronyms, non_camel_case_types)]
         #[repr(u64)]
         enum Plain { $($op),* , END }
-        const PLAIN_NAMES: [&str; Plain::END as usize] = [$(stringify!($name)),*];
         $(extern "system" fn $name(this: This $(, $a: $t)*) {
             front(this).put(Plain::$op as u64, &[$(Word::word($a)),*]);
         })*
@@ -569,53 +479,26 @@ plain! {
     SYNC sync = super::sync, (flags: u32, control: u32, address: u64, size: u64);
 }
 
-macro_rules! special {
-    ($($op:ident = $n:literal),* $(,)?) => {
-        $(const $op: u64 = Plain::END as u64 + $n;)*
-        fn op_name(op: usize) -> &'static str {
-            match op as u64 {
-                $($op => stringify!($op),)*
-                _ => PLAIN_NAMES.get(op).copied().unwrap_or("unknown"),
-            }
-        }
-    };
+const fn after(n: u64) -> u64 {
+    Plain::END as u64 + n
 }
-
-special! {
-    RESET = 0,
-    CLOSE = 1,
-    UPLOAD = 2,
-    BARRIER = 3,
-    BARRIER_GROUPS = 4,
-    VIEWPORTS = 5,
-    SCISSORS = 6,
-    BLEND_FACTOR = 7,
-    HEAPS = 8,
-    COMPUTE_CONSTANTS = 9,
-    GRAPHICS_CONSTANTS = 10,
-    INDEX_BUFFER = 11,
-    VERTEX_BUFFERS = 12,
-    TARGETS = 13,
-    CLEAR_RTV = 14,
-    CLEAR_DSV = 15,
-    COPY_TEXTURE = 16,
-}
-const UNKNOWN_OP: usize = COPY_TEXTURE as usize + 1;
-
-fn category(op: u64) -> usize {
-    use Plain::*;
-    match op {
-        n if n == DRAW as u64 || n == DRAW_INDEXED as u64 => 0,
-        n if n == DISPATCH as u64 || n == DISPATCH_X as u64 || n == DISPATCH_MESH as u64 || n == DISPATCH_MESH_X as u64 => 1,
-        n if n == EXECUTE_INDIRECT as u64 => 2,
-        n if n == COMPUTE_TABLE as u64 || n == GRAPHICS_TABLE as u64 => 3,
-        BARRIER | BARRIER_GROUPS => 4,
-        COPY_TEXTURE => 5,
-        n if n == COPY_BUFFER as u64 || n == COPY_RESOURCE as u64 || n == COPY_RESOURCE_X as u64
-            || n == COPY_MEMORY as u64 || n == RESOLVE as u64 || n == RESOLVE_QUERIES as u64 => 5,
-        _ => 6,
-    }
-}
+const RESET: u64 = after(0);
+const CLOSE: u64 = after(1);
+const UPLOAD: u64 = after(2);
+const BARRIER: u64 = after(3);
+const BARRIER_GROUPS: u64 = after(4);
+const VIEWPORTS: u64 = after(5);
+const SCISSORS: u64 = after(6);
+const BLEND_FACTOR: u64 = after(7);
+const HEAPS: u64 = after(8);
+const COMPUTE_CONSTANTS: u64 = after(9);
+const GRAPHICS_CONSTANTS: u64 = after(10);
+const INDEX_BUFFER: u64 = after(11);
+const VERTEX_BUFFERS: u64 = after(12);
+const TARGETS: u64 = after(13);
+const CLEAR_RTV: u64 = after(14);
+const CLEAR_DSV: u64 = after(15);
+const COPY_TEXTURE: u64 = after(16);
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -827,7 +710,7 @@ extern "system" fn copy_texture_region_x(
 
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
-fn translate<const PROFILE: bool>(list: This, stream: &[u64], left: impl Fn() -> bool, timings: &mut [OpTime]) -> (u64, bool) {
+fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
     let (mut i, mut calls, mut closed) = (0, 0, false);
     let mut skip = left();
     while i < stream.len() {
@@ -838,20 +721,15 @@ fn translate<const PROFILE: bool>(list: This, stream: &[u64], left: impl Fn() ->
         if calls % 64 == 0 {
             skip = left();
         }
-        if skip && op != UPLOAD && op != CLOSE && op != RESET {
-            continue;
-        }
-        let _timer = if PROFILE {
-            Some(OpTimer { time: &mut timings[(op as usize).min(UNKNOWN_OP)], start: std::time::Instant::now() })
-        } else {
-            None
-        };
         if op == UPLOAD {
             // SAFETY: made by `allocate_upload`, named once.
             let block = *unsafe { Box::from_raw(w[0] as *mut Upload) };
             // SAFETY: a list of ours.
             let uploads = unsafe { &(*list.cast::<List>()).uploads };
             held(uploads).push(block);
+            continue;
+        }
+        if skip && op != CLOSE && op != RESET {
             continue;
         }
         if run_plain(op, list, w) {
@@ -1049,19 +927,6 @@ mod tests {
         // SAFETY: as above.
         assert_eq!(unsafe { *at::<[u32; 3]>(&w[1..], 2, 3) }, [7, 8, 9]);
         assert!(at::<u32>(&w[1..], 2, 0).is_null());
-    }
-
-    #[test]
-    fn profiling_counts_only_translated_commands() {
-        // A zero-count barrier group does not access the list.
-        let stream = [BARRIER_GROUPS | 1 << 16, 0, BARRIER_GROUPS | 1 << 16, 0];
-        let mut times = [OpTime::ZERO; UNKNOWN_OP + 1];
-        let list = std::ptr::null();
-        assert_eq!(translate::<true>(list, &stream, || true, &mut times), (2, false));
-        assert_eq!(times[BARRIER_GROUPS as usize].calls, 0);
-        assert_eq!(translate::<true>(list, &stream, || false, &mut times), (2, false));
-        assert_eq!(times[BARRIER_GROUPS as usize].calls, 2);
-        assert_eq!(translate::<false>(list, &stream, || false, &mut []), (2, false));
     }
 
     /// A view's record is the one at the call, also if its slot is written
