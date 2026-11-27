@@ -4189,6 +4189,29 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     }
 }
 
+/// The title address a shader takes of buffer view `view`: a ray-tracing
+/// structure's view (dimension 11) has no resource and names its structure
+/// by address (`RaytracingAccelerationStructure.Location`, words 4-5); any
+/// other buffer view, its range's start ([`buffer_range`]). Before this,
+/// structure views gave 0 (no resource): the programs that walk the
+/// structures read page 0, an all-zero node, and every ray missed (runs
+/// 372-375: "a shader takes the address of a buffer view that is not there").
+pub(crate) fn view_address(view: &View) -> Option<u64> {
+    const STRUCTURE: u32 = 11;
+    let words = match view {
+        View::Shader(_, Some(desc)) => Some(&desc[..]),
+        View::Placed(false, _, desc) => Some(&desc[..10]),
+        _ => None,
+    };
+    if let Some(w) = words
+        && w[1] == STRUCTURE
+    {
+        let at = u64::from(w[4]) | u64::from(w[5]) << 32;
+        return (at != 0).then_some(at);
+    }
+    buffer_range(view).map(|range| range.0)
+}
+
 /// The title memory a buffer shader or unordered access view reads: its
 /// address and length.
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
@@ -4219,20 +4242,6 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
         base + buffer.FirstElement * element,
         u64::from(buffer.NumElements) * element,
     ))
-}
-
-/// The address a shader finds in a descriptor of title memory: where a
-/// buffer view starts, or the ray-tracing structure of a structure's view
-/// (no resource: the view's description holds the address, and the shader
-/// walks the structure from there itself).
-pub(crate) fn view_address(view: &View) -> Option<u64> {
-    const STRUCTURE: u32 = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32;
-    match view {
-        View::Shader(_, Some(desc)) if desc[1] == STRUCTURE => {
-            Some(u64::from(desc[4]) | u64::from(desc[5]) << 32)
-        }
-        _ => buffer_range(view).map(|range| range.0),
-    }
 }
 
 /// Enters the title address of `view` (0 for none, or a view that is no

@@ -159,6 +159,27 @@ Upstream's notes of commits 8a32d0ba to 67429060 (their numbers, on their machin
   (the title's constants heap read by the card in place; did not open in its first run),
   `VICTORY_PATCH_LEAN`, `VICTORY_DUMP_REFUSED=<dir>` (saves shaders that do not translate).
 
+### Merged from fxceless/victory-fork (2026-11-27, 06:30 UTC)
+
+Upstream's notes of commit 9a9091d1 (their numbers, on their machine):
+
+- **The structure builder's crash is fixed** upstream: it was the title's own hang watchdog (a store to
+  address 0 after 30 s without a finished frame): their layer brought every copy of title memory the
+  builder had named up to date in every list, and snapshot, copied back and compared up to 4 GiB per
+  list. There a list now syncs only the copies its own dispatches name and those shaders reached through
+  pointers (`VICTORY_MEMORY_SYNC_ALL=1` / `VICTORY_MEMORY_WHOLE_WRITES=1` restore the old ways); up to
+  4,095 copies. Here title memory by address keeps this fork's arenas: a list declares written only what
+  its dispatches name (as before), so those two switches have nothing to switch.
+- **Written-page notes:** translated stores and atomics flag each 64 KiB page they store to. Here the
+  pages of title buffers the builder was given to write, and of windows of title memory, are pulled back
+  into title memory a few frames later (`VICTORY_MEMORY_PULL=0`: not); arenas' pages stay on the card.
+- **Rays now see the structures:** a ray-tracing structure view has no resource, its address is in the
+  view description (`RaytracingAccelerationStructure.Location`); shaders were given address 0, read an
+  empty node and every ray missed. Instance and procedural nodes now return all ones as the hardware does
+  (AMD GPURT), not a miss.
+- Upstream's result: no crash past the builder (runs of 5 to 9 minutes) and ray-traced shadows later in a
+  run, **but 0.2 to 3 frames a second while it runs**; `VICTORY_BVH_BUILDER=0` plays at the usual speed.
+
 What is known to be wrong:
 
 - Trees, signs and far objects flicker in the distance in some places.

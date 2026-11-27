@@ -62,6 +62,20 @@
 //! A packed structure is gone when title memory has no header of it any more
 //! (looked at over [`SWEEP`] frames); the pages it alone has are given back.
 //!
+//! **Written-page notes** (fxceless 9a9091d18): translated stores and atomics
+//! set their page's flag after the fault notes
+//! (`victory_shader::emit::MEMORY_NOTES`; pages closed to stores set the
+//! sink). Once a frame the flags of the pages of title buffers the builder
+//! was given to write and of windows of title memory are read and cleared;
+//! those pages are pulled into title memory [`PULL_AFTER`] frames later
+//! ([`Shadow::pull_back`]), where the title reads results back
+//! (`VICTORY_MEMORY_PULL=0`: not). Arenas' pages are not pulled: a structure
+//! is whole only there.
+//! shortcut: unlike upstream every list still brings up every copy
+//! ([`Memory::bring_up`], run light-8) and declares written only what its
+//! dispatches name, so `VICTORY_MEMORY_SYNC_ALL` and
+//! `VICTORY_MEMORY_WHOLE_WRITES` have nothing to switch here.
+//!
 //! shortcut: a page held for anything else is kept for the rest of the run.
 //! shortcut: pages a list does not name are looked at again in turn, over
 //! [`SWEEP`] frames.
@@ -69,7 +83,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY};
+use victory_shader::emit::{MEMORY_FAULTS, MEMORY_NOTES, MEMORY_PAGES, MEMORY_READ_ONLY};
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::descriptor::host::HostHeap;
@@ -80,6 +94,9 @@ use crate::shadow::Shadow;
 const COPIES: u32 = (1 << 12) - 1;
 /// A directory page.
 const PAGE: u64 = 1 << 16;
+/// Frames after a page is seen written before its bytes are pulled into
+/// title memory: the lists that wrote it have run by then.
+const PULL_AFTER: u64 = 3;
 /// An arena's bytes.
 const ARENA: u64 = 64 << 20;
 /// What is compared at a time.
@@ -178,6 +195,10 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
+    /// Pages seen written (copy, title page, frame seen): pulled into title
+    /// memory once [`PULL_AFTER`] frames have passed; a page seen again is
+    /// pulled again.
+    pulls: Vec<(usize, u64, u64)>,
     stats: Stats,
     #[cfg(feature = "diagnostics")]
     dump: dump::Dump,
@@ -203,6 +224,11 @@ struct Stats {
     /// view, a structure named in upload memory.
     came: [u64; 4],
     micros: u64,
+    /// Written flags seen, pulls that wrote title memory, pulls refused (a
+    /// copy in the card's memory or in place).
+    written: u64,
+    pulled: u64,
+    pull_refused: u64,
 }
 
 // SAFETY: the mappings are of memory the struct owns; all access is under
@@ -229,10 +255,12 @@ impl Memory {
         let entries = crate::upload::reserve(bytes as usize)?;
         let directory = crate::shadow::by_address(entries as u64, bytes)?;
         crate::host::name(&directory.buffer, || "title memory by address: directory".into());
-        let (faults, data) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 4)?;
-        crate::host::name(&faults, || "title memory by address: faults".into());
+        // The fault notes, then a written flag per directory page: shaders
+        // store at dword MEMORY_FAULTS + page (a root view: not bounded).
+        let (faults, data) = host.shared_buffer(u64::from(MEMORY_NOTES) * 4)?;
+        crate::host::name(&faults, || "title memory by address: faults and written pages".into());
         // SAFETY: a fresh mapping of at least that many bytes.
-        unsafe { std::ptr::write_bytes(data, 0, MEMORY_FAULTS as usize * 4) };
+        unsafe { std::ptr::write_bytes(data, 0, MEMORY_NOTES as usize * 4) };
         // SAFETY: a live buffer.
         let gpu = unsafe { faults.GetGPUVirtualAddress() };
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
@@ -255,6 +283,7 @@ impl Memory {
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
+            pulls: Vec::new(),
             stats: Stats::default(),
             #[cfg(feature = "diagnostics")]
             dump: Default::default(),
@@ -705,6 +734,69 @@ impl Memory {
         }
     }
 
+    /// The written flags shaders set since the last look, for the pages of
+    /// title buffers the builder may store in ([`Memory::opens`]) and of
+    /// windows of title memory (each page counted for the copy the directory
+    /// gives it): cleared, each queued to be pulled into title memory.
+    /// shortcut: arenas' flags are neither read nor cleared.
+    fn take_written(&mut self) {
+        let last = u64::from(MEMORY_PAGES) - 1;
+        let arenas: std::collections::HashSet<usize> = self.arenas.iter().map(|&(n, _)| n).collect();
+        for n in 0..self.copies.len() {
+            let (first, len) = self.copies[n].span();
+            if len == 0 || arenas.contains(&n) || !(self.open.contains(&n) || len == PAGE) {
+                continue;
+            }
+            let (from, to) = (first / PAGE, ((first + len - 1) / PAGE).min(last - 1));
+            for page in from..=to {
+                // The owner first: a page inside this copy's span that
+                // another copy holds is left for that copy.
+                if self.copy_of(page) != Some(n) || self.pages.contains_key(&page) {
+                    continue;
+                }
+                // SAFETY: inside the notes' mapping (page < MEMORY_PAGES);
+                // the GPU may be writing: a flag set again is seen next time.
+                let flag = unsafe { self.faults.1.add((MEMORY_FAULTS as u64 + page) as usize) };
+                // SAFETY: as above.
+                if unsafe { flag.read_volatile() } == 0 {
+                    continue;
+                }
+                // SAFETY: as above.
+                unsafe { flag.write_volatile(0) };
+                self.stats.written += 1;
+                if pull() {
+                    self.pulls.push((n, page, self.frame));
+                }
+            }
+        }
+        // Pulled once their work has run: what the shaders stored there is
+        // in the copy, and (unless a list declared it and copied it back)
+        // not in title memory, where the title reads results back.
+        let frame = self.frame;
+        let mut keep = Vec::new();
+        for (n, page, seen) in std::mem::take(&mut self.pulls) {
+            if frame < seen + PULL_AFTER {
+                keep.push((n, page, seen));
+                continue;
+            }
+            match self.copies[n].pull_back(page * PAGE, PAGE) {
+                Some(bytes) => {
+                    if bytes > 0 {
+                        self.stats.pulled += 1;
+                    }
+                }
+                // Declared meanwhile: its own copy-back comes; else a copy
+                // that cannot be pulled (counted).
+                None if self.copies[n].pull_back(0, 0).is_none() => self.stats.pull_refused += 1,
+                None => keep.push((n, page, frame)),
+            }
+        }
+        // Pages seen again collapse to their latest sighting.
+        keep.sort_unstable_by_key(|&(n, page, seen)| (n, page, std::cmp::Reverse(seen)));
+        keep.dedup_by_key(|&mut (n, page, _)| (n, page));
+        self.pulls = keep;
+    }
+
     /// The structures named in a list's upload memory around `address`
     /// (instances of a top-level build: a structure's address is their last
     /// 8 bytes): the first page of each.
@@ -767,7 +859,8 @@ impl Memory {
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
              {:.1} packed structures ({} there), {:.2} ms; {} windows; since the last line {} KB of packed structures came and {} of them went, \
-             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}",
+             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}; \
+             written pages seen {}, pulls that wrote title memory {}, refused {}",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
             self.arenas.len(),
@@ -789,10 +882,26 @@ impl Memory {
             s.came[1],
             s.came[2],
             s.came[3],
-            self.faulted
+            self.faulted,
+            s.written,
+            s.pulled,
+            s.pull_refused
         );
         self.stats.from = Some((now, self.frame));
     }
+}
+
+/// `VICTORY_MEMORY_PULL=0`: pages shaders were seen to write through raw
+/// addresses are not pulled into title memory ([`Memory::take_written`]).
+fn pull() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_MEMORY_PULL").is_none_or(|v| v != "0");
+        if !on {
+            tracing::info!("title memory by address: written pages are not pulled into title memory (VICTORY_MEMORY_PULL=0)");
+        }
+        on
+    })
 }
 
 /// A list with this key ([`HostList::used`]) asks the builder for sizes.
@@ -915,6 +1024,7 @@ pub(crate) fn ready(
         m.frame = frame;
         m.refused.clear();
         m.take_faults();
+        m.take_written();
         m.look_again();
         m.report();
         #[cfg(feature = "diagnostics")]

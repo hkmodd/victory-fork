@@ -3577,8 +3577,14 @@ impl<'a> Lower<'a> {
     /// (and drops writes) through the null view at the first slot, and its
     /// number is left for the host, for lanes that run (`guard`). Goes on in
     /// another block.
-    /// With `store`, a page that is not to be written ([`super::shader::MEMORY_READ_ONLY`])
-    /// is the null view.
+    ///
+    /// `store`: the access writes (a store or an atomic): a page that is not
+    /// to be written ([`super::shader::MEMORY_READ_ONLY`]) is the null view;
+    /// any other page's flag in the written-page area after the fault notes
+    /// is set to 1 (lanes that do not run, and closed pages, set the sink,
+    /// dword 0), so the host copies back only the pages shaders wrote
+    /// (`victory_gpu::memory`; runs 371-374 compared whole copies and froze
+    /// the title's main loop).
     fn memory(&mut self, lo: V, hi: V, guard: Option<V>, store: bool) -> (V, V) {
         use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
         let c = self.cur;
@@ -3644,6 +3650,22 @@ impl<'a> Lower<'a> {
         self.page_there = Some(self.s.m.cmp(c, pred::NE, copy, zero));
         let copy = if store {
             let closed = self.s.m.cmp(c, pred::SLT, number, zero);
+            let first = k(self, MEMORY_FAULTS);
+            let flag = self.s.m.bin(c, Bin::Add, page, first);
+            let flag = self.s.m.bin(c, Bin::Shl, flag, k2);
+            let flag = match guard {
+                Some(g) => self.s.m.select(c, g, flag, zero),
+                None => flag,
+            };
+            let flag = self.s.m.select(c, closed, zero, flag);
+            self.s.op(
+                c,
+                "rawBufferStore.i32",
+                Attr::NoUnwind,
+                void,
+                140,
+                &[faults, flag, iu, one, iu, iu, iu, mask, align],
+            );
             self.s.m.select(c, closed, zero, copy)
         } else {
             copy

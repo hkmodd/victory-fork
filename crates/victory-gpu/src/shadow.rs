@@ -4538,6 +4538,73 @@ impl Shadow {
         written
     }
 
+    /// Title memory `[address, address + len)` brought up to the copy's
+    /// bytes wherever they differ, without a snapshot (`crate::memory`:
+    /// pages shaders were seen to store to through raw addresses, a few
+    /// frames after, when their work has run). A page first learned written
+    /// was not declared when the shaders wrote it, and declaring it later
+    /// snapshots the copy, which already holds those bytes: the compare then
+    /// finds nothing and they never reached title memory (rt-datapath audit
+    /// finding 1). None (nothing done) for a copy in place or in the card's
+    /// memory, or while a declared range overlaps (its copy-back is coming);
+    /// else the bytes written.
+    /// shortcut: a title write to those bytes that landed after the shaders'
+    /// is overwritten (no snapshot tells the two apart); for the structure
+    /// builder's output the title does not write there.
+    pub(crate) fn pull_back(&self, address: u64, len: u64) -> Option<usize> {
+        if self.place.is_some() || self.card.is_some() {
+            return None;
+        }
+        let (from, to) = self.inside(address as usize, len as usize);
+        if from >= to {
+            return Some(0);
+        }
+        let start = self.start as usize;
+        if self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|&(a, b)| a < start + to && b > start + from)
+        {
+            return None;
+        }
+        let mut title = vec![0u8; to - from];
+        if !crate::host::read_into((start + from) as *const u8, &mut title) {
+            return None;
+        }
+        // SAFETY: inside the copy's mapping; read only (shaders of a later
+        // flight may be writing it: what they write is pulled next time).
+        let copy = unsafe { std::slice::from_raw_parts(self.data.add(from), to - from) };
+        const CHUNK: usize = 256;
+        let mut written = 0;
+        let mut at = 0;
+        while at < to - from {
+            let n = CHUNK.min(to - from - at);
+            if copy[at..at + n] != title[at..at + n] {
+                // A run of differing chunks, written at once.
+                let mut end = at + n;
+                while end < to - from {
+                    let m = CHUNK.min(to - from - end);
+                    if copy[end..end + m] == title[end..end + m] {
+                        break;
+                    }
+                    end += m;
+                }
+                let dst = start + from + at;
+                // As this tree's landings (`put_changed`) tell it.
+                crate::watch::landing(dst, end - at);
+                crate::host::shaders_wrote_at(dst, end - at);
+                crate::host::write_mapped(dst as *mut u8, copy[at..].as_ptr(), end - at);
+                written += end - at;
+                at = end;
+            } else {
+                at += n;
+            }
+        }
+        Some(written)
+    }
+
     /// Offsets `[from, to)` of the copy are compared with the snapshot: for
     /// the frame line's counts.
     fn compared(&self, from: usize, to: usize) {
