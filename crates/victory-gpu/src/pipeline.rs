@@ -316,43 +316,151 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
         .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
 }
 
-/// Whether a compute container is one of the title's `bvh_skinning`
-/// programs: they pose every animated mesh (and its motion) once more, only
-/// for the ray-tracing structures. With the structure builder off
-/// (`VICTORY_BVH_BUILDER=0`) nothing reads what they write, and they were
-/// the largest share of the card's time in a cutscene (~6 ms a dispatch,
+/// What a compute container does only for rays, by its entry point's name
+/// (the container holds its entry point's, not the effect's).
+///
+/// The title's `bvh_skinning` programs pose every animated mesh (and its
+/// motion) once more, only for the ray-tracing structures: all 30 entry
+/// points named `CSComputeSkinning*` in the title's shader file are
+/// `bvh_skinning`'s; the picture's own skinning is `CS_PedStandardSkinning*`,
+/// `CS_PosOnlyLodSkinning*` and the cloth's `computeclothSkinning`. With the
+/// structure builder off nothing reads what they write, and they were the
+/// largest share of the card's time in a cutscene (~6 ms a dispatch,
 /// hundreds a frame).
 ///
-/// The container holds its entry point's name, not the effect's: all 30
-/// entry points named `CSComputeSkinning*` in the title's shader file are
-/// `bvh_skinning`'s; the picture's own skinning is `CS_PedStandardSkinning*`,
-/// `CS_PosOnlyLodSkinning*` and the cloth's `computeclothSkinning`.
+/// With every ray a miss, `CS_RaytracingResolve*` (some 1,000 programs that
+/// shade what a ray hit) and `CS_ScreenProbes_ActivateRays*` serve nothing
+/// either, nor do the screen probes' `CS_ScreenProbes_TraceRays*_BVH*` and
+/// the reflections' `CS_RaytraceVBuffer*`, which walk the structures. Their
+/// `Fallback` and `Voxels` forms march through the title's voxels and light
+/// the picture: they run. The `bvh_skinning_smh` program `CSGenerateHairVB`
+/// makes the hair's geometry: once taken for the structures only, it also
+/// feeds the hair's shadow tiles, so it runs ([`RayOnly::HairVb`]).
+/// (After edsuuu/VI-BR-PORT's f1e5e454f, 24f8d2ed4, a04f6012e, b120167f8,
+/// a934d142c and 6d5079cfa, GPL-3.0.)
 #[cfg(windows)]
-fn skins_for_rays(bytes: &[u8]) -> bool {
-    const NAME: &[u8] = b"CSComputeSkinning";
-    bytes.windows(NAME.len()).any(|w| w == NAME)
+fn for_rays(bytes: &[u8]) -> RayOnly {
+    let has = |name: &[u8]| bytes.windows(name.len()).any(|w| w == name);
+    if has(b"CSComputeSkinning") {
+        RayOnly::Skin
+    } else if has(b"CSGenerateHairVB") {
+        RayOnly::HairVb
+    } else if has(b"CS_RaytracingResolve") {
+        RayOnly::Resolve
+    } else if has(b"CS_ScreenProbes_ActivateRays") {
+        RayOnly::Activate
+    } else if (has(b"CS_ScreenProbes_TraceRays") && has(b"_BVH")) || (has(b"CS_RaytraceVBuffer") && !has(b"Voxels")) {
+        RayOnly::Trace
+    } else if has(b"CS_GenerateShadowMasks_Raytraced") || has(b"CS_RTShadowTrace") || has(b"CS_RaytraceShadows") {
+        RayOnly::ShadowMask
+    } else if has(b"CS_TransmissionVolumetrics_Tiled_") {
+        // (`_Tiled_<digits>` and `_Tiled_LocalLights_<digits>`; not `_Temporal_Tiled` nor
+        // `_GenerateTiles`.)
+        RayOnly::WaterLight
+    } else {
+        RayOnly::No
+    }
+}
+
+/// What a compute pipeline does only for rays ([`for_rays`]).
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RayOnly {
+    No,
+    Skin,
+    HairVb,
+    Resolve,
+    Activate,
+    Trace,
+    ShadowMask,
+    /// Not for rays: the light in the water's volume, in tiles
+    /// (`water_shading:CS_TransmissionVolumetrics_Tiled` and `_Tiled_LocalLights`), which
+    /// can be left out on hosts of 32-lane waves ([`skips_rt_skin`]).
+    WaterLight,
 }
 
 #[cfg(all(test, windows))]
 #[test]
-fn ray_skinning_programs_are_known_by_name() {
-    assert!(skins_for_rays(b"..\0CSComputeSkinningRigidVelocity_1c34db0a_Wrapped\0.."));
-    assert!(!skins_for_rays(b"..\0CS_PedStandardSkinning_3_00aa11bb_Wrapped\0.."));
-    assert!(!skins_for_rays(b"computeclothSkinning"));
+fn ray_programs_are_known_by_name() {
+    assert_eq!(for_rays(b"..\0CSComputeSkinningRigidVelocity_1c34db0a_Wrapped\0.."), RayOnly::Skin);
+    assert_eq!(for_rays(b"..\0CS_PedStandardSkinning_3_00aa11bb_Wrapped\0.."), RayOnly::No);
+    assert_eq!(for_rays(b"computeclothSkinning"), RayOnly::No);
+    assert_eq!(for_rays(b"..\0CS_RaytracingResolve_Opaque_12345678_Wrapped\0.."), RayOnly::Resolve);
+    assert_eq!(for_rays(b"..\0CS_ScreenProbes_ActivateRays_0_Wrapped\0.."), RayOnly::Activate);
+    assert_eq!(for_rays(b"..\0CSGenerateHairVB_c88a8f19_Wrapped\0.."), RayOnly::HairVb);
+    assert_eq!(for_rays(b"..\0CS_ScreenProbes_TraceRays_RayBinning_BVH_Mixed\0.."), RayOnly::Trace);
+    assert_eq!(for_rays(b"..\0CS_ScreenProbes_TraceRays_Voxels\0.."), RayOnly::No);
+    assert_eq!(for_rays(b"..\0CS_ScreenProbes_TraceRays_Fallback\0.."), RayOnly::No);
+    assert_eq!(for_rays(b"..\0CS_RaytraceVBuffer_ShaderBinning_WithFar\0.."), RayOnly::Trace);
+    assert_eq!(for_rays(b"..\0CS_RaytraceVBuffer_Voxels_RayBinning\0.."), RayOnly::No);
+    assert_eq!(for_rays(b"..\0CS_GenerateShadowMasks_Raytraced_0_Wrapped\0.."), RayOnly::ShadowMask);
+    assert_eq!(for_rays(b"..\0CS_TransmissionVolumetrics_Tiled_5dc3b259_Wrapped\0.."), RayOnly::WaterLight);
+    assert_eq!(for_rays(b"..\0CS_TransmissionVolumetrics_Tiled_LocalLights_6f225b64_Wrapped\0.."), RayOnly::WaterLight);
+    assert_eq!(for_rays(b"..\0CS_TransmissionVolumetrics_Temporal_Tiled_c7fd991b_Wrapped\0.."), RayOnly::No);
+    assert_eq!(for_rays(b"..\0CS_TransmissionVolumetrics_GenerateTiles_1aa247ed_Wrapped\0.."), RayOnly::No);
 }
 
-/// Whether a dispatch of `this` is left out because it only feeds the
-/// ray-tracing structures, which nothing builds: the builder is off
-/// (`VICTORY_BVH_BUILDER=0`). `VICTORY_RT_SKIN=1` runs them anyway.
+/// Whether every ray the title traces is a miss: the structure builder is
+/// off (`VICTORY_BVH_BUILDER=0`) and the node test answers "no hit"
+/// (`VICTORY_BVH_NO_HIT`, on by default then, or `VICTORY_BVH_MISS=1`):
+/// the translation's side of edsuuu's `VICTORY_RT_MISS=1`.
+#[cfg(windows)]
+fn rays_all_miss() -> bool {
+    std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "0")
+        && (std::env::var_os("VICTORY_BVH_NO_HIT").is_none_or(|v| v != "0")
+            || std::env::var_os("VICTORY_BVH_MISS").is_some_and(|v| v == "1"))
+}
+
+/// Whether a dispatch of `this` is left out because it only serves rays,
+/// and nothing they could hit is there. The skinning for the structures is
+/// left out whenever the builder is off (`VICTORY_RT_SKIN=1` runs it); the
+/// hit shading, the probes' ray activation and the walks of the structures
+/// while every ray is a miss ([`rays_all_miss`]; `VICTORY_RT_RESOLVE=1`,
+/// `VICTORY_ACTIVATE_RAYS=1`, `VICTORY_RT_TRACE=1` run them); the
+/// ray-traced shadow masks only with `VICTORY_SKIP_RT_SHADOW=1`; the hair's
+/// geometry runs unless `VICTORY_RT_HAIR_VB=0`, and the water's tiled light
+/// unless `VICTORY_WATER_LIGHT=0` on a host of 32-lane waves.
 #[cfg(windows)]
 pub(crate) fn skips_rt_skin(this: This) -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    !this.is_null()
-        && pipeline(this).rt_skin
-        && *ON.get_or_init(|| {
-            std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "0")
-                && std::env::var_os("VICTORY_RT_SKIN").is_none_or(|v| v != "1")
-        })
+    fn is(switch: &str, value: &str) -> bool {
+        std::env::var_os(switch).is_some_and(|v| v == value)
+    }
+    fn off(switch: &str) -> bool {
+        rays_all_miss() && !is(switch, "1")
+    }
+    static SKIN: OnceLock<bool> = OnceLock::new();
+    static HAIR_VB: OnceLock<bool> = OnceLock::new();
+    static RESOLVE: OnceLock<bool> = OnceLock::new();
+    static ACTIVATE: OnceLock<bool> = OnceLock::new();
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    static SHADOW: OnceLock<bool> = OnceLock::new();
+    static WATER: OnceLock<bool> = OnceLock::new();
+    if this.is_null() {
+        return false;
+    }
+    match pipeline(this).rt_only {
+        RayOnly::No => false,
+        RayOnly::Skin => *SKIN.get_or_init(|| is("VICTORY_BVH_BUILDER", "0") && !is("VICTORY_RT_SKIN", "1")),
+        // The hair's geometry is also what the sun's shadow mask reads for the tiles with hair
+        // (`CS_GenerateShadowMasks_HairOnly`): left out, those tiles kept stale, lit values over
+        // the hair (edsuuu b120167f8: blocky orange hair in the prison window).
+        RayOnly::HairVb => *HAIR_VB.get_or_init(|| is("VICTORY_RT_HAIR_VB", "0")),
+        RayOnly::Resolve => *RESOLVE.get_or_init(|| off("VICTORY_RT_RESOLVE")),
+        RayOnly::Activate => *ACTIVATE.get_or_init(|| off("VICTORY_ACTIVATE_RAYS")),
+        RayOnly::Trace => *TRACE.get_or_init(|| off("VICTORY_RT_TRACE")),
+        // With every ray a miss the tiles the title marks for rays (the cascades' edges, hair)
+        // come out lit (edsuuu a04f6012e: stair-stepped sun patches on walls and clothes). Left
+        // out, they keep what the title left: opt-in while it is tried.
+        RayOnly::ShadowMask => *SHADOW.get_or_init(|| is("VICTORY_SKIP_RT_SHADOW", "1") && off("VICTORY_RT_SHADOW")),
+        // Programs of one 64-lane wave a group, which a host of 32-lane waves gets in the
+        // wave-wide form only. trustno1 35c15608 (RTX 5070, Series X): ~15 ms of the card a
+        // frame and dark tiles of open water; edsuuu 6d5079cfa (RTX 4060 Ti, Series S): half a
+        // frame a second, and the water near the boat black without them. They run;
+        // `VICTORY_WATER_LIGHT=0` leaves them out on a host of 32-lane waves.
+        RayOnly::WaterLight => *WATER.get_or_init(|| {
+            victory_shader::emit::host_settings()[0] == 32 && is("VICTORY_WATER_LIGHT", "0")
+        }),
+    }
 }
 
 /// `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store
@@ -566,10 +674,9 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
-    /// One of the title's skinning passes for the ray-tracing structures
-    /// ([`skins_for_rays`]).
+    /// What it does only for rays, if anything ([`for_rays`]).
     #[cfg(windows)]
-    rt_skin: bool,
+    rt_only: RayOnly,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -767,7 +874,12 @@ fn hand_out(
         #[cfg(windows)]
         builder,
         #[cfg(windows)]
-        rt_skin: shaders.iter().any(|s| s.stage == "compute" && skins_for_rays(&s.container)),
+        rt_only: shaders
+            .iter()
+            .filter(|s| s.stage == "compute")
+            .map(|s| for_rays(&s.container))
+            .find(|&r| r != RayOnly::No)
+            .unwrap_or(RayOnly::No),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });

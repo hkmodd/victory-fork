@@ -4082,7 +4082,7 @@ impl State {
             return;
         }
         if crate::pipeline::skips_rt_skin(self.pipeline as This) {
-            once!("the ray-tracing skinning passes are left out (VICTORY_BVH_BUILDER=0; VICTORY_RT_SKIN=1 runs them)");
+            once!("programs that only serve rays are left out (skinning with VICTORY_BVH_BUILDER=0; hit shading, probe activation and walks while every ray misses; VICTORY_RT_SKIN, _RESOLVE, _TRACE, VICTORY_ACTIVATE_RAYS=1 run them)");
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
