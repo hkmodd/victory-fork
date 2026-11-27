@@ -10388,8 +10388,8 @@ impl Batch {
         }
         let ahead = spans.len() > 1;
         if ahead {
-            let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
-            crate::watch::ask_ahead(&ranges);
+            let ranges = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2));
+            crate::watch::ask_ahead(ranges);
         }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
@@ -10556,13 +10556,8 @@ impl Batch {
         let ahead = self.refreshes.len() > 1;
         if ahead {
             let started = std::time::Instant::now();
-            let ranges: Vec<(usize, usize)> = self
-                .refreshes
-                .iter()
-                .filter(|r| r.0.asked_ahead())
-                .map(|r| (r.1, r.2))
-                .collect();
-            crate::watch::ask_ahead(&ranges);
+            let ranges = self.refreshes.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2));
+            crate::watch::ask_ahead(ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         if wide_refresh() && self.refreshes.len() >= 4 {
