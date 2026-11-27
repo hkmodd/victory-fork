@@ -475,6 +475,15 @@ fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32
     victory_shader::emit::set_host_rdna(rdna || host_wave == 64);
     victory_shader::emit::set_view_heap_limit(view_limit);
     victory_shader::emit::set_raw_views(raw_views);
+    // The programs the runtime translates in the paired wave64 form
+    // (`VICTORY_WAVE_PAIRS_ONLY`, as `victory_gpu`'s shader cache reads it),
+    // so that a capture measures that form.
+    let pairs: Vec<String> = std::env::var("VICTORY_WAVE_PAIRS_ONLY")
+        .unwrap_or_default()
+        .split(',')
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| h.len() == 16)
+        .collect();
     let all: Vec<_> = wanted.iter().collect();
     let (next, done) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let started = std::time::Instant::now();
@@ -483,7 +492,8 @@ fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32
             s.spawn(|| {
                 while let Some((stage, hash)) = all.get(next.fetch_add(1, Ordering::Relaxed)) {
                     let Ok(bytes) = std::fs::read(kept.join(format!("{hash}.cdxil"))) else { continue };
-                    match victory_shader::emit::translate(&bytes) {
+                    let paired = pairs.iter().any(|h| h == hash);
+                    match victory_shader::emit::with_wave_pairs(paired, || victory_shader::emit::translate(&bytes)) {
                         Ok(t) => {
                             if std::fs::write(into.join(format!("{hash}.dxil")), &t.dxil).is_ok() {
                                 done.fetch_add(1, Ordering::Relaxed);

@@ -8,7 +8,23 @@ pub(in super::super) fn accesses_lds(inst: &Inst) -> bool {
 }
 
 pub(in super::super) fn supports_paired_lds(name: &str) -> bool {
-    matches!(name, "ds_read_b32" | "ds_write_b32" | "ds_read2_b32" | "ds_write2_b32" | "ds_min_u32" | "ds_max_u32")
+    matches!(name, "ds_read_b32" | "ds_write_b32" | "ds_read2_b32" | "ds_write2_b32") || paired_rmw(name).is_some()
+}
+
+/// The LDS read-modify-writes without a result the paired form makes as one
+/// atomic per console lane (the 1f1fbd86 pass, 3 ms of the world's frame,
+/// has one `ds_or_b32`).
+fn paired_rmw(name: &str) -> Option<Rmw> {
+    Some(match name {
+        "ds_add_u32" => Rmw::Add,
+        "ds_sub_u32" => Rmw::Sub,
+        "ds_and_b32" => Rmw::And,
+        "ds_or_b32" => Rmw::Or,
+        "ds_xor_b32" => Rmw::Xor,
+        "ds_min_u32" => Rmw::UMin,
+        "ds_max_u32" => Rmw::UMax,
+        _ => return None,
+    })
 }
 
 impl<'a> Lower<'a> {
@@ -27,11 +43,7 @@ impl<'a> Lower<'a> {
             [u32::from(*offset0) | u32::from(*offset1) << 8, 0]
         };
         let read = name.starts_with("ds_read");
-        let rmw = match name {
-            "ds_min_u32" => Some(Rmw::UMin),
-            "ds_max_u32" => Some(Rmw::UMax),
-            _ => None,
-        };
+        let rmw = paired_rmw(name);
         let dst = if read {
             let Some(Operand::Vector { reg, .. }) = dst else {
                 return Err("an LDS result");
@@ -326,6 +338,24 @@ impl<'a> Lower<'a> {
         self.s.m.bin(c, Bin::Or, first, sum)
     }
 
+    /// The float sum (of the bits `x`) of this host wave's 32 lanes, one half of a console
+    /// wave, as the console's tree adds them: partners 1, 2, 4, 8, 16 in turn. Bits.
+    fn float_tree(&mut self, x: V) -> V {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        let mut sum = x;
+        for step in 0..5 {
+            let bit = self.s.m.i32(1 << step);
+            let partner = self.s.m.bin(c, Bin::Xor, lane, bit);
+            let theirs = self.read_lane(sum, partner);
+            let (a, b) = (self.as_float(sum), self.as_float(theirs));
+            let total = self.s.m.bin(c, Bin::Add, a, b);
+            sum = self.as_int(total);
+        }
+        sum
+    }
+
     /// The last addition of [`Self::half_sum`]'s tree: the sums of a console wave's two halves
     /// (from [`Self::half_tree`]), with the high half of the lower one's (lane 0's).
     pub(super) fn join_half_sums(&mut self, lo: V, hi: V) -> V {
@@ -466,6 +496,28 @@ impl<'a> Lower<'a> {
             }
             let (lo, hi) = (self.half_tree(lo, 5), self.half_tree(hi, 5));
             let r = self.join_half_sums(lo, hi);
+            return Ok([r, r]);
+        }
+        // A float minimum or maximum is the same whatever the order of its tree: each half's
+        // host wave reduction and then the two halves', as the exchange of two host waves
+        // does it (`Lower::shape`). A float sum is not, nor here a prefix.
+        if prefix.is_none() && matches!(op, Op::MinF | Op::MaxF) {
+            let (lo, hi) = (self.as_float(lo), self.as_float(hi));
+            let lo = self.host_wave_op(op, lo, true, None)?;
+            let hi = self.host_wave_op(op, hi, true, None)?;
+            let r = self.join_halves(op, lo, hi, true);
+            let r = self.as_int(r);
+            return Ok([r, r]);
+        }
+        // A float sum: the console's tree (DPP8 partners 1, 2, 4, the row mirror, the other
+        // row, the other half; every add of two adjacent groups) is the butterfly of partners
+        // 1 to 16 over each half, then the halves': the same adds in the same groups, which
+        // (each add being commutative) give the console's bits.
+        if prefix.is_none() && op == Op::AddF {
+            let (lo, hi) = (self.float_tree(lo), self.float_tree(hi));
+            let (lo, hi) = (self.as_float(lo), self.as_float(hi));
+            let r = self.s.m.bin(c, Bin::Add, lo, hi);
+            let r = self.as_int(r);
             return Ok([r, r]);
         }
         if matches!(op, Op::AddF | Op::MinF | Op::MaxF) {
