@@ -171,7 +171,7 @@ I fork AMD vanno verificati su NVIDIA: un pezzo che dipende da wave64 o da compo
 
 ## 7. Conoscenza misurata (ancore; dettagli e date in STATE.md)
 
-- Oggi (2026-11-27, v7 caldo avmv7b): **18,4 fps** nel mondo col set standard, frame 51-60 ms. Muro doppio:
+- Oggi (2026-11-27, x1 = RT skip + fusione xavi): **20,8 fps** nel mondo col set standard, frame ~48 ms (avmv7b 18,4). Muro doppio:
   **scheda ~55 ms** (liste del titolo 41, nostre 5, buchi 9) e lane ~35 ms. 30 fps = 33 ms di entrambi.
 - La scheda è lavoro degli shader tradotti diffuso su ~1270 pipeline (nessuna voce ≥5 ms); l'emulazione wave64 NON
   è il muro (nodo 234); le leve a switch del traduttore sono esaurite.
