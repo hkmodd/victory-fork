@@ -151,6 +151,13 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::constants_raw() {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
         }
+        // The programs translated in the paired wave64 form by name
+        // (`VICTORY_WAVE_PAIRS_ONLY`, upstream b1d777a80). Only when set, so
+        // the translations cached without it keep their key.
+        if let Some(value) = std::env::var_os("VICTORY_WAVE_PAIRS_ONLY").filter(|v| !v.is_empty()) {
+            bytes.extend_from_slice(b"\0VICTORY_WAVE_PAIRS_ONLY=");
+            bytes.extend_from_slice(value.as_encoded_bytes());
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();
@@ -212,7 +219,68 @@ fn translate(container: &[u8]) -> Result<HostShader, String> {
     });
     let hash = blake3::hash(container).to_hex();
     let wide = list.iter().any(|h| hash.starts_with(h.as_str()));
-    victory_shader::emit::with_wave_wide(wide, || victory_shader::emit::translate(container)).map_err(|e| e.to_string())
+    // The paired wave64 form for the programs on `VICTORY_WAVE_PAIRS_ONLY`
+    // (16-hex-digit hashes as the log names shaders, comma separated;
+    // upstream b1d777a80, pull request #1397).
+    static PAIRS: OnceLock<Vec<String>> = OnceLock::new();
+    let pairs = PAIRS.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_PAIRS_ONLY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect()
+    });
+    let paired = listed_pair_hash(hash.as_str(), pairs);
+    if paired {
+        eprintln!("WAVE64-PAIRS-ONLY selected {}", &hash.as_str()[..16]);
+    }
+    victory_shader::emit::with_wave_wide(wide, || {
+        victory_shader::emit::with_wave_pairs(paired, || victory_shader::emit::translate(container))
+    })
+    .map_err(|e| e.to_string())
+}
+
+fn listed_pair_hash(hash: &str, list: &[String]) -> bool {
+    hash.get(..16).is_some_and(|prefix| list.iter().any(|h| h == prefix))
+}
+
+#[cfg(test)]
+#[test]
+fn listed_pair_hash_matches_only_complete_log_hashes() {
+    let list = vec!["5dc3b25986622949".to_owned(), "6f225b641c5b0708".to_owned()];
+    assert!(listed_pair_hash("5dc3b25986622949ffffffffffffffffffffffffffffffff", &list));
+    assert!(listed_pair_hash("6f225b641c5b0708", &list));
+    assert!(!listed_pair_hash("5dc3b25986622940", &list));
+    assert!(!listed_pair_hash("5dc3", &list));
+    assert!(!listed_pair_hash("5dc3b25986622949", &["5dc3".to_owned()]));
+}
+
+#[cfg(test)]
+#[test]
+fn listed_pair_cache_key_changes() {
+    const CHILD: &str = "VICTORY_CACHE_PAIRS_KEY_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        println!("pairs-cache-key={}", blake3::Hash::from_bytes(build()));
+        return;
+    }
+    let key = |list: &str| {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["listed_pair_cache_key_changes", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("VICTORY_WAVE_PAIRS", "0")
+            .env("VICTORY_WAVE_PAIRS_ONLY", list)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap().lines()
+            .find_map(|line| line.split_once("pairs-cache-key=").map(|(_, key)| key.to_owned()))
+            .expect("the child printed its cache key")
+    };
+    let off = key("");
+    assert_ne!(off, key("5dc3b25986622949"));
+    assert_ne!(key("5dc3b25986622949"), key("6f225b641c5b0708"));
+    assert_eq!(off, key(""));
 }
 
 /// The cache entry's converter: the build and the container in, the

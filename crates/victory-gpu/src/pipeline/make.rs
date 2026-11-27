@@ -222,8 +222,11 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        if p.graphics.is_none() && compute_waits() {
-            // Made here, or waited for while a worker makes it.
+        // A compute pipeline in the first 600 frames (the title's one-shot
+        // world and lighting set-up passes) or with `compute_waits`: made
+        // here, or waited for while a worker makes it, instead of dropping
+        // its dispatch after the frame's budget. `make` keeps its panic guard.
+        if p.graphics.is_none() && (compute_waits() || crate::frame::current() < 600) {
             p.make();
         } else {
             wait(p, crate::frame::current());
@@ -574,13 +577,18 @@ fn workers() -> bool {
                 .spawn(move || {
                     // Below the title's own threads (loading, recording),
                     // and the streaming one, which is below normal itself
-                    // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
-                    let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
+                    // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before;
+                    // `normal`: at normal priority, as upstream since b1d777a80).
+                    let asked = std::env::var_os("VICTORY_PIPELINE_LOWEST");
+                    let normal = asked.as_deref().is_some_and(|v| v == "normal");
+                    let lowest = !screens_only && asked.is_none_or(|v| v != "0" && v != "normal");
                     // SAFETY: a plain call on our own thread.
                     unsafe {
                         use windows::Win32::System::Threading::*;
                         let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
-                        let _ = SetThreadPriority(GetCurrentThread(), priority);
+                        if !normal {
+                            let _ = SetThreadPriority(GetCurrentThread(), priority);
+                        }
                     }
                     loop {
                         let p = next(screens_only);

@@ -118,7 +118,7 @@ unsafe impl Send for Spare {}
 static SPARE: Mutex<(std::collections::BTreeMap<u64, Vec<Spare>>, u64)> =
     Mutex::new((std::collections::BTreeMap::new(), 0));
 /// The most bytes kept spare, and the largest buffer that is pooled.
-const SPARE_MOST: (u64, u64) = (256 << 20, 8 << 20);
+const SPARE_MOST: (u64, u64) = (64 << 20, 8 << 20);
 /// Staging buffers taken from the spare ones, and made, since the start.
 pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
@@ -519,9 +519,15 @@ fn no_wait() -> bool {
 /// 2,382 had zeros in the first level shown; 137 of that frame's 787 repeated
 /// uploads put zeros over a filled level (run pic1-1; 68,700 refreshes left
 /// in the 150 s of world of run play1).
+///
+/// Upstream's switch for the same fallback (fork #1392,
+/// `VICTORY_NO_WAIT_PARTIAL=0`) turns it off too.
 fn fill_unlocked() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FILL").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| {
+        let on = |name| std::env::var_os(name).is_none_or(|v| v != "0");
+        on("VICTORY_TEXTURE_FILL") && on("VICTORY_NO_WAIT_PARTIAL")
+    })
 }
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
@@ -572,7 +578,11 @@ fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
     READ.with(|read| {
         let mut read = read.borrow_mut();
         if read.len() < size {
-            read.resize(size, 0);
+            // A new block of zeroed pages, the old one let go first: a
+            // resize would copy the old contents over and write the zeros
+            // (the contents are not kept anyway).
+            *read = Vec::new();
+            *read = vec![0; size];
         }
         f(&mut read[..size])
     })

@@ -87,6 +87,38 @@ first boat mission); their README is the source of each.
 | `VICTORY_CLZERO_LOOP15=0` | The title's 15-byte `clzero` loop is no longer emulated whole in one fault (on by default) |
 | `VICTORY_DISK_CORES=slow` | DirectStorage workers asked to keep to the slow cores (not measured) |
 
+### Merged from fxceless/victory-fork (2026-11-27, 00:30 UTC)
+
+Upstream's notes of commit b1d777a8 (their numbers, on their machine):
+
+- **Measured (one run, 3,300 to 4,100 draws): usual world frame 113 ms, the card 71 ms** with the
+  wide raw loads guarded at a view's end, the fast-math flag off, the 4 MiB window grid, joins of 4
+  parts and 48 lists, texture room 90 % with 3,072 MB kept for targets, and the kept thread pool.
+- **Water:** the black and grey patches came from forcing the two water programs into the wave-wide
+  form. Left out, open water shows waves and the sun's path.
+- **Translator (shader caches must be rebuilt; keep `early-pipelines.txt`):** wide raw loads are on by
+  default and fall back to one load a dword where four would pass a heap view's end; `ds_bpermute`
+  reads within its own 32-lane half (after Belobug PR #363); pixel-shader quad swizzles read through
+  quad operations (after Belobug 03629f3f); a helper lane's first-lane read is its own value (after
+  upstream 0601955); NaN tests are made on the bits; `VICTORY_SHADER_FAST_BITS` picks the fast-math
+  flags (still off: all flags gave black blotches); ray node tests answer "no hit" by default
+  (`VICTORY_BVH_NO_HIT=0` off).
+- **Merged by hand:** #1397 (paired wave64 lowering, off; per program with `VICTORY_WAVE_PAIRS_ONLY`;
+  both water programs are refused by it today: "a floating-point reduction without an exact paired
+  tree"), #1399 (one GPU-write step per range per list), #1400 (lock-free empty slots, one-block
+  write faults, root constants on the stack), and a switch for #1392 (`VICTORY_NO_WAIT_PARTIAL=0`;
+  here it also turns off this fork's own fill of such textures, `VICTORY_TEXTURE_FILL`).
+- **New, off by default:** `VICTORY_CARD_FILLS` (constant buffers and copies where shaders wrote, on
+  the card; measured worse: usual frame +11 ms, card +6 ms), `VICTORY_MESH_LAUNCH` (#1381's idea,
+  from its HLSL), and a kept pool for the texture checks ahead (`VICTORY_KEPT_THREADS=0` off).
+
+Here the descriptor heap's slots, the guard's write faults and the heap locks are this fork's own
+(#1400's empty-slot and one-block changes are not taken), and the pipeline workers stay at the lowest
+priority (`VICTORY_PIPELINE_LOWEST=normal`: at normal priority, as upstream). This fork has no
+`fill_ahead`: `VICTORY_CARD_FILLS` learns where shaders wrote from this fork's own landings, and the
+kept pool serves the work spread over threads. Upstream's quad reads replace this fork's (same
+helper-lane fix); DPP8 inside a quad keeps this fork's per-lane quad read.
+
 What is known to be wrong:
 
 - Trees, signs and far objects flicker in the distance in some places.

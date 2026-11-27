@@ -1788,6 +1788,10 @@ pub(crate) struct HostList {
     /// Refreshes of host copies that a thread of ours is still finding, and
     /// where among the list's steps they belong ([`aside`]).
     coming: Mutex<Option<(usize, std::sync::Arc<aside::Coming>)>>,
+    /// Card memory the list copies constant buffers into on the card
+    /// ([`HostList::card_fill`]): the buffer, the bytes used since the
+    /// reset, and whether it has been read as constants since its last copy.
+    card_fills: Mutex<Option<(ID3D12Resource, u64, bool)>>,
     /// Another number each time something changes that what a draw reads
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
@@ -3727,6 +3731,111 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     }
 }
 
+/// `VICTORY_CARD_FILLS`: 0 off (the default), 1 on, 2 in turn (`alt`, [`card_fills_now`]).
+///
+/// With it a constant buffer read at an address that is not 256-byte
+/// aligned, and a title buffer copy, whose title memory shaders have
+/// written this run ([`shaders_wrote`]), are copied by the card in the list,
+/// in order ([`HostList::card_fill`], [`HostList::card_copy`]), instead of by
+/// the CPU at submission. Ported from SPOOKEXE/victory-fork 8806c3f5,
+/// 36e80839 and c6e0d629 (their RTX 4070 runs W/X: frames 160/114 ms to
+/// 98/99, the submitting thread 142/110 to 88/87, the card 103 to 87; their
+/// runs O/P had shown the card +42 ms with about 180 copies a frame). What
+/// differs here: this tree's fills already go ahead of flights without a
+/// wait (`fill_ahead`, about 5,000 a frame in runs 352 and 355, none found
+/// to miss), the wait their port removed; so here it moves the CPU's copy
+/// of those bytes to the card (each copy between two pairs of barriers) and
+/// makes those reads exact. "Shaders have written" is learnt from the
+/// landings (`fill_ahead::wrote`) by 64 KiB, kept while the switch is on
+/// at all (also in the phases without).
+fn card_fills_mode() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_CARD_FILLS").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    })
+}
+
+/// Whether constant buffers and title copies are copied on the card now
+/// ([`card_fills_mode`]): with `=1` always; with `alt` twenty seconds with,
+/// twenty without, in turn, each change said in the log.
+pub(crate) fn card_fills_now() -> bool {
+    match card_fills_mode() {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "constant buffers and title copies where shaders wrote, from now (VICTORY_CARD_FILLS=alt): {}",
+                    if on { "ON, copied by the card in the list" } else { "off, copied by the CPU at submission" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Since the last frame line: constant buffers copied on the card
+/// ([`HostList::card_fill`]), title buffer copies done on the card
+/// ([`HostList::card_copy`]), and the bytes of both.
+pub(crate) static CARD_FILLS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// With `VICTORY_CARD_FILLS` ([`card_fills_mode`]): the 64 KiB pieces of
+/// title memory shaders have changed this run, as landings put them in
+/// (`crate::shadow`'s `put_changed` and its own put back), and those a copy
+/// on the card writes ([`HostList::card_copy`]). Upstream keeps the set in
+/// its `fill_ahead`, which this tree does not have (fills here never wait).
+mod card_learned {
+    use std::sync::Mutex;
+
+    /// Title memory is learnt by the 64 KiB.
+    const PIECE: usize = 1 << 16;
+
+    static LEARNED: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+
+    /// `[at, at + len)` holds what shaders wrote, or is written by the card
+    /// from now on (a copy of ours there).
+    pub(crate) fn note_written(at: usize, len: usize) {
+        if super::card_fills_mode() == 0 || len == 0 {
+            return;
+        }
+        let mut learned = LEARNED.lock().unwrap_or_else(|e| e.into_inner());
+        learned.get_or_insert_with(Default::default).extend(at / PIECE..=(at + len - 1) / PIECE);
+    }
+
+    /// Whether `len` bytes at `src` lie in a piece shaders have changed this
+    /// run (only with `VICTORY_CARD_FILLS`; false without).
+    pub(crate) fn shaders_wrote(src: usize, len: usize) -> bool {
+        if super::card_fills_mode() == 0 || len == 0 {
+            return false;
+        }
+        let learned = LEARNED.lock().unwrap_or_else(|e| e.into_inner());
+        learned.as_ref().is_some_and(|set| (src / PIECE..=(src + len - 1) / PIECE).any(|p| set.contains(&p)))
+    }
+
+    /// With the frame line.
+    pub(super) fn line(frames: f64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let [fills, copies, bytes] = [0, 1, 2].map(|i| super::CARD_FILLS[i].swap(0, Relaxed));
+        if super::card_fills_mode() != 0 {
+            let learned = LEARNED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |s| s.len());
+            tracing::info!(
+                "copies on the card where shaders wrote (VICTORY_CARD_FILLS), per frame: {:.1} constant buffers, {:.1} title \
+                 buffer copies, {:.3} MB; {learned} pieces of 64 KiB known written by shaders",
+                fills as f64 / frames,
+                copies as f64 / frames,
+                bytes as f64 / (1 << 20) as f64 / frames
+            );
+        }
+    }
+}
+
+pub(crate) use card_learned::{note_written as shaders_wrote_at, shaders_wrote};
+
 /// Since the last frame-rate line, ns of [`stale_under_flights`] looking
 /// through the lists' refreshes for copies shaders may be writing.
 static UNDER_SCAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -4540,6 +4649,7 @@ fn late_line(frames: f64) {
     if !late() {
         return;
     }
+    card_learned::line(frames);
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
@@ -5108,6 +5218,7 @@ impl Host {
                 indirect_args: Mutex::default(),
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
+                card_fills: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
                 clamp_window: Mutex::new(None),
                 open_queries: Mutex::new(Vec::new()),
@@ -7658,6 +7769,9 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
+        if let Some(fills) = self.card_fills.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            (fills.1, fills.2) = (0, false);
+        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -8238,6 +8352,139 @@ impl HostList {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// A constant buffer at `address` (`len` bytes, in `shadow`) the list
+    /// reads at an address not 256-byte aligned, copied on the card, here in
+    /// the list, into card memory of the list's own: its address there, or
+    /// none if [`card_fills_now`] says not now, or the list's room is used
+    /// up, or the bytes are not wholly in the copy's buffer. (With the
+    /// buffer: a constant view here keeps what it shows.)
+    ///
+    /// Why: such a buffer is otherwise copied by the CPU when the list is
+    /// submitted (`HostList::fill_scratch`) from title memory, ahead of the
+    /// flights whose shaders may still write it. The card
+    /// reads them in order instead, as the console's does: after the work
+    /// before them in the list and in the queue. (The CPU's own changes
+    /// reach the copy with the list's refreshes, which run before it.)
+    pub(crate) fn card_fill(&self, shadow: &crate::shadow::Shadow, address: u64, len: u64) -> Option<(ID3D12Resource, u64)> {
+        /// Room per list; more is left to the CPU's fill.
+        const ROOM: u64 = 4 << 20;
+        const VERTEX_AND_CONSTANT: i32 = 0x1;
+        const COPY_DEST: i32 = 0x400;
+        const COPY_SOURCE: i32 = 0x800;
+        if len == 0 || !card_fills_now() {
+            return None;
+        }
+        // SAFETY: a live buffer.
+        let (base, width) = unsafe { (shadow.buffer.GetGPUVirtualAddress(), shadow.buffer.GetDesc().Width) };
+        let from = shadow.gpu(address).checked_sub(base)?;
+        if from + len > width {
+            return None;
+        }
+        let mut fills = self.card_fills.lock().unwrap_or_else(|e| e.into_inner());
+        if fills.is_none() {
+            let buffer = host()?.uav_buffer(ROOM)?;
+            name(&buffer, || "list card fills".to_owned());
+            *fills = Some((buffer, 0, false));
+        }
+        let (buffer, used, read) = fills.as_mut()?;
+        let at = used.next_multiple_of(256);
+        if at + len > ROOM {
+            return None;
+        }
+        // SAFETY: live buffers; an open list. The copy's own memory moves
+        // from constant reads (or the common state, at the list's start) to
+        // a copy's destination and back; the title buffer's copy from the
+        // common state (every write before it in the queue made visible) to
+        // a copy's source and back.
+        let gpu = unsafe {
+            let state = |s: i32| D3D12_RESOURCE_STATES(s);
+            let was = if *read { VERTEX_AND_CONSTANT } else { 0 };
+            self.list.ResourceBarrier(&[
+                transition(&shadow.buffer, state(0), state(COPY_SOURCE)),
+                transition(buffer, state(was), state(COPY_DEST)),
+            ]);
+            self.list.CopyBufferRegion(&*buffer, at, &shadow.buffer, from, len);
+            self.list.ResourceBarrier(&[
+                transition(&shadow.buffer, state(COPY_SOURCE), state(0)),
+                transition(buffer, state(COPY_DEST), state(VERTEX_AND_CONSTANT)),
+            ]);
+            buffer.GetGPUVirtualAddress() + at
+        };
+        (*used, *read) = (at + len, true);
+        CARD_FILLS[0].fetch_add(1, Ordering::Relaxed);
+        CARD_FILLS[2].fetch_add(len, Ordering::Relaxed);
+        Some((buffer.clone(), gpu))
+    }
+
+    /// A title buffer copy of `len` bytes from `src` to `dst` (title
+    /// addresses) whose source lies where shaders write ([`shaders_wrote`]),
+    /// recorded as a copy on the card here, in the list, in order. True if
+    /// recorded; false leaves it to the CPU's copy at submission
+    /// (`defer_copy`).
+    ///
+    /// The destination's range is then the card's to write: declared as
+    /// shaders' writes ([`crate::shadow::Shadow::gpu_writes`]), so that no
+    /// refresh copies the title's old bytes over it and the copy-back puts
+    /// the new ones into title memory when the submission has run; and
+    /// noted as shader-written (`card_learned::note_written`), so that
+    /// constant buffers read from it are copied on the card too.
+    ///
+    /// shortcut (as in the fork): a title copy of the same list, done by the
+    /// CPU at submission, that reads this destination reads title memory
+    /// from before this copy; the next submissions see it after the
+    /// copy-back.
+    pub(crate) fn card_copy(&self, dst: usize, src: usize, len: usize) -> bool {
+        const COPY_DEST: i32 = 0x400;
+        const COPY_SOURCE: i32 = 0x800;
+        if len == 0 || !card_fills_now() || !shaders_wrote(src, len) {
+            return false;
+        }
+        let (Some(from), Some(to)) = (crate::shadow::find(src as u64, len as u64), crate::shadow::find(dst as u64, len as u64)) else {
+            return false;
+        };
+        // Both whole inside their copies, and the destination's copy in the
+        // card's memory (one the copy-back brings home).
+        if !to.carded()
+            || from.left(src as u64) < len as u64
+            || to.left(dst as u64) < len as u64
+            || std::sync::Arc::ptr_eq(&from, &to)
+        {
+            return false;
+        }
+        // SAFETY: live buffers.
+        let (from_at, to_at) = unsafe {
+            (
+                from.gpu(src as u64).checked_sub(from.buffer.GetGPUVirtualAddress()),
+                to.gpu(dst as u64).checked_sub(to.buffer.GetGPUVirtualAddress()),
+            )
+        };
+        let (Some(from_at), Some(to_at)) = (from_at, to_at) else {
+            return false;
+        };
+        // The source's CPU-side changes first, as for any read of it.
+        from.refresh(self, src as u64, len as u64);
+        to.gpu_writes(self, dst as u64, len as u64);
+        card_learned::note_written(dst, len);
+        // SAFETY: live buffers; an open list. Each copy moves from the
+        // common state (every write before it in the queue made visible)
+        // to a copy's source or destination and back.
+        unsafe {
+            let state = |s: i32| D3D12_RESOURCE_STATES(s);
+            self.list.ResourceBarrier(&[
+                transition(&from.buffer, state(0), state(COPY_SOURCE)),
+                transition(&to.buffer, state(0), state(COPY_DEST)),
+            ]);
+            self.list.CopyBufferRegion(&to.buffer, to_at, &from.buffer, from_at, len as u64);
+            self.list.ResourceBarrier(&[
+                transition(&from.buffer, state(COPY_SOURCE), state(0)),
+                transition(&to.buffer, state(COPY_DEST), state(0)),
+            ]);
+        }
+        CARD_FILLS[1].fetch_add(1, Ordering::Relaxed);
+        CARD_FILLS[2].fetch_add(len as u64, Ordering::Relaxed);
+        true
+    }
+
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
@@ -8311,6 +8558,8 @@ impl HostList {
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
+            // A subsequent GpuWrite for this copy must still flush this new refresh first.
+            deferred.gpu_written.retain(|k| k.0 != key.0);
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
@@ -8735,7 +8984,36 @@ impl HostList {
                 _ => None,
             })
             .collect();
-        textures.iter().filter(|staging| !staging.refresh_ahead()).count() as u64
+        // Over 4 threads when there are several (each holds a read buffer of
+        // its own, so not more); a texture's own lock orders two reads of it.
+        if textures.len() <= 1 {
+            return textures.iter().filter(|staging| !staging.refresh_ahead()).count() as u64;
+        }
+        let per = textures.len().div_ceil(4);
+        if crate::shadow::kept_threads_now() {
+            // On kept threads of their own (`crate::shadow::ahead_workers`):
+            // their read buffers stay grown from one flush to the next.
+            let left = std::sync::atomic::AtomicU64::new(0);
+            let left_ref = &left;
+            let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = textures
+                .chunks(per)
+                .map(|part| {
+                    Box::new(move || {
+                        let n = part.iter().filter(|staging| !staging.refresh_ahead()).count() as u64;
+                        left_ref.fetch_add(n, Ordering::Relaxed);
+                    }) as Box<dyn FnOnce() + Send + '_>
+                })
+                .collect();
+            crate::shadow::wide_scoped(crate::shadow::ahead_workers(), jobs);
+            return left.into_inner();
+        }
+        std::thread::scope(|s| {
+            let parts: Vec<_> = textures
+                .chunks(per)
+                .map(|part| s.spawn(move || part.iter().filter(|staging| !staging.refresh_ahead()).count() as u64))
+                .collect();
+            parts.into_iter().map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e))).sum()
+        })
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -13109,3 +13387,28 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+#[cfg(test)]
+mod deferred_tests {
+    use super::Deferred;
+
+    #[test]
+    fn gpu_written_deduplicates_until_refresh_or_title_write() {
+        let mut d = Deferred::default();
+        let (s1, s2) = (0x1000usize, 0x2000usize);
+        // Same (shadow, address, len) deduplicates.
+        assert!(d.gpu_written.insert((s1, 0x1000, 64)));
+        assert!(!d.gpu_written.insert((s1, 0x1000, 64)));
+        // Distinct ranges or shadows stay distinct.
+        assert!(d.gpu_written.insert((s1, 0x2000, 64)));
+        assert!(d.gpu_written.insert((s2, 0x1000, 64)));
+
+        // Intervening refresh on `s1` invalidates `s1`'s entries but keeps `s2`.
+        d.gpu_written.retain(|k| k.0 != s1);
+        assert!(d.gpu_written.insert((s1, 0x1000, 64)));
+        assert!(!d.gpu_written.insert((s2, 0x1000, 64)));
+
+        // Title copy/run clears all pending deduplication state.
+        d.gpu_written.clear();
+        assert!(d.gpu_written.insert((s2, 0x1000, 64)));
+    }
+}

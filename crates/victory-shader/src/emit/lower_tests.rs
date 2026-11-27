@@ -917,3 +917,11 @@ fn small_floats_widen_as_halves() {
     // A 16-bit float is a half already, sign included.
     assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
 }
+
+#[test]
+fn paired_lowering_scope_restores_on_unwind() {
+    assert!(!super::PAIRED.get());
+    let failed = std::panic::catch_unwind(|| super::with_paired_lanes(|| panic!("translation panic")));
+    assert!(failed.is_err());
+    assert!(!super::PAIRED.get());
+}

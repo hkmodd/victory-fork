@@ -383,8 +383,9 @@ fn bake_sources_mode() -> (BakeMode, u64) {
         let mode = match std::env::var("VICTORY_BAKE_SOURCES").ok().as_deref().map(str::trim) {
             Some("count") => BakeMode::Count,
             Some("1") => BakeMode::Upload,
-            Some("full") => BakeMode::Full,
-            _ => BakeMode::Off,
+            Some("0") => BakeMode::Off,
+            // Full unless set otherwise.
+            _ => BakeMode::Full,
         };
         let mb = std::env::var("VICTORY_BAKE_SOURCES_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(64);
         if mode != BakeMode::Off {
@@ -1466,6 +1467,13 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         #[cfg(feature = "diagnostics")]
         crate::book::root(gpu, len);
+        return Some(gpu);
+    }
+    // Where shaders wrote (`VICTORY_CARD_FILLS`): copied on the card, in order.
+    if crate::host::shaders_wrote(address as usize, len as usize)
+        && let Some((_, gpu)) = list.card_fill(&shadow, address, len)
+    {
+        shadow.refresh(list, address, len);
         return Some(gpu);
     }
     list.fill_scratch(address as *const u8, len)
@@ -3516,7 +3524,7 @@ impl State {
             // The bake draw's own, due or not, held or not.
             Some(slots) => (host.texture_slots_queued(slots), None),
             None => {
-                let (due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
+                let (due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 8192 });
                 (due, Some(census))
             }
         };
@@ -3545,7 +3553,7 @@ impl State {
         // What a run for a bake draw's own may upload.
         let sourced_at_most = bake_sources_mode().1;
         let mut sourced_bytes = 0u64;
-        // The frames in about four seconds, between 16 and 256: how long a
+        // The frames in about a second, between 8 and 64 (was four seconds, 16 to 256): how long a
         // slot with nothing to upload waits at most for its next look. In
         // frames alone it was 120: four minutes at the opening cutscene's
         // half a frame per second, while the title streams by the clock.
@@ -3561,7 +3569,7 @@ impl State {
         // second; `VICTORY_TEXTURE_LOOK_MS` counts by the frame's time.)
         let most = match look_ms() {
             Some(ms) => (ms / frame_ms(frame, now)).clamp(1, 256),
-            None => (4000 / took).clamp(16, 256),
+            None => (1000 / took).clamp(8, 64),
         };
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
@@ -4568,6 +4576,7 @@ impl State {
         crate::indirect::end_window(list);
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        let launch = crate::pipeline::host_pipeline(self.pipeline as This).and_then(|p| p.launch.as_ref());
         let ran = mesh_test() != 1
             && mesh_kept(self.pipeline)
             && self.prepare_for(list, false, true)
@@ -4585,8 +4594,29 @@ impl State {
                     if x > 65_535 {
                         once!(x, "a mesh dispatch of more groups than the host takes: cut");
                     }
-                    // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
+                    // With the launch stage the count goes to it as a root
+                    // constant (`crate::launch`).
+                    match launch {
+                        Some(launch) if crate::launch::now() => {
+                            crate::launch::record(list, launch.roots, crate::launch::Launch::Direct(x));
+                        }
+                        // The phase without (`VICTORY_MESH_LAUNCH=alt`): the
+                        // same pipeline without the stage.
+                        Some(launch) => {
+                            if let Some(plain) = launch.plain() {
+                                // SAFETY: an open list and a live pipeline of
+                                // the same root signature; everything set.
+                                unsafe {
+                                    list.list.SetPipelineState(plain);
+                                    l6.DispatchMesh(x.min(65_535), 1, 1);
+                                }
+                                self.host_pipeline = windows::core::Interface::as_raw(plain) as usize;
+                                list.keep(plain);
+                            }
+                        }
+                        // SAFETY: an open list with everything set.
+                        None => unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) },
+                    }
                     self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -4753,7 +4783,7 @@ impl State {
         // in root parameter `slot`, if the shader moves halves there and
         // the title's view is a 16-bit float or signed buffer view.
         let halved = |state: &Self, slot: u8, at: u32| -> Option<View> {
-            if !half.contains(&(slot, at)) {
+            if half.is_empty() || !half.contains(&(slot, at)) {
                 return None;
             }
             let Some(&Root::Table(table)) = state.roots_ref(compute).get(usize::from(slot)) else {
@@ -5035,6 +5065,16 @@ impl State {
                 let used = group.entry(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        // Where shaders wrote (`VICTORY_CARD_FILLS`): copied
+                        // on the card, in order.
+                        if crate::host::shaders_wrote(address as usize, size as usize)
+                            && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+                            && let Some((buffer, gpu)) = list.card_fill(&shadow, address, u64::from(size))
+                        {
+                            shadow.refresh(list, address, u64::from(size));
+                            host.constant_at(index, &buffer, gpu, size);
+                            continue;
+                        }
                         if let Some((buffer, gpu)) = list.constants_at_place(address, size) {
                             host.constant_at(index, &buffer, gpu, size);
                             continue;
@@ -5524,6 +5564,41 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        // One mesh record of a pipeline with the launch stage: the draw
+        // reads it itself (`crate::launch`), no clamp of ours before it.
+        if kind == MESH
+            && max == 1
+            && count.is_none()
+            && let Some(launch) = &p.launch
+            && crate::launch::now()
+        {
+            let offset = args.offset(arguments);
+            if !offset.is_multiple_of(4) {
+                why("a mesh record not 4-byte aligned");
+                return false;
+            }
+            self.window = None;
+            args.refresh(list, arguments, len);
+            if !self.prepare_for(list, false, true) {
+                why("prepare failed");
+                return false;
+            }
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x} launched"), false));
+            // SAFETY: a live buffer.
+            let record = unsafe { args.buffer.GetGPUVirtualAddress() } + offset;
+            list.keep(&args.buffer);
+            self.mesh_scissor(list, true);
+            let launched = crate::launch::record(list, launch.roots, crate::launch::Launch::Record(record));
+            self.mesh_scissor(list, false);
+            if !launched {
+                why("no budget for the launch");
+                return false;
+            }
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+
         // One record without a count: clamped in a batch (`batches`). A
         // spread dispatch's signature reads [row, asked x, x, y, z] records:
         // its job writes them (`batch::SPREAD`; read as spread words, plain
@@ -5773,6 +5848,21 @@ impl State {
         if !ran {
             why("prepare failed");
             return false;
+        }
+        // A mesh call the launch stage does not take (a count buffer, more
+        // than one record): the same pipeline without the stage.
+        if kind == MESH
+            && let Some(launch) = &p.launch
+        {
+            let Some(plain) = launch.plain() else {
+                why("no host pipeline without the launch stage");
+                return false;
+            };
+            // SAFETY: an open list and a live pipeline of the same root
+            // signature.
+            unsafe { list.list.SetPipelineState(plain) };
+            self.host_pipeline = windows::core::Interface::as_raw(plain) as usize;
+            list.keep(plain);
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
@@ -6500,7 +6590,7 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
 
 /// The longest wait, in milliseconds, between two looks at a texture slot
 /// whose memory is not there yet (`VICTORY_TEXTURE_LOOK_MS`; unset: about
-/// four seconds counted in passes, as before). The looks back off 1, 2, 4,
+/// a second counted in passes, upstream's default; it was four seconds). The looks back off 1, 2, 4,
 /// ... frames up to it. Measured (run light-22, `crate::texlate`): from
 /// the last look that found a slot's memory away to its upload, half under
 /// 0.5 s but nine in ten under 32 s: the memory had come long before.

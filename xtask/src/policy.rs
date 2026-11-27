@@ -29,10 +29,16 @@ const ALLOWED_NAMES: &[&str] = &[
 ];
 
 /// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
-const EXCEPTIONS: &[(&str, &str)] = &[(
-    "crates/victory-formats/src/bcpack-tables.bin",
-    "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
-)];
+const EXCEPTIONS: &[(&str, &str)] = &[
+    (
+        "crates/victory-formats/src/bcpack-tables.bin",
+        "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
+    ),
+    (
+        "crates/victory-gpu/src/launch_code.rs",
+        "our own amplification shader launch.hlsl (in the tree) compiled by dxc into bytes, as upstream ships it; nothing of the title",
+    ),
+];
 
 /// Run logs: the layer's own log of a run, scrubbed of names, kept under
 /// `diagnostics/` by the owner's decision (2026-11-26; docs/asset-policy.md).
