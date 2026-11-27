@@ -1590,6 +1590,8 @@ fn create() -> windows::core::Result<Host> {
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
+        // DLSS (VICTORY_DLSS): Streamline is given the device, nothing proxied.
+        crate::streamline::device_made(&device);
         let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
             ..Default::default()
@@ -11692,6 +11694,7 @@ impl Meter {
             crate::descriptor::sync_line(frames);
             late_line(frames);
             crate::queue::behind_line(frames);
+            crate::streamline::line(frames);
             card_clock_line(frames, ms);
             upq::line(frames);
             rec::line(frames);
