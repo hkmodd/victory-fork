@@ -116,6 +116,7 @@ fn build() -> [u8; 32] {
             "VICTORY_WAVE_LOCAL",
             "VICTORY_LANE_SPLIT",
             "VICTORY_LDS_FLAGS",
+            "VICTORY_DEFRAG",
             "VICTORY_F16_NEAREST",
             "VICTORY_HELPER_OWN",
             "VICTORY_FIRSTLANE_OWN",
