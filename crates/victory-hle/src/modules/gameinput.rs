@@ -1269,7 +1269,7 @@ mod host {
     /// `Tab`, `Back`, `Up`, `Down`, `Left`, `Right` (the stand-in pad's
     /// table maps them to buttons).
     fn key_code(key: &str) -> Option<u8> {
-        Some(match key {
+        Some(match key.trim() {
             "Enter" => 0x0D,
             "Esc" => 0x1B,
             "Tab" => 0x09,
@@ -1373,23 +1373,6 @@ mod host {
             .collect();
         down.extend(path(now));
         down
-    }
-
-    /// A key of `VICTORY_KEYS` or `VICTORY_PATH` by its name.
-    #[cfg(feature = "diagnostics")]
-    fn key_code(name: &str) -> Option<u8> {
-        Some(match name.trim() {
-            "Enter" => 0x0D,
-            "Esc" => 0x1B,
-            "Tab" => 0x09,
-            "Back" => 0x08,
-            "Up" => 0x26,
-            "Down" => 0x28,
-            "Left" => 0x25,
-            "Right" => 0x27,
-            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => k.as_bytes()[0].to_ascii_uppercase(),
-            _ => return None,
-        })
     }
 
     /// Debugging aid, for runs that must see the same views:
